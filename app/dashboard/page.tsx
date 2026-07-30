@@ -74,12 +74,25 @@ export default async function DashboardPage() {
     .limit(1)
     .maybeSingle();
 
-  const { data: roomRows, error: roomsError } = await supabase
-    .from("rooms")
-    .select(
-      "id, name, created_at, participants(user_id, last_seen_at, profiles(username, avatar_url))"
-    )
-    .order("created_at", { ascending: false });
+  // Scope to rooms this user has actually joined. RLS alone isn't enough here:
+  // public rooms are readable by everyone, so an unfiltered select would list
+  // other people's rooms too.
+  const { data: joined } = await supabase
+    .from("participants")
+    .select("room_id")
+    .eq("user_id", user.id);
+
+  const roomIds = (joined ?? []).map((p) => p.room_id);
+
+  const { data: roomRows, error: roomsError } = roomIds.length
+    ? await supabase
+        .from("rooms")
+        .select(
+          "id, name, visibility, created_at, participants(user_id, last_seen_at, profiles(username, avatar_url))"
+        )
+        .in("id", roomIds)
+        .order("created_at", { ascending: false })
+    : { data: [], error: null };
 
   const rooms: RoomView[] = (roomRows ?? []).map((room) => {
     const participants = (room.participants ?? []) as ParticipantRow[];
@@ -93,6 +106,7 @@ export default async function DashboardPage() {
     return {
       id: room.id,
       name: room.name || "Untitled room",
+      visibility: (room.visibility ?? "private") as RoomView["visibility"],
       members: participants.map((p) => {
         const prof = firstOf(p.profiles);
         return {
