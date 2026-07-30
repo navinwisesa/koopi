@@ -6,8 +6,10 @@ import {
   useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import Link from "next/link";
 import {
@@ -17,6 +19,7 @@ import {
   ArrowUp,
   PanelLeft,
   MessageSquarePlus,
+  Terminal,
 } from "lucide-react";
 import Avatar from "@/components/Avatar";
 import NewChatModal from "@/components/NewChatModal";
@@ -32,6 +35,7 @@ export type ChatMessage = {
   senderId: string | null;
   content: string;
   status: "streaming" | "complete" | "interrupted";
+  type: "text" | "tool_call" | "tool_result";
   interruptedBy: string | null;
   createdAt: string;
 };
@@ -66,6 +70,58 @@ function timeLabel(iso: string) {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+type ToolCallPayload = { code: string; language: string };
+type ToolResultPayload = { stdout: string; stderr: string; exit_code: number };
+
+function parseJson<T>(raw: string, fallback: T): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+const KOOPI_MENTION = "Koopi";
+
+// Finds the "@partial" fragment the cursor is currently sitting inside, if any —
+// an "@" preceded by start-of-string or whitespace, with no whitespace since.
+function detectMention(
+  text: string,
+  cursor: number
+): { start: number; query: string } | null {
+  let i = cursor;
+  while (i > 0 && !/\s/.test(text[i - 1])) {
+    i--;
+    if (text[i] === "@") {
+      const before = text[i - 1];
+      if (i === 0 || /\s/.test(before)) {
+        return { start: i, query: text.slice(i + 1, cursor) };
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+function mentionsKoopi(text: string) {
+  return new RegExp(`(^|\\s)@${KOOPI_MENTION}\\b`, "i").test(text);
+}
+
+function renderWithMentions(text: string, knownNames: string[]): ReactNode {
+  if (!knownNames.length || !text.includes("@")) return text;
+  const lower = new Set(knownNames.map((n) => n.toLowerCase()));
+  const parts = text.split(/(@[A-Za-z0-9_]+)/g);
+  return parts.map((part, i) =>
+    part.startsWith("@") && lower.has(part.slice(1).toLowerCase()) ? (
+      <span key={i} className="rounded bg-accent/20 px-1 font-medium text-accent">
+        {part}
+      </span>
+    ) : (
+      <span key={i}>{part}</span>
+    )
+  );
 }
 
 function rowToThread(row: Record<string, unknown>): Thread {
@@ -119,6 +175,13 @@ export default function RoomView({
   const [copied, setCopied] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
+  const [mentionState, setMentionState] = useState<{
+    start: number;
+    query: string;
+  } | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+
   const [name, setName] = useState(initialName);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(initialName);
@@ -144,6 +207,53 @@ export default function RoomView({
     return map;
   }, [members]);
 
+  const activeThreadParticipantIds = useMemo(
+    () => (activeThreadId ? (threadParticipants[activeThreadId] ?? []) : []),
+    [activeThreadId, threadParticipants]
+  );
+
+  // Everyone the @ dropdown can offer, excluding yourself — tagging yourself
+  // doesn't do anything useful.
+  const mentionMembers = useMemo(
+    () =>
+      activeThreadParticipantIds
+        .filter((id) => id !== currentUserId)
+        .map((id) => memberById.get(id))
+        .filter((m): m is RoomMember => Boolean(m)),
+    [activeThreadParticipantIds, memberById, currentUserId]
+  );
+
+  const mentionMemberByName = useMemo(() => {
+    const map = new Map<string, RoomMember>();
+    for (const m of mentionMembers) map.set(m.username, m);
+    return map;
+  }, [mentionMembers]);
+
+  const mentionCandidates = useMemo(
+    () => [KOOPI_MENTION, ...mentionMembers.map((m) => m.username)],
+    [mentionMembers]
+  );
+
+  // Everyone a message could legitimately mention, including yourself — used
+  // to decide what to highlight when rendering someone else's message.
+  const allMentionNames = useMemo(() => {
+    const names = activeThreadParticipantIds
+      .map((id) => memberById.get(id)?.username)
+      .filter((n): n is string => Boolean(n));
+    return [KOOPI_MENTION, ...names];
+  }, [activeThreadParticipantIds, memberById]);
+
+  const mentionOptions = useMemo(() => {
+    if (!mentionState) return [];
+    const q = mentionState.query.toLowerCase();
+    return mentionCandidates.filter((name) => name.toLowerCase().startsWith(q)).slice(0, 6);
+  }, [mentionState, mentionCandidates]);
+
+  // A thread with 2+ people is a group conversation — Koopi only jumps in
+  // when explicitly tagged there, so humans can talk without waking it up.
+  // Solo threads (just you) keep the old always-respond behavior.
+  const requiresMention = activeThreadParticipantIds.length >= 2;
+
   // --- realtime: messages -------------------------------------------------
   useEffect(() => {
     const channel = supabase
@@ -167,6 +277,7 @@ export default function RoomView({
             senderId: (row.sender_id as string | null) ?? null,
             content: (row.content as string) ?? "",
             status: row.status as ChatMessage["status"],
+            type: (row.type as ChatMessage["type"]) ?? "text",
             interruptedBy: (row.interrupted_by as string | null) ?? null,
             createdAt: row.created_at as string,
           };
@@ -382,25 +493,35 @@ export default function RoomView({
     if (!text || sending || isStreaming || !activeThreadId) return;
 
     const threadId = activeThreadId;
+    // A group thread only wakes Koopi up when it's actually tagged — humans
+    // can otherwise talk amongst themselves without an uninvited reply.
+    const shouldInvokeAgent = !requiresMention || mentionsKoopi(text);
     setError(null);
     setSending(true);
     setDraft("");
+    setMentionState(null);
 
     try {
-      const { error: insertError } = await supabase.from("messages").insert({
-        room_id: roomId,
-        thread_id: threadId,
-        sender_type: "user",
-        sender_id: currentUserId,
-        content: text,
-        status: "complete",
-      });
+      const { data: inserted, error: insertError } = await supabase
+        .from("messages")
+        .insert({
+          room_id: roomId,
+          thread_id: threadId,
+          sender_type: "user",
+          sender_id: currentUserId,
+          content: text,
+          status: "complete",
+        })
+        .select("id")
+        .single();
       if (insertError) throw insertError;
+
+      if (!shouldInvokeAgent) return;
 
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ threadId }),
+        body: JSON.stringify({ threadId, triggerMessageId: inserted.id }),
       });
 
       if (!res.ok) {
@@ -467,7 +588,58 @@ export default function RoomView({
     }
   }
 
+  function handleComposerChange(e: ChangeEvent<HTMLTextAreaElement>) {
+    const value = e.target.value;
+    setDraft(value);
+    const cursor = e.target.selectionStart ?? value.length;
+    const mention = detectMention(value, cursor);
+    setMentionState(mention);
+    setMentionIndex(0);
+  }
+
+  function selectMention(name: string) {
+    if (!mentionState) return;
+    const cursor = mentionState.start + 1 + mentionState.query.length;
+    const before = draft.slice(0, mentionState.start);
+    const after = draft.slice(cursor);
+    const next = `${before}@${name} ${after}`;
+    setDraft(next);
+    setMentionState(null);
+
+    const caretPos = before.length + name.length + 2; // "@" + name + trailing space
+    requestAnimationFrame(() => {
+      const el = composerRef.current;
+      if (el) {
+        el.focus();
+        el.setSelectionRange(caretPos, caretPos);
+      }
+    });
+  }
+
   function onInputKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (mentionState && mentionOptions.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setMentionIndex((i) => (i + 1) % mentionOptions.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setMentionIndex((i) => (i - 1 + mentionOptions.length) % mentionOptions.length);
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        selectMention(mentionOptions[mentionIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setMentionState(null);
+        return;
+      }
+    }
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void handleSend(e as unknown as FormEvent);
@@ -673,22 +845,94 @@ export default function RoomView({
                               </span>
                             </div>
 
-                            <div
-                              className={`mt-1 whitespace-pre-wrap break-words rounded-lg px-4 py-3 text-sm leading-relaxed ${
-                                isAgent
-                                  ? "bg-surface text-foreground"
-                                  : "bg-accent/10 text-foreground"
-                              }`}
-                            >
-                              {m.content || (
-                                <span className="text-muted">
-                                  {m.status === "streaming" ? "Thinking…" : "—"}
-                                </span>
-                              )}
-                              {m.status === "streaming" && m.content && (
-                                <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-accent" />
-                              )}
-                            </div>
+                            {m.type === "tool_call" ? (
+                              <div className="mt-1 overflow-hidden rounded-lg border border-border">
+                                <div className="flex items-center gap-1.5 border-b border-border bg-surface px-3 py-1.5 text-xs font-medium text-muted">
+                                  <Terminal className="h-3.5 w-3.5" strokeWidth={2} />
+                                  {m.status === "streaming"
+                                    ? "Running code…"
+                                    : m.status === "interrupted"
+                                      ? "Code execution stopped"
+                                      : "Ran code"}
+                                  {(() => {
+                                    const { language } = parseJson<ToolCallPayload>(
+                                      m.content,
+                                      { code: "", language: "" }
+                                    );
+                                    return language ? (
+                                      <span className="ml-auto rounded bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted">
+                                        {language}
+                                      </span>
+                                    ) : null;
+                                  })()}
+                                </div>
+                                <pre className="overflow-x-auto bg-background px-3 py-2 font-mono text-xs leading-relaxed text-foreground">
+                                  {
+                                    parseJson<ToolCallPayload>(m.content, {
+                                      code: "",
+                                      language: "",
+                                    }).code
+                                  }
+                                </pre>
+                              </div>
+                            ) : m.type === "tool_result" ? (
+                              (() => {
+                                const { stdout, stderr, exit_code } =
+                                  parseJson<ToolResultPayload>(m.content, {
+                                    stdout: "",
+                                    stderr: "",
+                                    exit_code: 0,
+                                  });
+                                return (
+                                  <div className="mt-1 overflow-hidden rounded-lg border border-border">
+                                    <div className="flex items-center justify-between border-b border-border bg-surface px-3 py-1.5 text-xs font-medium text-muted">
+                                      <span>Output</span>
+                                      <span
+                                        className={
+                                          exit_code === 0
+                                            ? "text-muted"
+                                            : "text-red-400"
+                                        }
+                                      >
+                                        exit {exit_code}
+                                      </span>
+                                    </div>
+                                    <pre className="overflow-x-auto whitespace-pre-wrap break-words bg-background px-3 py-2 font-mono text-xs leading-relaxed text-foreground">
+                                      {stdout || (
+                                        <span className="text-muted">
+                                          (no stdout)
+                                        </span>
+                                      )}
+                                      {stderr && (
+                                        <span className="text-red-400">
+                                          {stdout ? "\n" : ""}
+                                          {stderr}
+                                        </span>
+                                      )}
+                                    </pre>
+                                  </div>
+                                );
+                              })()
+                            ) : (
+                              <div
+                                className={`mt-1 whitespace-pre-wrap break-words rounded-lg px-4 py-3 text-sm leading-relaxed ${
+                                  isAgent
+                                    ? "bg-surface text-foreground"
+                                    : "bg-accent/10 text-foreground"
+                                }`}
+                              >
+                                {m.content ? (
+                                  renderWithMentions(m.content, allMentionNames)
+                                ) : (
+                                  <span className="text-muted">
+                                    {m.status === "streaming" ? "Thinking…" : "—"}
+                                  </span>
+                                )}
+                                {m.status === "streaming" && m.content && (
+                                  <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-accent" />
+                                )}
+                              </div>
+                            )}
 
                             {m.status === "interrupted" && (
                               <p className="mt-1.5 text-xs text-muted">
@@ -730,19 +974,60 @@ export default function RoomView({
                   </div>
                 )}
 
-                <form onSubmit={handleSend} className="flex items-end gap-2">
+                <form onSubmit={handleSend} className="relative flex items-end gap-2">
+                  {mentionState && mentionOptions.length > 0 && (
+                    <ul className="absolute bottom-full left-0 mb-1.5 w-56 overflow-hidden rounded-lg border border-border bg-surface shadow-xl">
+                      {mentionOptions.map((name, i) => (
+                        <li key={name}>
+                          <button
+                            type="button"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => selectMention(name)}
+                            className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
+                              i === mentionIndex
+                                ? "bg-accent/15 text-foreground"
+                                : "text-foreground hover:bg-background"
+                            }`}
+                          >
+                            {name === KOOPI_MENTION ? (
+                              <span
+                                aria-hidden="true"
+                                className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent/15 text-xs"
+                              >
+                                🦫
+                              </span>
+                            ) : (
+                              <Avatar
+                                name={name}
+                                src={mentionMemberByName.get(name)?.avatarUrl ?? null}
+                                size="sm"
+                              />
+                            )}
+                            {name}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+
                   <label htmlFor="composer" className="sr-only">
                     Message
                   </label>
                   <textarea
                     id="composer"
+                    ref={composerRef}
                     rows={1}
                     value={draft}
                     disabled={isStreaming}
-                    onChange={(e) => setDraft(e.target.value)}
+                    onChange={handleComposerChange}
                     onKeyDown={onInputKeyDown}
+                    onBlur={() => setMentionState(null)}
                     placeholder={
-                      isStreaming ? "Koopi is responding…" : "Message the room…"
+                      isStreaming
+                        ? "Koopi is responding…"
+                        : requiresMention
+                          ? "Message the room… (tag @Koopi for a response)"
+                          : "Message the room…"
                     }
                     className="max-h-40 min-h-[46px] flex-1 resize-y rounded-lg border border-border bg-surface px-4 py-3 text-sm text-foreground placeholder:text-muted focus:border-accent focus:outline-none disabled:opacity-60"
                   />

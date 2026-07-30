@@ -152,7 +152,7 @@ export default async function RoomPage({
   const { data: messageRows } = await supabase
     .from("messages")
     .select(
-      "id, thread_id, sender_type, sender_id, content, status, interrupted_by, created_at"
+      "id, thread_id, sender_type, sender_id, content, status, type, interrupted_by, created_at"
     )
     .eq("room_id", id)
     .order("created_at", { ascending: true });
@@ -164,6 +164,7 @@ export default async function RoomPage({
     senderId: m.sender_id,
     content: m.content ?? "",
     status: m.status,
+    type: m.type ?? "text",
     interruptedBy: m.interrupted_by ?? null,
     createdAt: m.created_at,
   }));
