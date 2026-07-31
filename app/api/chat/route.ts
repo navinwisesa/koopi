@@ -1,12 +1,26 @@
 import Groq from "groq-sdk";
+import OpenAI from "openai";
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { SandboxRun, type RunResult } from "@/lib/sandbox";
+import { classifyIntent } from "@/lib/intentClassifier";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-const MODEL = "llama-3.3-70b-versatile";
+// Chat Mode: casual conversation, opinions, general knowledge — a small model
+// on its own Groq quota so it never competes with Build Mode's budget.
+// Build Mode: anything that needs real reasoning or the run_code tool.
+const MODEL_CHAT = "llama-3.1-8b-instant";
+const MODEL_BUILD = "llama-3.3-70b-versatile";
+
+// Same-tier equivalents on OpenRouter, used only when Groq itself is
+// unavailable for that tier (e.g. its daily quota is exhausted).
+const OPENROUTER_MODEL: Record<string, string> = {
+  [MODEL_CHAT]: "meta-llama/llama-3.1-8b-instruct",
+  [MODEL_BUILD]: "meta-llama/llama-3.3-70b-instruct",
+};
+
 const MAX_HISTORY = 40;
 const FLUSH_MS = 120;
 const MAX_TOOL_ROUNDS = 4;
@@ -45,6 +59,18 @@ the output didn't already convey (e.g. tying it back to what was asked). Don't
 restate the raw stdout/stderr verbatim — if the output already speaks for itself,
 a short reply or none at all is better than repeating it.`;
 
+const MEMORY_SYSTEM_PROMPT = `You maintain a short rolling summary of a shared team chat
+room's activity across all its threads. Given the existing summary (if any) and new
+messages since then, write an updated summary. Focus only on: key decisions made, what
+was built or changed, and notable constraints or preferences any participant stated.
+Skip small talk and routine back-and-forth. Keep it tight — a few sentences, not a
+transcript. Write neutral third-person notes, not addressed to anyone.`;
+
+// Regenerate the room summary once a summary already exists and this many new
+// messages have accrued since — frequent enough to stay useful, far cheaper
+// than redoing it on every single message.
+const MEMORY_REGEN_THRESHOLD = 20;
+
 const RUN_CODE_TOOL: Groq.Chat.ChatCompletionTool = {
   type: "function",
   function: {
@@ -70,6 +96,11 @@ const RUN_CODE_TOOL: Groq.Chat.ChatCompletionTool = {
     },
   },
 };
+
+// Groq and OpenRouter both speak the same OpenAI-compatible chunk format,
+// so the streaming/interrupt logic below can treat either provider's
+// response identically once cast to this shape.
+type ChatStream = AsyncIterable<Groq.Chat.ChatCompletionChunk> & { controller: AbortController };
 
 type MessageRow = {
   id: string;
@@ -163,9 +194,17 @@ export async function POST(request: Request) {
     );
   }
 
-  const { threadId, triggerMessageId } = (await request.json()) as {
+  // Optional — without it, a Groq quota/outage just surfaces the visible
+  // failure message instead of failing over to a second provider.
+  const openrouterKey = process.env.OPENROUTER_API_KEY;
+  const openrouter = openrouterKey
+    ? new OpenAI({ apiKey: openrouterKey, baseURL: "https://openrouter.ai/api/v1" })
+    : null;
+
+  const { threadId, triggerMessageId, modelOverride } = (await request.json()) as {
     threadId?: string;
     triggerMessageId?: string;
+    modelOverride?: "chat" | "build";
   };
   if (!threadId) {
     return NextResponse.json({ error: "threadId is required" }, { status: 400 });
@@ -202,12 +241,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Triggering message not found" }, { status: 404 });
   }
   const triggerUsername = firstOf(triggerRow.profiles)?.username ?? "there";
+  const triggerCreatedAt = triggerRow.created_at;
 
   const { data: history, error: historyError } = await supabase
     .from("messages")
     .select("id, sender_type, content, sender_id, type, profiles!sender_id(username)")
     .eq("thread_id", threadId)
-    .lte("created_at", triggerRow.created_at)
+    .lte("created_at", triggerCreatedAt)
     .order("created_at", { ascending: true })
     .limit(MAX_HISTORY);
 
@@ -220,17 +260,125 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Nothing to respond to" }, { status: 400 });
   }
 
-  const groq = new Groq({ apiKey });
+  // Route on the raw trigger text, not the annotated turn — casual chatter
+  // stays on the cheap model, anything build/code-shaped gets the real one.
+  // A manual override from the composer's model switcher always wins over
+  // the heuristic — the person sending the message knows better than a guess.
+  const triggerText = (history ?? []).find((row) => row.id === triggerMessageId)?.content ?? "";
+  const intent = modelOverride ?? classifyIntent(triggerText);
+  const routedModel = intent === "build" ? MODEL_BUILD : MODEL_CHAT;
+  console.log(
+    `/api/chat: trigger=${triggerMessageId} intent=${intent} model=${routedModel}` +
+      (modelOverride ? " (manual override)" : "")
+  );
+
+  // maxRetries: 0 — the SDK's default retry-with-backoff would silently eat
+  // 30+ seconds retrying a rate-limited Groq call before our own OpenRouter
+  // fallback ever gets a chance to run. A 429 should surface immediately.
+  const groq = new Groq({ apiKey, maxRetries: 0 });
   const encoder = new TextEncoder();
+
+  // Room-level memory: a rolling summary of everything that's happened in this
+  // room across ALL its threads, so a brand-new thread isn't starting blind.
+  // Regenerated lazily — only when there's no summary yet, or enough new
+  // activity has piled up — never on every message.
+  async function getRoomMemory(): Promise<string | null> {
+    const { data: room } = await supabase
+      .from("rooms")
+      .select("memory_summary, memory_summarized_until")
+      .eq("id", roomId)
+      .maybeSingle();
+
+    const existingSummary = room?.memory_summary ?? null;
+    const since = room?.memory_summarized_until ?? null;
+
+    // RLS on `messages` only allows a user to read threads they're a
+    // participant of — a plain query here would silently drop every other
+    // thread's messages for anyone not in all of them. This RPC runs with
+    // elevated privileges but still gates on room (not per-thread) membership.
+    const { data: newMessages } = (await supabase.rpc("get_room_memory_messages", {
+      p_room_id: roomId,
+      p_since: since,
+      p_until: triggerCreatedAt,
+    })) as {
+      data: {
+        thread_id: string;
+        sender_type: "user" | "agent";
+        username: string | null;
+        content: string;
+        created_at: string;
+      }[] | null;
+    };
+    const rows = (newMessages ?? []).filter((r) => r.content?.trim());
+
+    if (rows.length === 0) return existingSummary;
+
+    // The current thread already sees its own history via normal turn context,
+    // so same-thread chatter can wait for the batch threshold. But activity in
+    // OTHER threads is exactly the gap this feature exists to close — refresh
+    // right away so it doesn't take 20 messages before a teammate's decision
+    // in another thread becomes visible here.
+    const otherThreadActivity = rows.some((r) => r.thread_id !== threadId);
+    if (existingSummary && !otherThreadActivity && rows.length < MEMORY_REGEN_THRESHOLD) {
+      return existingSummary;
+    }
+
+    const formatted = rows
+      .map((r) => {
+        const name = r.sender_type === "agent" ? "Koopi" : (r.username ?? "teammate");
+        return `${name}: ${r.content.trim()}`;
+      })
+      .join("\n");
+
+    try {
+      const completion = await groq.chat.completions.create({
+        model: MODEL_CHAT,
+        max_completion_tokens: 400,
+        messages: [
+          { role: "system", content: MEMORY_SYSTEM_PROMPT },
+          {
+            role: "user",
+            content:
+              `Existing summary: ${existingSummary ?? "(none yet)"}\n\n` +
+              `New activity since then:\n${formatted}\n\nProduce the updated summary.`,
+          },
+        ],
+      });
+      const updated = completion.choices[0]?.message?.content?.trim();
+      if (!updated) return existingSummary;
+
+      const until = rows[rows.length - 1].created_at as string;
+      const { error: rpcError } = await supabase.rpc("update_room_memory", {
+        p_room_id: roomId,
+        p_summary: updated,
+        p_until: until,
+      });
+      if (rpcError) throw rpcError;
+
+      return updated;
+    } catch (err) {
+      // Best-effort — a summarization hiccup should never block or degrade
+      // the actual chat response.
+      console.warn(`/api/chat: room memory update skipped for room ${roomId}:`, err);
+      return existingSummary;
+    }
+  }
+
+  const roomMemory = await getRoomMemory();
+  const effectiveSystemPrompt = roomMemory
+    ? `${SYSTEM_PROMPT}\n\nRoom memory (prior activity in this room, across other threads):\n${roomMemory}`
+    : SYSTEM_PROMPT;
+
+  const isRateLimited = (err: unknown) =>
+    err instanceof Groq.RateLimitError || err instanceof OpenAI.RateLimitError;
 
   // A genuine API failure (rate limit, network blip, etc.) must never just
   // vanish — the person who tagged Koopi should always see *something*
   // rather than silence that looks like they were ignored.
   async function postFailureNotice(err: unknown) {
-    const reason =
-      err instanceof Groq.RateLimitError
-        ? "we've hit today's usage limit for the model — try again a bit later."
-        : "I hit an error trying to respond — try asking again.";
+    const reason = isRateLimited(err)
+      ? "we've hit today's usage limit for the model — try again a bit later."
+      : "I hit an error trying to respond — try asking again.";
     console.error(`/api/chat: model call failed for trigger ${triggerMessageId}:`, err);
     await supabase.from("messages").insert({
       room_id: roomId,
@@ -292,20 +440,43 @@ export async function POST(request: Request) {
       return true;
     }
 
-    let stream;
+    const requestMessages = [{ role: "system" as const, content: effectiveSystemPrompt }, ...turns];
+
+    let stream: ChatStream;
     try {
-      stream = await groq.chat.completions.create({
-        model: MODEL,
+      stream = (await groq.chat.completions.create({
+        model: routedModel,
         max_completion_tokens: 4096,
         stream: true,
         tools: [RUN_CODE_TOOL],
-        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...turns],
-      });
-    } catch (err) {
-      // The request never got a stream at all — nothing to interrupt, this
-      // is always a genuine failure, not a Stop-button abort.
-      await postFailureNotice(err);
-      return { kind: "text" };
+        messages: requestMessages,
+      })) as ChatStream;
+    } catch (groqErr) {
+      // Only fail over on a genuine quota/availability problem, and only if
+      // a second provider is actually configured — anything else (a bad
+      // request, an auth error) would just fail identically on OpenRouter.
+      if (!isRateLimited(groqErr) || !openrouter) {
+        await postFailureNotice(groqErr);
+        return { kind: "text" };
+      }
+      try {
+        console.log(`/api/chat: trigger=${triggerMessageId} groq rate-limited, failing over to openrouter`);
+        // Groq's and OpenRouter's SDKs are separately typed but both speak
+        // the same OpenAI-compatible wire format — safe to reuse the same
+        // request shape across the provider boundary.
+        stream = (await openrouter.chat.completions.create({
+          model: OPENROUTER_MODEL[routedModel],
+          max_completion_tokens: 4096,
+          stream: true,
+          tools: [RUN_CODE_TOOL] as unknown as OpenAI.Chat.ChatCompletionTool[],
+          messages: requestMessages as unknown as OpenAI.Chat.ChatCompletionMessageParam[],
+        })) as ChatStream;
+      } catch (fallbackErr) {
+        // Both providers failed — this must still surface visibly, same as
+        // a single-provider failure would.
+        await postFailureNotice(fallbackErr);
+        return { kind: "text" };
+      }
     }
 
     const ticker = setInterval(async () => {

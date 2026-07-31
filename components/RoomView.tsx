@@ -20,6 +20,9 @@ import {
   PanelLeft,
   MessageSquarePlus,
   Terminal,
+  Wand2,
+  Zap,
+  Sparkles,
 } from "lucide-react";
 import Avatar from "@/components/Avatar";
 import NewChatModal from "@/components/NewChatModal";
@@ -174,6 +177,9 @@ export default function RoomView({
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Auto lets the server's heuristic pick a model per message; the other two
+  // pin every message from this composer to one tier until switched back.
+  const [modelMode, setModelMode] = useState<"auto" | "chat" | "build">("auto");
 
   const [mentionState, setMentionState] = useState<{
     start: number;
@@ -521,7 +527,11 @@ export default function RoomView({
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ threadId, triggerMessageId: inserted.id }),
+        body: JSON.stringify({
+          threadId,
+          triggerMessageId: inserted.id,
+          modelOverride: modelMode === "auto" ? undefined : modelMode,
+        }),
       });
 
       if (!res.ok) {
@@ -952,6 +962,35 @@ export default function RoomView({
             {/* ---------- composer ---------- */}
             <div className="shrink-0 border-t border-border bg-background">
               <div className="mx-auto max-w-3xl px-6 py-4">
+                <div className="mb-2 flex items-center justify-end gap-1.5">
+                  <span className="text-xs text-muted">Model</span>
+                  <div className="flex items-center gap-0.5 rounded-full border border-border bg-surface p-0.5">
+                    {(
+                      [
+                        { key: "auto", label: "Auto", icon: Wand2, title: "Auto — picks the right model per message" },
+                        { key: "chat", label: "Efficient", icon: Zap, title: "Efficient — always use the fast, cheaper model" },
+                        { key: "build", label: "Powerful", icon: Sparkles, title: "Powerful — always use the stronger model" },
+                      ] as const
+                    ).map(({ key, label, icon: Icon, title }) => (
+                      <button
+                        key={key}
+                        type="button"
+                        title={title}
+                        onClick={() => setModelMode(key)}
+                        aria-pressed={modelMode === key}
+                        className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium transition-colors ${
+                          modelMode === key
+                            ? "bg-accent text-accent-foreground"
+                            : "text-muted hover:bg-background hover:text-foreground"
+                        }`}
+                      >
+                        <Icon className="h-3 w-3" strokeWidth={2.5} />
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
                 {error && (
                   <p className="mb-3 rounded-md border border-red-500/30 bg-red-500/10 px-4 py-2 text-sm text-red-400">
                     {error}
