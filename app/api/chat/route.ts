@@ -8,17 +8,27 @@ import { classifyIntent } from "@/lib/intentClassifier";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-// Chat Mode: casual conversation, opinions, general knowledge — a small model
-// on its own Groq quota so it never competes with Build Mode's budget.
-// Build Mode: anything that needs real reasoning or the run_code tool.
-const MODEL_CHAT = "llama-3.1-8b-instant";
-const MODEL_BUILD = "llama-3.3-70b-versatile";
+// Both modes run the same Cerebras model — gpt-oss-120b is the only
+// production-supported model there (Gemma and GLM-4.7 are preview-only).
+// Efficient mode uses low reasoning effort for quick conversational replies;
+// Powerful mode uses high effort for anything that needs real reasoning or
+// the run_code tool.
+const CEREBRAS_MODEL = "gpt-oss-120b";
+const REASONING_EFFORT: Record<"chat" | "build", "low" | "high"> = {
+  chat: "low",
+  build: "high",
+};
 
-// Same-tier equivalents on OpenRouter, used only when Groq itself is
-// unavailable for that tier (e.g. its daily quota is exhausted).
-const OPENROUTER_MODEL: Record<string, string> = {
-  [MODEL_CHAT]: "meta-llama/llama-3.1-8b-instruct",
-  [MODEL_BUILD]: "meta-llama/llama-3.3-70b-instruct",
+// Fallback models, used only when Cerebras itself is unavailable (missing
+// key, rate limit, or any other error) — first Groq, then OpenRouter, the
+// same tiering Koopi used before Cerebras became the primary provider.
+const FALLBACK_GROQ_MODEL: Record<"chat" | "build", string> = {
+  chat: "llama-3.1-8b-instant",
+  build: "llama-3.3-70b-versatile",
+};
+const FALLBACK_OPENROUTER_MODEL: Record<"chat" | "build", string> = {
+  chat: "meta-llama/llama-3.1-8b-instruct",
+  build: "meta-llama/llama-3.3-70b-instruct",
 };
 
 const MAX_HISTORY = 40;
@@ -186,17 +196,28 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Not signed in" }, { status: 401 });
   }
 
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) {
+  const cerebrasKey = process.env.CEREBRAS_API_KEY;
+  if (!cerebrasKey) {
     return NextResponse.json(
-      { error: "GROQ_API_KEY is not set in .env.local" },
+      { error: "CEREBRAS_API_KEY is not set in .env.local" },
       { status: 500 }
     );
   }
 
-  // Optional — without it, a Groq quota/outage just surfaces the visible
-  // failure message instead of failing over to a second provider.
+  // Both optional — without either, a Cerebras failure just surfaces the
+  // visible failure message instead of failing over to a backup provider.
+  const groqKey = process.env.GROQ_API_KEY;
   const openrouterKey = process.env.OPENROUTER_API_KEY;
+
+  // maxRetries: 0 — the SDK's default retry-with-backoff would silently eat
+  // 30+ seconds retrying a rate-limited call before our own fallback chain
+  // ever gets a chance to run. A 429 should surface immediately.
+  const cerebras = new OpenAI({
+    apiKey: cerebrasKey,
+    baseURL: "https://api.cerebras.ai/v1",
+    maxRetries: 0,
+  });
+  const groq = groqKey ? new Groq({ apiKey: groqKey, maxRetries: 0 }) : null;
   const openrouter = openrouterKey
     ? new OpenAI({ apiKey: openrouterKey, baseURL: "https://openrouter.ai/api/v1" })
     : null;
@@ -266,16 +287,12 @@ export async function POST(request: Request) {
   // the heuristic — the person sending the message knows better than a guess.
   const triggerText = (history ?? []).find((row) => row.id === triggerMessageId)?.content ?? "";
   const intent = modelOverride ?? classifyIntent(triggerText);
-  const routedModel = intent === "build" ? MODEL_BUILD : MODEL_CHAT;
   console.log(
-    `/api/chat: trigger=${triggerMessageId} intent=${intent} model=${routedModel}` +
+    `/api/chat: trigger=${triggerMessageId} intent=${intent} model=${CEREBRAS_MODEL} ` +
+      `reasoning_effort=${REASONING_EFFORT[intent]}` +
       (modelOverride ? " (manual override)" : "")
   );
 
-  // maxRetries: 0 — the SDK's default retry-with-backoff would silently eat
-  // 30+ seconds retrying a rate-limited Groq call before our own OpenRouter
-  // fallback ever gets a chance to run. A 429 should surface immediately.
-  const groq = new Groq({ apiKey, maxRetries: 0 });
   const encoder = new TextEncoder();
 
   // Room-level memory: a rolling summary of everything that's happened in this
@@ -312,6 +329,9 @@ export async function POST(request: Request) {
     const rows = (newMessages ?? []).filter((r) => r.content?.trim());
 
     if (rows.length === 0) return existingSummary;
+    // Best-effort feature — without a fallback provider configured, there's
+    // no cheap model left to spend on background summarization.
+    if (!groq) return existingSummary;
 
     // The current thread already sees its own history via normal turn context,
     // so same-thread chatter can wait for the batch threshold. But activity in
@@ -332,7 +352,7 @@ export async function POST(request: Request) {
 
     try {
       const completion = await groq.chat.completions.create({
-        model: MODEL_CHAT,
+        model: FALLBACK_GROQ_MODEL.chat,
         max_completion_tokens: 400,
         messages: [
           { role: "system", content: MEMORY_SYSTEM_PROMPT },
@@ -442,40 +462,73 @@ export async function POST(request: Request) {
 
     const requestMessages = [{ role: "system" as const, content: effectiveSystemPrompt }, ...turns];
 
-    let stream: ChatStream;
-    try {
-      stream = (await groq.chat.completions.create({
-        model: routedModel,
-        max_completion_tokens: 4096,
-        stream: true,
-        tools: [RUN_CODE_TOOL],
-        messages: requestMessages,
-      })) as ChatStream;
-    } catch (groqErr) {
-      // Only fail over on a genuine quota/availability problem, and only if
-      // a second provider is actually configured — anything else (a bad
-      // request, an auth error) would just fail identically on OpenRouter.
-      if (!isRateLimited(groqErr) || !openrouter) {
-        await postFailureNotice(groqErr);
-        return { kind: "text" };
+    // Cerebras, Groq, and OpenRouter are all cast to the same ChatStream shape —
+    // Cerebras and OpenRouter speak OpenAI's wire format natively, and Groq's
+    // separately-typed SDK speaks the same format under the hood.
+    async function attemptOpenrouterOrFail(prevErr: unknown): Promise<ChatStream | null> {
+      if (!openrouter) {
+        await postFailureNotice(prevErr);
+        return null;
       }
       try {
-        console.log(`/api/chat: trigger=${triggerMessageId} groq rate-limited, failing over to openrouter`);
-        // Groq's and OpenRouter's SDKs are separately typed but both speak
-        // the same OpenAI-compatible wire format — safe to reuse the same
-        // request shape across the provider boundary.
-        stream = (await openrouter.chat.completions.create({
-          model: OPENROUTER_MODEL[routedModel],
+        console.log(`/api/chat: trigger=${triggerMessageId} failing over to openrouter`);
+        return (await openrouter.chat.completions.create({
+          model: FALLBACK_OPENROUTER_MODEL[intent],
           max_completion_tokens: 4096,
           stream: true,
           tools: [RUN_CODE_TOOL] as unknown as OpenAI.Chat.ChatCompletionTool[],
           messages: requestMessages as unknown as OpenAI.Chat.ChatCompletionMessageParam[],
         })) as ChatStream;
       } catch (fallbackErr) {
-        // Both providers failed — this must still surface visibly, same as
+        // Every provider failed — this must still surface visibly, same as
         // a single-provider failure would.
         await postFailureNotice(fallbackErr);
-        return { kind: "text" };
+        return null;
+      }
+    }
+
+    let stream: ChatStream;
+    try {
+      stream = (await cerebras.chat.completions.create({
+        model: CEREBRAS_MODEL,
+        reasoning_effort: REASONING_EFFORT[intent],
+        max_completion_tokens: 4096,
+        stream: true,
+        tools: [RUN_CODE_TOOL] as unknown as OpenAI.Chat.ChatCompletionTool[],
+        messages: requestMessages as unknown as OpenAI.Chat.ChatCompletionMessageParam[],
+      })) as ChatStream;
+    } catch (cerebrasErr) {
+      // Cerebras is new here — fail over on any error, not just rate limits,
+      // straight into the existing Groq/OpenRouter chain below.
+      console.log(
+        `/api/chat: trigger=${triggerMessageId} cerebras failed, failing over:`,
+        cerebrasErr instanceof Error ? cerebrasErr.message : cerebrasErr
+      );
+
+      if (!groq) {
+        const fallback = await attemptOpenrouterOrFail(cerebrasErr);
+        if (!fallback) return { kind: "text" };
+        stream = fallback;
+      } else {
+        try {
+          stream = (await groq.chat.completions.create({
+            model: FALLBACK_GROQ_MODEL[intent],
+            max_completion_tokens: 4096,
+            stream: true,
+            tools: [RUN_CODE_TOOL],
+            messages: requestMessages,
+          })) as ChatStream;
+        } catch (groqErr) {
+          // Only fail over further on a genuine quota/availability problem —
+          // anything else would just fail identically on OpenRouter too.
+          if (!isRateLimited(groqErr)) {
+            await postFailureNotice(groqErr);
+            return { kind: "text" };
+          }
+          const fallback = await attemptOpenrouterOrFail(groqErr);
+          if (!fallback) return { kind: "text" };
+          stream = fallback;
+        }
       }
     }
 
