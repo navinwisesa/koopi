@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import Avatar from "@/components/Avatar";
 import NewChatModal from "@/components/NewChatModal";
+import PersonalitySelector, { type Personality } from "@/components/PersonalitySelector";
 import ProfileMenu from "@/components/ProfileMenu";
 import RoomSidebar from "@/components/RoomSidebar";
 import { presenceOf } from "@/lib/presence";
@@ -41,6 +42,8 @@ export type ChatMessage = {
   type: "text" | "tool_call" | "tool_result";
   interruptedBy: string | null;
   createdAt: string;
+  modelTier: "chat" | "build" | null;
+  modelProvider: string | null;
 };
 
 export type RoomMember = {
@@ -147,6 +150,7 @@ export default function RoomView({
   initialMembers,
   initialThreads,
   initialThreadParticipants,
+  initialPersonality,
 }: {
   roomId: string;
   initialName: string;
@@ -157,6 +161,7 @@ export default function RoomView({
   initialMembers: RoomMember[];
   initialThreads: Thread[];
   initialThreadParticipants: Record<string, string[]>;
+  initialPersonality: Personality;
 }) {
   const supabase = useMemo(() => createClient(), []);
 
@@ -191,6 +196,7 @@ export default function RoomView({
   const [name, setName] = useState(initialName);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(initialName);
+  const [personality, setPersonality] = useState<Personality>(initialPersonality);
 
   const [now, setNow] = useState(() => Date.now());
 
@@ -286,6 +292,8 @@ export default function RoomView({
             type: (row.type as ChatMessage["type"]) ?? "text",
             interruptedBy: (row.interrupted_by as string | null) ?? null,
             createdAt: row.created_at as string,
+            modelTier: (row.model_tier as ChatMessage["modelTier"]) ?? null,
+            modelProvider: (row.model_provider as string | null) ?? null,
           };
 
           setMessages((prev) => {
@@ -386,6 +394,31 @@ export default function RoomView({
             if (list.includes(userId)) return prev;
             return { ...prev, [threadId]: [...list, userId] };
           });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [supabase, roomId]);
+
+  // --- realtime: room settings (personality) ------------------------------
+  useEffect(() => {
+    const channel = supabase
+      .channel(`room:${roomId}:settings`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "rooms",
+          filter: `id=eq.${roomId}`,
+        },
+        (payload) => {
+          const row = payload.new as Record<string, unknown> | null;
+          const next = row?.personality as Personality | undefined;
+          if (next) setPersonality(next);
         }
       )
       .subscribe();
@@ -726,6 +759,12 @@ export default function RoomView({
             </div>
 
             <div className="ml-auto flex shrink-0 items-center gap-3">
+              <PersonalitySelector
+                roomId={roomId}
+                personality={personality}
+                onChanged={setPersonality}
+              />
+
               <button
                 type="button"
                 onClick={copyInvite}
@@ -853,6 +892,30 @@ export default function RoomView({
                               <span className="text-xs text-muted">
                                 {timeLabel(m.createdAt)}
                               </span>
+                              {isAgent && m.modelTier && (
+                                <span
+                                  title={
+                                    m.modelProvider && m.modelProvider !== "cerebras"
+                                      ? `Served via ${m.modelProvider} (fallback)`
+                                      : undefined
+                                  }
+                                  className={`flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
+                                    m.modelTier === "build"
+                                      ? "bg-accent/15 text-accent"
+                                      : "bg-surface text-muted"
+                                  }`}
+                                >
+                                  {m.modelTier === "build" ? (
+                                    <Sparkles className="h-2.5 w-2.5" strokeWidth={2.5} />
+                                  ) : (
+                                    <Zap className="h-2.5 w-2.5" strokeWidth={2.5} />
+                                  )}
+                                  {m.modelTier === "build" ? "Powerful" : "Efficient"}
+                                  {m.modelProvider && m.modelProvider !== "cerebras"
+                                    ? ` · ${m.modelProvider}`
+                                    : ""}
+                                </span>
+                              )}
                             </div>
 
                             {m.type === "tool_call" ? (

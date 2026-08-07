@@ -9,6 +9,7 @@ import RoomView, {
   type RoomMember,
   type Thread,
 } from "@/components/RoomView";
+import { type Personality } from "@/components/PersonalitySelector";
 
 function firstOf<T>(value: T | T[] | null): T | null {
   return Array.isArray(value) ? (value[0] ?? null) : (value ?? null);
@@ -40,7 +41,7 @@ export default async function RoomPage({
 
   const { data: room } = await supabase
     .from("rooms")
-    .select("id, name, created_by")
+    .select("id, name, created_by, personality")
     .eq("id", id)
     .maybeSingle();
 
@@ -152,7 +153,7 @@ export default async function RoomPage({
   const { data: messageRows } = await supabase
     .from("messages")
     .select(
-      "id, thread_id, sender_type, sender_id, content, status, type, interrupted_by, created_at"
+      "id, thread_id, sender_type, sender_id, content, status, type, interrupted_by, created_at, model_tier, model_provider"
     )
     .eq("room_id", id)
     .order("created_at", { ascending: true });
@@ -167,6 +168,8 @@ export default async function RoomPage({
     type: m.type ?? "text",
     interruptedBy: m.interrupted_by ?? null,
     createdAt: m.created_at,
+    modelTier: m.model_tier ?? null,
+    modelProvider: m.model_provider ?? null,
   }));
 
   const initialMembers: RoomMember[] = participants.map((p) => {
@@ -191,6 +194,7 @@ export default async function RoomPage({
       initialMembers={initialMembers}
       initialThreads={initialThreads}
       initialThreadParticipants={initialThreadParticipants}
+      initialPersonality={(room.personality as Personality | null) ?? "default"}
     />
   );
 }

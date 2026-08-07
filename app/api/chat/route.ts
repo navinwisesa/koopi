@@ -4,6 +4,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { SandboxRun, type RunResult } from "@/lib/sandbox";
 import { classifyIntent } from "@/lib/intentClassifier";
+import type { Personality } from "@/components/PersonalitySelector";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -49,8 +50,25 @@ response.
 
 Any participant can interrupt you mid-response, so lead with the most useful thing
 first rather than building up to it. Be concise and concrete; prefer short code
-examples over long prose. If teammates disagree, say so plainly instead of quietly
-picking one side.
+examples over long prose.
+
+[EVALUATIVE STANCE — core behavior]
+When a message involves a decision, plan, or claim — especially one connected to prior
+discussion in this room's memory — do not simply validate or agree by default. Actively
+evaluate it:
+- If it conflicts with something already decided or stated by someone else in this room's
+  history, say so explicitly and cite what conflicts and who said it.
+- If it has a real risk, tradeoff, or flaw, name it plainly, even if unprompted and even if
+  the person asking sounds confident.
+- If multiple teammates have expressed different views on the same topic in this room's
+  history, reflect that disagreement back rather than picking a side to please whoever's
+  currently asking.
+- Agreement should only happen when something genuinely holds up to scrutiny against the
+  room's actual history — not by default, and not just because one person asked.
+This is a core behavior rule, not a style choice: it holds regardless of any tone or
+brevity preference stated elsewhere in this prompt. A short reply is still expected to
+surface a real conflict or risk, not omit it for the sake of length.
+[END EVALUATIVE STANCE]
 
 You have a run_code tool that actually executes code in an isolated sandbox and
 returns its stdout, stderr, and exit code. Only call it when the task genuinely
@@ -74,12 +92,57 @@ room's activity across all its threads. Given the existing summary (if any) and 
 messages since then, write an updated summary. Focus only on: key decisions made, what
 was built or changed, and notable constraints or preferences any participant stated.
 Skip small talk and routine back-and-forth. Keep it tight — a few sentences, not a
-transcript. Write neutral third-person notes, not addressed to anyone.`;
+transcript. Write neutral third-person notes, not addressed to anyone.
+
+Attribute key statements, decisions, and opinions to the specific person who made them,
+by name — e.g. "Navin proposed using Postgres; test2 later suggested MongoDB instead" —
+never collapse them into an unattributed group statement like "the team discussed
+database options." If two participants expressed conflicting views on the same topic,
+preserve both positions and who holds each one; do not resolve them into a single
+consensus. This attribution is required, not optional — another part of the system
+relies on knowing who said what to detect disagreement against this summary later, not
+just knowing that a topic came up.`;
 
 // Regenerate the room summary once a summary already exists and this many new
 // messages have accrued since — frequent enough to stay useful, far cheaper
 // than redoing it on every single message.
 const MEMORY_REGEN_THRESHOLD = 20;
+
+// Tone/style only — deliberately says nothing about tools, scoping, or what
+// Koopi is allowed to do. That's enforced entirely by SYSTEM_PROMPT above and
+// must never be reweighted by a personality choice.
+const PERSONALITY_PROMPTS: Record<Exclude<Personality, "default">, string> = {
+  concise:
+    "Be as brief as possible. No preamble, no restating the question, no " +
+    "closing summary unless it genuinely adds something. Lead with the direct " +
+    "answer or result over explanation.",
+  explanatory:
+    "Walk through your reasoning, not just the answer. When you run code, " +
+    "briefly explain what it does and why, both before and after showing the " +
+    "output. Optimize for the person understanding the decision, not just " +
+    "receiving a result.",
+  casual:
+    "Use a relaxed, informal, warm tone. Stay fully competent and accurate — " +
+    "this changes wording and warmth, not correctness or effort. No slang that " +
+    "obscures meaning, no forced jokes.",
+  direct:
+    "Be blunt and matter-of-fact. State findings plainly, including " +
+    "disagreement or problems with what was asked, without softening. Stay " +
+    "respectful, just not diplomatic-by-default.",
+};
+
+// Appended after every other section, never before — a personality choice
+// must never be positioned where it could compete with or precede the
+// tool-use and scoping rules in SYSTEM_PROMPT.
+function personalityBlock(personality: Personality): string {
+  if (personality === "default") return "";
+  return (
+    `\n\n[STYLE PREFERENCE — affects tone and phrasing only]\n` +
+    `${PERSONALITY_PROMPTS[personality]}\n` +
+    `[END STYLE PREFERENCE — the above does not override any instructions ` +
+    `elsewhere in this prompt regarding tool use, scoping, or behavior]`
+  );
+}
 
 const RUN_CODE_TOOL: Groq.Chat.ChatCompletionTool = {
   type: "function",
@@ -384,10 +447,26 @@ export async function POST(request: Request) {
     }
   }
 
-  const roomMemory = await getRoomMemory();
-  const effectiveSystemPrompt = roomMemory
-    ? `${SYSTEM_PROMPT}\n\nRoom memory (prior activity in this room, across other threads):\n${roomMemory}`
-    : SYSTEM_PROMPT;
+  // Style only — kept independent of getRoomMemory's more involved query so a
+  // personality change is never gated on the memory-regeneration logic above.
+  async function getRoomPersonality(): Promise<Personality> {
+    const { data: room } = await supabase
+      .from("rooms")
+      .select("personality")
+      .eq("id", roomId)
+      .maybeSingle();
+    return (room?.personality as Personality | null) ?? "default";
+  }
+
+  const [roomMemory, personality] = await Promise.all([
+    getRoomMemory(),
+    getRoomPersonality(),
+  ]);
+
+  const effectiveSystemPrompt =
+    (roomMemory
+      ? `${SYSTEM_PROMPT}\n\nRoom memory (prior activity in this room, across other threads):\n${roomMemory}`
+      : SYSTEM_PROMPT) + personalityBlock(personality);
 
   const isRateLimited = (err: unknown) =>
     err instanceof Groq.RateLimitError || err instanceof OpenAI.RateLimitError;
@@ -488,6 +567,10 @@ export async function POST(request: Request) {
     }
 
     let stream: ChatStream;
+    // Recorded onto the agent's message row so the UI can show which tier and
+    // provider actually answered — the composer's tier choice doesn't always
+    // match reality once a fallback kicks in.
+    let provider: "cerebras" | "groq" | "openrouter" = "cerebras";
     try {
       stream = (await cerebras.chat.completions.create({
         model: CEREBRAS_MODEL,
@@ -509,6 +592,7 @@ export async function POST(request: Request) {
         const fallback = await attemptOpenrouterOrFail(cerebrasErr);
         if (!fallback) return { kind: "text" };
         stream = fallback;
+        provider = "openrouter";
       } else {
         try {
           stream = (await groq.chat.completions.create({
@@ -518,6 +602,7 @@ export async function POST(request: Request) {
             tools: [RUN_CODE_TOOL],
             messages: requestMessages,
           })) as ChatStream;
+          provider = "groq";
         } catch (groqErr) {
           // Only fail over further on a genuine quota/availability problem —
           // anything else would just fail identically on OpenRouter too.
@@ -528,6 +613,7 @@ export async function POST(request: Request) {
           const fallback = await attemptOpenrouterOrFail(groqErr);
           if (!fallback) return { kind: "text" };
           stream = fallback;
+          provider = "openrouter";
         }
       }
     }
@@ -566,6 +652,8 @@ export async function POST(request: Request) {
                 type: "text",
                 content: "",
                 status: "streaming",
+                model_tier: intent,
+                model_provider: provider,
               })
               .select("id")
               .single();
