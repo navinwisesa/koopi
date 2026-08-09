@@ -9,9 +9,9 @@ import {
   type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
-  type ReactNode,
 } from "react";
 import Link from "next/link";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import {
   Link2,
   Check,
@@ -96,47 +96,6 @@ function parseJson<T>(raw: string, fallback: T): T {
   }
 }
 
-const KOOPI_MENTION = "Koopi";
-
-// Finds the "@partial" fragment the cursor is currently sitting inside, if any —
-// an "@" preceded by start-of-string or whitespace, with no whitespace since.
-function detectMention(
-  text: string,
-  cursor: number
-): { start: number; query: string } | null {
-  let i = cursor;
-  while (i > 0 && !/\s/.test(text[i - 1])) {
-    i--;
-    if (text[i] === "@") {
-      const before = text[i - 1];
-      if (i === 0 || /\s/.test(before)) {
-        return { start: i, query: text.slice(i + 1, cursor) };
-      }
-      return null;
-    }
-  }
-  return null;
-}
-
-function mentionsKoopi(text: string) {
-  return new RegExp(`(^|\\s)@${KOOPI_MENTION}\\b`, "i").test(text);
-}
-
-function renderWithMentions(text: string, knownNames: string[]): ReactNode {
-  if (!knownNames.length || !text.includes("@")) return text;
-  const lower = new Set(knownNames.map((n) => n.toLowerCase()));
-  const parts = text.split(/(@[A-Za-z0-9_]+)/g);
-  return parts.map((part, i) =>
-    part.startsWith("@") && lower.has(part.slice(1).toLowerCase()) ? (
-      <span key={i} className="rounded bg-accent/20 px-1 font-medium text-accent">
-        {part}
-      </span>
-    ) : (
-      <span key={i}>{part}</span>
-    )
-  );
-}
-
 function rowToThread(row: Record<string, unknown>): Thread {
   return {
     id: row.id as string,
@@ -158,6 +117,8 @@ export default function RoomView({
   initialThreads,
   initialThreadParticipants,
   initialLastReadAt,
+  initialKoopiActive,
+  initialParticipantKoopiActive,
   initialPersonality,
 }: {
   roomId: string;
@@ -170,6 +131,8 @@ export default function RoomView({
   initialThreads: Thread[];
   initialThreadParticipants: Record<string, string[]>;
   initialLastReadAt: Record<string, string | null>;
+  initialKoopiActive: Record<string, boolean>;
+  initialParticipantKoopiActive: Record<string, Record<string, boolean>>;
   initialPersonality: Personality;
 }) {
   const supabase = useMemo(() => createClient(), []);
@@ -185,6 +148,19 @@ export default function RoomView({
   const [lastReadAt, setLastReadAt] = useState<Record<string, string | null>>(
     initialLastReadAt
   );
+  // Current user's own "Ask Koopi" setting per thread — the sole gate on whether
+  // THEIR OWN messages trigger a reply. Never affected by anyone else's setting.
+  const [koopiActive, setKoopiActiveState] = useState<Record<string, boolean>>(
+    initialKoopiActive
+  );
+  // Every participant's setting per thread, so the composer can show "Koopi also
+  // answers: ..." — each person's setting is independent, so this is purely informational.
+  const [participantKoopiActive, setParticipantKoopiActive] = useState<
+    Record<string, Record<string, boolean>>
+  >(initialParticipantKoopiActive);
+  // Threads with a Koopi reply currently in flight (broadcast, not persisted — purely
+  // ephemeral UI state, same as any chat app's typing indicator).
+  const [typingThreads, setTypingThreads] = useState<Set<string>>(new Set());
   const [activeThreadId, setActiveThreadId] = useState<string | null>(
     // Threads arrive newest-first, so the most recent conversation opens.
     initialThreads[0]?.id ?? null
@@ -200,13 +176,6 @@ export default function RoomView({
   // pin every message from this composer to one tier until switched back.
   const [modelMode, setModelMode] = useState<"auto" | "chat" | "build">("auto");
 
-  const [mentionState, setMentionState] = useState<{
-    start: number;
-    query: string;
-  } | null>(null);
-  const [mentionIndex, setMentionIndex] = useState(0);
-  const composerRef = useRef<HTMLTextAreaElement>(null);
-
   const [name, setName] = useState(initialName);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(initialName);
@@ -215,6 +184,9 @@ export default function RoomView({
   const [now, setNow] = useState(() => Date.now());
 
   const bottomRef = useRef<HTMLDivElement>(null);
+  // The messages channel also carries the "typing" broadcast (see the realtime effect
+  // below) — stashed in a ref so handleSend can send() on it without re-subscribing.
+  const messagesChannelRef = useRef<RealtimeChannel | null>(null);
 
   const threadMessages = useMemo(
     () =>
@@ -238,52 +210,34 @@ export default function RoomView({
     [activeThreadId, threadParticipants]
   );
 
-  // Everyone the @ dropdown can offer, excluding yourself — tagging yourself
-  // doesn't do anything useful.
-  const mentionMembers = useMemo(
-    () =>
-      activeThreadParticipantIds
-        .filter((id) => id !== currentUserId)
-        .map((id) => memberById.get(id))
-        .filter((m): m is RoomMember => Boolean(m)),
-    [activeThreadParticipantIds, memberById, currentUserId]
-  );
+  // My own setting for the open thread — the sole gate on whether my messages
+  // trigger Koopi. Defaults true to match the column default for a thread whose
+  // participant row hasn't round-tripped through state yet.
+  const myKoopiActive = activeThreadId ? (koopiActive[activeThreadId] ?? true) : true;
 
-  const mentionMemberByName = useMemo(() => {
-    const map = new Map<string, RoomMember>();
-    for (const m of mentionMembers) map.set(m.username, m);
-    return map;
-  }, [mentionMembers]);
-
-  const mentionCandidates = useMemo(
-    () => [KOOPI_MENTION, ...mentionMembers.map((m) => m.username)],
-    [mentionMembers]
-  );
-
-  // Everyone a message could legitimately mention, including yourself — used
-  // to decide what to highlight when rendering someone else's message.
-  const allMentionNames = useMemo(() => {
-    const names = activeThreadParticipantIds
+  // Other participants in the open thread who currently have Koopi answering them —
+  // purely informational, since each person's setting only ever affects their own
+  // messages. Explains why Koopi might reply to one person's messages but not another's
+  // in the same live conversation.
+  const othersKoopiActive = useMemo(() => {
+    if (!activeThreadId) return [];
+    const settings = participantKoopiActive[activeThreadId] ?? {};
+    return activeThreadParticipantIds
+      .filter((id) => id !== currentUserId)
+      .filter((id) => settings[id] ?? true)
       .map((id) => memberById.get(id)?.username)
       .filter((n): n is string => Boolean(n));
-    return [KOOPI_MENTION, ...names];
-  }, [activeThreadParticipantIds, memberById]);
+  }, [activeThreadId, participantKoopiActive, activeThreadParticipantIds, currentUserId, memberById]);
 
-  const mentionOptions = useMemo(() => {
-    if (!mentionState) return [];
-    const q = mentionState.query.toLowerCase();
-    return mentionCandidates.filter((name) => name.toLowerCase().startsWith(q)).slice(0, 6);
-  }, [mentionState, mentionCandidates]);
+  const isActiveThreadTyping = Boolean(activeThreadId && typingThreads.has(activeThreadId));
 
-  // A thread with 2+ people is a group conversation — Koopi only jumps in
-  // when explicitly tagged there, so humans can talk without waking it up.
-  // Solo threads (just you) keep the old always-respond behavior.
-  const requiresMention = activeThreadParticipantIds.length >= 2;
-
-  // --- realtime: messages -------------------------------------------------
+  // --- realtime: messages (+ typing broadcast, same channel) --------------
   useEffect(() => {
+    // { self: true } so the sender's own client also sees its own typing broadcasts —
+    // "Koopi is typing" should look identical for the sender and everyone else, not
+    // need separate local-optimistic-state just for the one person who sent it.
     const channel = supabase
-      .channel(`room:${roomId}:messages`)
+      .channel(`room:${roomId}:messages`, { config: { broadcast: { self: true } } })
       .on(
         "postgres_changes",
         {
@@ -323,14 +277,55 @@ export default function RoomView({
             copy[at] = next;
             return copy;
           });
+
+          // The first row for a reply is inserted the moment the first token arrives
+          // server-side (or, on failure, the failure-notice row) — either way, a real
+          // agent row showing up is exactly the "stop showing typing" moment, precise
+          // down to the same event that puts the real content on screen.
+          if (next.senderType === "agent") {
+            setTypingThreads((prev) => {
+              if (!prev.has(next.threadId)) return prev;
+              const copy = new Set(prev);
+              copy.delete(next.threadId);
+              return copy;
+            });
+          }
         }
       )
+      .on("broadcast", { event: "typing" }, (payload) => {
+        const { threadId, active } = payload.payload as {
+          threadId: string;
+          active: boolean;
+        };
+        setTypingThreads((prev) => {
+          const alreadySet = prev.has(threadId);
+          if (active === alreadySet) return prev;
+          const copy = new Set(prev);
+          if (active) copy.add(threadId);
+          else copy.delete(threadId);
+          return copy;
+        });
+      })
       .subscribe();
 
+    messagesChannelRef.current = channel;
+
     return () => {
+      messagesChannelRef.current = null;
       supabase.removeChannel(channel);
     };
   }, [supabase, roomId]);
+
+  // Broadcasts on the shared messages channel — a no-op (not an error) if the channel
+  // hasn't finished subscribing yet, which only matters for a request fired in the
+  // first instant after mount.
+  const broadcastTyping = useCallback((threadId: string, active: boolean) => {
+    void messagesChannelRef.current?.send({
+      type: "broadcast",
+      event: "typing",
+      payload: { threadId, active },
+    });
+  }, []);
 
   // --- realtime: threads --------------------------------------------------
   useEffect(() => {
@@ -416,6 +411,18 @@ export default function RoomView({
           if (userId === currentUserId) {
             const lastRead = (row?.last_read_at as string | null) ?? null;
             setLastReadAt((prev) => ({ ...prev, [threadId]: lastRead }));
+          }
+
+          // koopi_active, unlike last_read_at, matters for EVERY participant — it's
+          // what powers the "Koopi also answers: ..." hint, so every row's value gets
+          // tracked, not just our own.
+          const active = (row?.koopi_active as boolean | null) ?? true;
+          setParticipantKoopiActive((prev) => ({
+            ...prev,
+            [threadId]: { ...(prev[threadId] ?? {}), [userId]: active },
+          }));
+          if (userId === currentUserId) {
+            setKoopiActiveState((prev) => ({ ...prev, [threadId]: active }));
           }
         }
       )
@@ -559,6 +566,26 @@ export default function RoomView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeThreadId]);
 
+  // --- "Ask Koopi" toggle --------------------------------------------------
+  // Purely a per-user, per-thread setting — writing it never touches anyone else's
+  // row, and reading it (via participantKoopiActive) never lets one person's toggle
+  // change what another person's messages do.
+  const setMyKoopiActive = useCallback(
+    (threadId: string, active: boolean) => {
+      setKoopiActiveState((prev) => ({ ...prev, [threadId]: active }));
+      setParticipantKoopiActive((prev) => ({
+        ...prev,
+        [threadId]: { ...(prev[threadId] ?? {}), [currentUserId]: active },
+      }));
+      void supabase
+        .from("thread_participants")
+        .update({ koopi_active: active })
+        .eq("thread_id", threadId)
+        .eq("user_id", currentUserId);
+    },
+    [supabase, currentUserId]
+  );
+
   // A thread counts as unread if it has a message newer than our last visit that we
   // didn't send ourselves — our own messages don't need to notify us of themselves.
   // The active thread is excluded outright: it's on screen, so by definition read.
@@ -582,8 +609,14 @@ export default function RoomView({
         : [created, ...prev].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     );
     // Seed participants immediately so the directory groups it correctly
-    // right away, instead of waiting on the realtime round trip.
+    // right away, instead of waiting on the realtime round trip. Matches the
+    // koopi_active column default — nobody has touched the toggle yet.
     setThreadParticipants((prev) => ({ ...prev, [created.id]: participantIds }));
+    setKoopiActiveState((prev) => ({ ...prev, [created.id]: true }));
+    setParticipantKoopiActive((prev) => ({
+      ...prev,
+      [created.id]: Object.fromEntries(participantIds.map((id) => [id, true])),
+    }));
     setActiveThreadId(created.id);
     setNewChatOpen(false);
     if (isNarrowViewport()) setSidebarOpen(false);
@@ -595,13 +628,11 @@ export default function RoomView({
     if (!text || sending || isStreaming || !activeThreadId) return;
 
     const threadId = activeThreadId;
-    // A group thread only wakes Koopi up when it's actually tagged — humans
-    // can otherwise talk amongst themselves without an uninvited reply.
-    const shouldInvokeAgent = !requiresMention || mentionsKoopi(text);
+    // Purely the sender's own setting — replaces the old @-mention trigger entirely.
+    const shouldInvokeAgent = koopiActive[threadId] ?? true;
     setError(null);
     setSending(true);
     setDraft("");
-    setMentionState(null);
 
     try {
       const { data: inserted, error: insertError } = await supabase
@@ -620,23 +651,32 @@ export default function RoomView({
 
       if (!shouldInvokeAgent) return;
 
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          threadId,
-          triggerMessageId: inserted.id,
-          modelOverride: modelMode === "auto" ? undefined : modelMode,
-        }),
-      });
+      broadcastTyping(threadId, true);
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            threadId,
+            triggerMessageId: inserted.id,
+            modelOverride: modelMode === "auto" ? undefined : modelMode,
+          }),
+        });
 
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.error ?? "The agent could not respond.");
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}));
+          throw new Error(detail.error ?? "The agent could not respond.");
+        }
+
+        // Content lands via realtime; draining keeps the connection open.
+        await res.text();
+      } finally {
+        // Tied to the request actually settling — success or failure — not a fixed
+        // timer, so the indicator can never get stuck. The row-insert-based clear in
+        // the messages effect above is what handles the normal "first token arrived"
+        // case; this is the backstop for the rare case where no row ever lands at all.
+        broadcastTyping(threadId, false);
       }
-
-      // Content lands via realtime; draining keeps the connection open.
-      await res.text();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong.");
     } finally {
@@ -695,57 +735,10 @@ export default function RoomView({
   }
 
   function handleComposerChange(e: ChangeEvent<HTMLTextAreaElement>) {
-    const value = e.target.value;
-    setDraft(value);
-    const cursor = e.target.selectionStart ?? value.length;
-    const mention = detectMention(value, cursor);
-    setMentionState(mention);
-    setMentionIndex(0);
-  }
-
-  function selectMention(name: string) {
-    if (!mentionState) return;
-    const cursor = mentionState.start + 1 + mentionState.query.length;
-    const before = draft.slice(0, mentionState.start);
-    const after = draft.slice(cursor);
-    const next = `${before}@${name} ${after}`;
-    setDraft(next);
-    setMentionState(null);
-
-    const caretPos = before.length + name.length + 2; // "@" + name + trailing space
-    requestAnimationFrame(() => {
-      const el = composerRef.current;
-      if (el) {
-        el.focus();
-        el.setSelectionRange(caretPos, caretPos);
-      }
-    });
+    setDraft(e.target.value);
   }
 
   function onInputKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
-    if (mentionState && mentionOptions.length > 0) {
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setMentionIndex((i) => (i + 1) % mentionOptions.length);
-        return;
-      }
-      if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setMentionIndex((i) => (i - 1 + mentionOptions.length) % mentionOptions.length);
-        return;
-      }
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        selectMention(mentionOptions[mentionIndex]);
-        return;
-      }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        setMentionState(null);
-        return;
-      }
-    }
-
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void handleSend(e as unknown as FormEvent);
@@ -910,7 +903,7 @@ export default function RoomView({
             {/* ---------- transcript ---------- */}
             <div className="min-h-0 flex-1 overflow-y-auto">
               <div className="mx-auto max-w-3xl px-6 py-8">
-                {threadMessages.length === 0 ? (
+                {threadMessages.length === 0 && !isActiveThreadTyping ? (
                   <div className="flex h-full min-h-[40vh] items-center justify-center">
                     <p className="text-sm text-muted">
                       Send a message to get started
@@ -1102,7 +1095,7 @@ export default function RoomView({
                                 }`}
                               >
                                 {m.content ? (
-                                  renderWithMentions(m.content, allMentionNames)
+                                  m.content
                                 ) : (
                                   <span className="text-muted">
                                     {m.status === "streaming" ? "Thinking…" : "—"}
@@ -1123,6 +1116,24 @@ export default function RoomView({
                         </li>
                       );
                     })}
+                    {isActiveThreadTyping && !isStreaming && (
+                      <li className="flex gap-3">
+                        <span
+                          aria-hidden="true"
+                          title="Koopi Kapi — responding"
+                          className="flex h-8 w-8 shrink-0 animate-pulse items-center justify-center rounded-full bg-accent/15 text-base ring-2 ring-accent/50"
+                        >
+                          🦫
+                        </span>
+                        <div className="flex items-center">
+                          <div className="mt-1 flex items-center gap-1 rounded-lg bg-surface px-4 py-3.5">
+                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.3s]" />
+                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.15s]" />
+                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted" />
+                          </div>
+                        </div>
+                      </li>
+                    )}
                   </ul>
                 )}
                 <div ref={bottomRef} />
@@ -1132,6 +1143,48 @@ export default function RoomView({
             {/* ---------- composer ---------- */}
             <div className="shrink-0 border-t border-border bg-background">
               <div className="mx-auto max-w-3xl px-6 py-4">
+                {/* Deliberately the most prominent thing above the composer — this
+                    replaced @-mention tagging entirely, so it has to be impossible to
+                    miss, not a tucked-away setting. */}
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5 rounded-lg border border-border bg-surface px-3 py-2">
+                  <div className="flex items-center gap-2">
+                    <span className="font-display text-sm font-semibold text-foreground">
+                      Should Koopi answer you?
+                    </span>
+                    <div className="flex items-center gap-0.5 rounded-full border border-border bg-background p-0.5">
+                      <button
+                        type="button"
+                        onClick={() => activeThreadId && setMyKoopiActive(activeThreadId, true)}
+                        aria-pressed={myKoopiActive}
+                        className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                          myKoopiActive
+                            ? "bg-accent text-accent-foreground"
+                            : "text-muted hover:bg-surface hover:text-foreground"
+                        }`}
+                      >
+                        Yes
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => activeThreadId && setMyKoopiActive(activeThreadId, false)}
+                        aria-pressed={!myKoopiActive}
+                        className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                          !myKoopiActive
+                            ? "bg-accent text-accent-foreground"
+                            : "text-muted hover:bg-surface hover:text-foreground"
+                        }`}
+                      >
+                        No
+                      </button>
+                    </div>
+                  </div>
+                  {othersKoopiActive.length > 0 && (
+                    <span className="text-xs text-muted">
+                      Koopi also answers: {othersKoopiActive.join(", ")}
+                    </span>
+                  )}
+                </div>
+
                 <div className="mb-2 flex items-center justify-end gap-1.5">
                   <span className="text-xs text-muted">Model</span>
                   <div className="flex items-center gap-0.5 rounded-full border border-border bg-surface p-0.5">
@@ -1200,60 +1253,17 @@ export default function RoomView({
                 )}
 
                 <form onSubmit={handleSend} className="relative flex items-end gap-2">
-                  {mentionState && mentionOptions.length > 0 && (
-                    <ul className="absolute bottom-full left-0 mb-1.5 w-56 overflow-hidden rounded-lg border border-border bg-surface shadow-xl">
-                      {mentionOptions.map((name, i) => (
-                        <li key={name}>
-                          <button
-                            type="button"
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => selectMention(name)}
-                            className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
-                              i === mentionIndex
-                                ? "bg-accent/15 text-foreground"
-                                : "text-foreground hover:bg-background"
-                            }`}
-                          >
-                            {name === KOOPI_MENTION ? (
-                              <span
-                                aria-hidden="true"
-                                className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent/15 text-xs"
-                              >
-                                🦫
-                              </span>
-                            ) : (
-                              <Avatar
-                                name={name}
-                                src={mentionMemberByName.get(name)?.avatarUrl ?? null}
-                                size="sm"
-                              />
-                            )}
-                            {name}
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-
                   <label htmlFor="composer" className="sr-only">
                     Message
                   </label>
                   <textarea
                     id="composer"
-                    ref={composerRef}
                     rows={1}
                     value={draft}
                     disabled={isStreaming}
                     onChange={handleComposerChange}
                     onKeyDown={onInputKeyDown}
-                    onBlur={() => setMentionState(null)}
-                    placeholder={
-                      isStreaming
-                        ? "Koopi is responding…"
-                        : requiresMention
-                          ? "Message the room… (tag @Koopi for a response)"
-                          : "Message the room…"
-                    }
+                    placeholder={isStreaming ? "Koopi is responding…" : "Message the room…"}
                     className="max-h-40 min-h-[46px] flex-1 resize-y rounded-lg border border-border bg-surface px-4 py-3 text-sm text-foreground placeholder:text-muted focus:border-accent focus:outline-none disabled:opacity-60"
                   />
                   <button

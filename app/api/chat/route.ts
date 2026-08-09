@@ -337,7 +337,7 @@ export async function POST(request: Request) {
   // person's message land first and try to answer both in one reply.
   const { data: triggerRow } = await supabase
     .from("messages")
-    .select("created_at, profiles!sender_id(username)")
+    .select("created_at, sender_id, profiles!sender_id(username)")
     .eq("id", triggerMessageId)
     .eq("thread_id", threadId)
     .maybeSingle();
@@ -345,6 +345,25 @@ export async function POST(request: Request) {
   if (!triggerRow) {
     return NextResponse.json({ error: "Triggering message not found" }, { status: 404 });
   }
+
+  // Defense in depth for the per-user "Ask Koopi" toggle: the composer already gates
+  // whether it calls this endpoint at all based on the sender's own setting, so this
+  // only matters if that state was stale at send time or the endpoint was hit directly
+  // — but the whole point of the toggle is to guarantee no model call happens for
+  // someone who turned it off, so it's worth the one extra query rather than trusting
+  // the client alone.
+  if (triggerRow.sender_id) {
+    const { data: senderParticipant } = await supabase
+      .from("thread_participants")
+      .select("koopi_active")
+      .eq("thread_id", threadId)
+      .eq("user_id", triggerRow.sender_id)
+      .maybeSingle();
+    if (senderParticipant?.koopi_active === false) {
+      return new Response(null, { status: 204 });
+    }
+  }
+
   const triggerUsername = firstOf(triggerRow.profiles)?.username ?? "there";
   const triggerCreatedAt = triggerRow.created_at;
 

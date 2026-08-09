@@ -138,7 +138,7 @@ export default async function RoomPage({
   const { data: threadParticipantRows } = threadIds.length
     ? await supabase
         .from("thread_participants")
-        .select("thread_id, user_id, seq, last_read_at")
+        .select("thread_id, user_id, seq, last_read_at, koopi_active")
         .in("thread_id", threadIds)
         .order("seq", { ascending: true })
     : { data: [] };
@@ -147,9 +147,19 @@ export default async function RoomPage({
   // Only the current user's own last_read_at is meaningful client-side — unread state
   // is per-viewer, not a shared property of the thread.
   const initialLastReadAt: Record<string, string | null> = {};
+  // The current user's own "Ask Koopi" setting per thread — what actually gates whether
+  // their own messages trigger a reply.
+  const initialKoopiActive: Record<string, boolean> = {};
+  // Every participant's setting, per thread — powers the "who else Koopi answers" hint
+  // next to the toggle, since each person's setting is independent.
+  const initialParticipantKoopiActive: Record<string, Record<string, boolean>> = {};
   for (const row of threadParticipantRows ?? []) {
     (initialThreadParticipants[row.thread_id] ??= []).push(row.user_id);
-    if (row.user_id === user.id) initialLastReadAt[row.thread_id] = row.last_read_at;
+    if (row.user_id === user.id) {
+      initialLastReadAt[row.thread_id] = row.last_read_at;
+      initialKoopiActive[row.thread_id] = row.koopi_active;
+    }
+    (initialParticipantKoopiActive[row.thread_id] ??= {})[row.user_id] = row.koopi_active;
   }
 
   // Every thread in the room loads at once — switching threads is then a local
@@ -201,6 +211,8 @@ export default async function RoomPage({
       initialThreads={initialThreads}
       initialThreadParticipants={initialThreadParticipants}
       initialLastReadAt={initialLastReadAt}
+      initialKoopiActive={initialKoopiActive}
+      initialParticipantKoopiActive={initialParticipantKoopiActive}
       initialPersonality={(room.personality as Personality | null) ?? "default"}
     />
   );
