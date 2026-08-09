@@ -9,6 +9,7 @@ import {
   type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import Link from "next/link";
 import type { RealtimeChannel } from "@supabase/supabase-js";
@@ -96,6 +97,44 @@ function parseJson<T>(raw: string, fallback: T): T {
   }
 }
 
+// Finds the "@partial" fragment the cursor is currently sitting inside, if any —
+// an "@" preceded by start-of-string or whitespace, with no whitespace since.
+// Purely a text-composition affordance now — tagging someone here never triggers
+// Koopi (that's governed entirely by the per-user toggle below the transcript), so
+// this only ever offers/highlights human teammates.
+function detectMention(
+  text: string,
+  cursor: number
+): { start: number; query: string } | null {
+  let i = cursor;
+  while (i > 0 && !/\s/.test(text[i - 1])) {
+    i--;
+    if (text[i] === "@") {
+      const before = text[i - 1];
+      if (i === 0 || /\s/.test(before)) {
+        return { start: i, query: text.slice(i + 1, cursor) };
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+function renderWithMentions(text: string, knownNames: string[]): ReactNode {
+  if (!knownNames.length || !text.includes("@")) return text;
+  const lower = new Set(knownNames.map((n) => n.toLowerCase()));
+  const parts = text.split(/(@[A-Za-z0-9_]+)/g);
+  return parts.map((part, i) =>
+    part.startsWith("@") && lower.has(part.slice(1).toLowerCase()) ? (
+      <span key={i} className="rounded bg-accent/20 px-1 font-medium text-accent">
+        {part}
+      </span>
+    ) : (
+      <span key={i}>{part}</span>
+    )
+  );
+}
+
 function rowToThread(row: Record<string, unknown>): Thread {
   return {
     id: row.id as string,
@@ -176,6 +215,13 @@ export default function RoomView({
   // pin every message from this composer to one tier until switched back.
   const [modelMode, setModelMode] = useState<"auto" | "chat" | "build">("auto");
 
+  const [mentionState, setMentionState] = useState<{
+    start: number;
+    query: string;
+  } | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+
   const [name, setName] = useState(initialName);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(initialName);
@@ -209,6 +255,45 @@ export default function RoomView({
     () => (activeThreadId ? (threadParticipants[activeThreadId] ?? []) : []),
     [activeThreadId, threadParticipants]
   );
+
+  // Everyone the @ dropdown can offer, excluding yourself — tagging yourself doesn't
+  // do anything useful. Human teammates only — Koopi isn't a taggable target anymore,
+  // since tagging never triggered it in the first place (the toggle does that).
+  const mentionMembers = useMemo(
+    () =>
+      activeThreadParticipantIds
+        .filter((id) => id !== currentUserId)
+        .map((id) => memberById.get(id))
+        .filter((m): m is RoomMember => Boolean(m)),
+    [activeThreadParticipantIds, memberById, currentUserId]
+  );
+
+  const mentionMemberByName = useMemo(() => {
+    const map = new Map<string, RoomMember>();
+    for (const m of mentionMembers) map.set(m.username, m);
+    return map;
+  }, [mentionMembers]);
+
+  const mentionCandidates = useMemo(
+    () => mentionMembers.map((m) => m.username),
+    [mentionMembers]
+  );
+
+  // Everyone a message could legitimately mention, including yourself — used to
+  // decide what to highlight when rendering someone else's message.
+  const allMentionNames = useMemo(
+    () =>
+      activeThreadParticipantIds
+        .map((id) => memberById.get(id)?.username)
+        .filter((n): n is string => Boolean(n)),
+    [activeThreadParticipantIds, memberById]
+  );
+
+  const mentionOptions = useMemo(() => {
+    if (!mentionState) return [];
+    const q = mentionState.query.toLowerCase();
+    return mentionCandidates.filter((name) => name.toLowerCase().startsWith(q)).slice(0, 6);
+  }, [mentionState, mentionCandidates]);
 
   // My own setting for the open thread — the sole gate on whether my messages
   // trigger Koopi. Defaults true to match the column default for a thread whose
@@ -642,6 +727,7 @@ export default function RoomView({
     setError(null);
     setSending(true);
     setDraft("");
+    setMentionState(null);
 
     try {
       const { data: inserted, error: insertError } = await supabase
@@ -744,10 +830,57 @@ export default function RoomView({
   }
 
   function handleComposerChange(e: ChangeEvent<HTMLTextAreaElement>) {
-    setDraft(e.target.value);
+    const value = e.target.value;
+    setDraft(value);
+    const cursor = e.target.selectionStart ?? value.length;
+    const mention = detectMention(value, cursor);
+    setMentionState(mention);
+    setMentionIndex(0);
+  }
+
+  function selectMention(name: string) {
+    if (!mentionState) return;
+    const cursor = mentionState.start + 1 + mentionState.query.length;
+    const before = draft.slice(0, mentionState.start);
+    const after = draft.slice(cursor);
+    const next = `${before}@${name} ${after}`;
+    setDraft(next);
+    setMentionState(null);
+
+    const caretPos = before.length + name.length + 2; // "@" + name + trailing space
+    requestAnimationFrame(() => {
+      const el = composerRef.current;
+      if (el) {
+        el.focus();
+        el.setSelectionRange(caretPos, caretPos);
+      }
+    });
   }
 
   function onInputKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (mentionState && mentionOptions.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setMentionIndex((i) => (i + 1) % mentionOptions.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setMentionIndex((i) => (i - 1 + mentionOptions.length) % mentionOptions.length);
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        selectMention(mentionOptions[mentionIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setMentionState(null);
+        return;
+      }
+    }
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void handleSend(e as unknown as FormEvent);
@@ -1104,7 +1237,7 @@ export default function RoomView({
                                 }`}
                               >
                                 {m.content ? (
-                                  m.content
+                                  renderWithMentions(m.content, allMentionNames)
                                 ) : (
                                   <span className="text-muted">
                                     {m.status === "streaming" ? "Thinking…" : "—"}
@@ -1262,16 +1395,44 @@ export default function RoomView({
                 )}
 
                 <form onSubmit={handleSend} className="relative flex items-end gap-2">
+                  {mentionState && mentionOptions.length > 0 && (
+                    <ul className="absolute bottom-full left-0 mb-1.5 w-56 overflow-hidden rounded-lg border border-border bg-surface shadow-xl">
+                      {mentionOptions.map((name, i) => (
+                        <li key={name}>
+                          <button
+                            type="button"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => selectMention(name)}
+                            className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
+                              i === mentionIndex
+                                ? "bg-accent/15 text-foreground"
+                                : "text-foreground hover:bg-background"
+                            }`}
+                          >
+                            <Avatar
+                              name={name}
+                              src={mentionMemberByName.get(name)?.avatarUrl ?? null}
+                              size="sm"
+                            />
+                            {name}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+
                   <label htmlFor="composer" className="sr-only">
                     Message
                   </label>
                   <textarea
                     id="composer"
+                    ref={composerRef}
                     rows={1}
                     value={draft}
                     disabled={isStreaming}
                     onChange={handleComposerChange}
                     onKeyDown={onInputKeyDown}
+                    onBlur={() => setMentionState(null)}
                     placeholder={isStreaming ? "Koopi is responding…" : "Message the room…"}
                     className="max-h-40 min-h-[46px] flex-1 resize-y rounded-lg border border-border bg-surface px-4 py-3 text-sm text-foreground placeholder:text-muted focus:border-accent focus:outline-none disabled:opacity-60"
                   />
