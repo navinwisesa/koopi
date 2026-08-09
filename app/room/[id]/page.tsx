@@ -138,14 +138,18 @@ export default async function RoomPage({
   const { data: threadParticipantRows } = threadIds.length
     ? await supabase
         .from("thread_participants")
-        .select("thread_id, user_id, seq")
+        .select("thread_id, user_id, seq, last_read_at")
         .in("thread_id", threadIds)
         .order("seq", { ascending: true })
     : { data: [] };
 
   const initialThreadParticipants: Record<string, string[]> = {};
+  // Only the current user's own last_read_at is meaningful client-side — unread state
+  // is per-viewer, not a shared property of the thread.
+  const initialLastReadAt: Record<string, string | null> = {};
   for (const row of threadParticipantRows ?? []) {
     (initialThreadParticipants[row.thread_id] ??= []).push(row.user_id);
+    if (row.user_id === user.id) initialLastReadAt[row.thread_id] = row.last_read_at;
   }
 
   // Every thread in the room loads at once — switching threads is then a local
@@ -153,7 +157,7 @@ export default async function RoomPage({
   const { data: messageRows } = await supabase
     .from("messages")
     .select(
-      "id, thread_id, sender_type, sender_id, content, status, type, interrupted_by, created_at, model_tier, model_provider"
+      "id, thread_id, sender_type, sender_id, content, status, type, interrupted_by, created_at, model_tier, model_provider, used_room_memory, flagged"
     )
     .eq("room_id", id)
     .order("created_at", { ascending: true });
@@ -170,6 +174,8 @@ export default async function RoomPage({
     createdAt: m.created_at,
     modelTier: m.model_tier ?? null,
     modelProvider: m.model_provider ?? null,
+    usedRoomMemory: m.used_room_memory ?? false,
+    flagged: m.flagged ?? false,
   }));
 
   const initialMembers: RoomMember[] = participants.map((p) => {
@@ -194,6 +200,7 @@ export default async function RoomPage({
       initialMembers={initialMembers}
       initialThreads={initialThreads}
       initialThreadParticipants={initialThreadParticipants}
+      initialLastReadAt={initialLastReadAt}
       initialPersonality={(room.personality as Personality | null) ?? "default"}
     />
   );

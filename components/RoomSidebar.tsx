@@ -49,6 +49,7 @@ type Section = {
 export default function RoomSidebar({
   threads,
   threadParticipants,
+  unreadThreadIds,
   members,
   activeThreadId,
   currentUserId,
@@ -60,6 +61,7 @@ export default function RoomSidebar({
 }: {
   threads: Thread[];
   threadParticipants: Record<string, string[]>;
+  unreadThreadIds: Set<string>;
   members: RoomMember[];
   activeThreadId: string | null;
   currentUserId: string;
@@ -250,6 +252,7 @@ export default function RoomSidebar({
                         const isRenaming = renamingId === t.id;
                         const isBusy = busyId === t.id;
                         const canDelete = t.createdBy === currentUserId;
+                        const unread = unreadThreadIds.has(t.id);
 
                         return (
                           <li key={t.id}>
@@ -280,9 +283,20 @@ export default function RoomSidebar({
                                   aria-current={active ? "true" : undefined}
                                   className="flex min-w-0 flex-1 items-start gap-2 text-left disabled:opacity-50"
                                 >
+                                  {unread && (
+                                    <span
+                                      aria-hidden="true"
+                                      title="Unread"
+                                      className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
+                                    />
+                                  )}
                                   <span
                                     className={`min-w-0 flex-1 truncate font-sans text-sm ${
-                                      active ? "text-foreground" : "text-foreground/85"
+                                      unread
+                                        ? "font-semibold text-foreground"
+                                        : active
+                                          ? "text-foreground"
+                                          : "text-foreground/85"
                                     }`}
                                   >
                                     {t.title?.trim() || "New chat"}

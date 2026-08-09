@@ -108,6 +108,27 @@ just knowing that a topic came up.`;
 // than redoing it on every single message.
 const MEMORY_REGEN_THRESHOLD = 20;
 
+// Powers the "🧠 Room memory" / "⚠ Flagged" badges on a reply. Deliberately a
+// classification of the FINISHED reply text against what was actually available —
+// not "was room memory present in the prompt" (a room accrues a memory_summary almost
+// immediately, so that would be true on nearly every message and the badge would stop
+// meaning anything) and not a marker embedded in the model's own output (the stream is
+// enqueued to the client character-by-character as it arrives, well before there's any
+// chance to inspect or strip an inline tag).
+const SIGNAL_CLASSIFIER_PROMPT = `You are a strict binary classifier. You will be given optional
+room-memory context and a single assistant reply. Decide two independent yes/no facts about
+ONLY that reply:
+
+1. used_room_memory: does the reply draw on specific content from the room-memory context below
+   — e.g. referencing a decision, statement, or fact that came from another thread — rather than
+   just generically continuing the current conversation? If no room-memory context is given
+   below, this must be false.
+2. flagged: does the reply explicitly push back on something — surfacing a conflict or
+   disagreement between named people, or naming a concrete risk/flaw/tradeoff — rather than
+   simply agreeing, answering neutrally, or making small talk?
+
+Respond with ONLY a compact JSON object and nothing else: {"used_room_memory": true|false, "flagged": true|false}`;
+
 // Tone/style only — deliberately says nothing about tools, scoping, or what
 // Koopi is allowed to do. That's enforced entirely by SYSTEM_PROMPT above and
 // must never be reweighted by a personality choice.
@@ -490,6 +511,44 @@ export async function POST(request: Request) {
     });
   }
 
+  // Best-effort classification for the room-memory/flagged badges — runs after a reply
+  // is already fully streamed and saved, so a failure or skip here never affects what the
+  // person sees, only whether the badges show up moments later. Same "no fallback model
+  // configured" degrade-quietly pattern as getRoomMemory above.
+  async function classifySignals(
+    replyText: string
+  ): Promise<{ usedRoomMemory: boolean; flagged: boolean }> {
+    const none = { usedRoomMemory: false, flagged: false };
+    if (!groq || !replyText.trim()) return none;
+
+    try {
+      const completion = await groq.chat.completions.create({
+        model: FALLBACK_GROQ_MODEL.chat,
+        max_completion_tokens: 40,
+        messages: [
+          { role: "system", content: SIGNAL_CLASSIFIER_PROMPT },
+          {
+            role: "user",
+            content:
+              `Room-memory context: ${roomMemory ?? "(none provided)"}\n\n` +
+              `Assistant reply:\n${replyText}`,
+          },
+        ],
+      });
+      const raw = completion.choices[0]?.message?.content?.trim() ?? "";
+      const parsed = safeParse<{ used_room_memory?: boolean; flagged?: boolean }>(raw, {});
+      return {
+        // Belt-and-suspenders: never true if there genuinely was no memory to draw on,
+        // regardless of what the classifier says.
+        usedRoomMemory: Boolean(parsed.used_room_memory) && Boolean(roomMemory),
+        flagged: Boolean(parsed.flagged),
+      };
+    } catch (err) {
+      console.warn(`/api/chat: signal classification skipped for trigger ${triggerMessageId}:`, err);
+      return none;
+    }
+  }
+
   // A no-op update guarded on `status = 'streaming'` — 0 rows affected means
   // someone else (Stop) already flipped it, same trick the text flush uses.
   async function isStillStreaming(messageId: string): Promise<boolean> {
@@ -507,7 +566,10 @@ export async function POST(request: Request) {
 
   type TurnOutcome =
     | { kind: "interrupted" }
-    | { kind: "text" }
+    // messageId/text are null/empty when no reply ever reached the chat (e.g. every
+    // provider failed before a row was created) — callers use their presence to decide
+    // whether there's anything worth classifying for the room-memory/flagged badges.
+    | { kind: "text"; messageId: string | null; text: string }
     | { kind: "tool_use"; calls: PendingToolCall[] };
 
   async function runModelTurn(
@@ -590,7 +652,7 @@ export async function POST(request: Request) {
 
       if (!groq) {
         const fallback = await attemptOpenrouterOrFail(cerebrasErr);
-        if (!fallback) return { kind: "text" };
+        if (!fallback) return { kind: "text", messageId: null, text: "" };
         stream = fallback;
         provider = "openrouter";
       } else {
@@ -608,10 +670,10 @@ export async function POST(request: Request) {
           // anything else would just fail identically on OpenRouter too.
           if (!isRateLimited(groqErr)) {
             await postFailureNotice(groqErr);
-            return { kind: "text" };
+            return { kind: "text", messageId: null, text: "" };
           }
           const fallback = await attemptOpenrouterOrFail(groqErr);
-          if (!fallback) return { kind: "text" };
+          if (!fallback) return { kind: "text", messageId: null, text: "" };
           stream = fallback;
           provider = "openrouter";
         }
@@ -687,7 +749,7 @@ export async function POST(request: Request) {
       // Nothing ever reached the chat — the person who tagged Koopi would
       // otherwise see total silence, indistinguishable from being ignored.
       await postFailureNotice(streamError);
-      return { kind: "text" };
+      return { kind: "text", messageId: null, text: "" };
     }
 
     try {
@@ -714,7 +776,7 @@ export async function POST(request: Request) {
       return { kind: "tool_use", calls };
     }
 
-    return { kind: "text" };
+    return { kind: "text", messageId: textMessageId, text };
   }
 
   async function runToolCall(call: PendingToolCall): Promise<"interrupted" | "done"> {
@@ -795,6 +857,17 @@ export async function POST(request: Request) {
       try {
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
           const outcome = await runModelTurn(controller);
+
+          // Every completed text reply gets its own classification pass, independent of
+          // whichever round produced it — a tool-use round's follow-up text is just as
+          // eligible for either badge as a first-round reply.
+          if (outcome.kind === "text" && outcome.messageId && outcome.text) {
+            const signals = await classifySignals(outcome.text);
+            await supabase
+              .from("messages")
+              .update({ used_room_memory: signals.usedRoomMemory, flagged: signals.flagged })
+              .eq("id", outcome.messageId);
+          }
 
           if (outcome.kind !== "tool_use") break;
           if (round === MAX_TOOL_ROUNDS) break;

@@ -23,13 +23,15 @@ import {
   Wand2,
   Zap,
   Sparkles,
+  Brain,
+  AlertTriangle,
 } from "lucide-react";
 import Avatar from "@/components/Avatar";
 import NewChatModal from "@/components/NewChatModal";
 import PersonalitySelector, { type Personality } from "@/components/PersonalitySelector";
 import ProfileMenu from "@/components/ProfileMenu";
 import RoomSidebar from "@/components/RoomSidebar";
-import { presenceOf } from "@/lib/presence";
+import { presenceOf, PRESENCE_DOT } from "@/lib/presence";
 import { createClient } from "@/lib/supabase/client";
 
 export type ChatMessage = {
@@ -44,6 +46,11 @@ export type ChatMessage = {
   createdAt: string;
   modelTier: "chat" | "build" | null;
   modelProvider: string | null;
+  // Set by /api/chat's post-reply classification pass — never inferred client-side,
+  // since "was room memory available" is true on nearly every message once a room has
+  // any history, and would make the badge meaningless.
+  usedRoomMemory: boolean;
+  flagged: boolean;
 };
 
 export type RoomMember = {
@@ -150,6 +157,7 @@ export default function RoomView({
   initialMembers,
   initialThreads,
   initialThreadParticipants,
+  initialLastReadAt,
   initialPersonality,
 }: {
   roomId: string;
@@ -161,6 +169,7 @@ export default function RoomView({
   initialMembers: RoomMember[];
   initialThreads: Thread[];
   initialThreadParticipants: Record<string, string[]>;
+  initialLastReadAt: Record<string, string | null>;
   initialPersonality: Personality;
 }) {
   const supabase = useMemo(() => createClient(), []);
@@ -171,6 +180,11 @@ export default function RoomView({
   const [threadParticipants, setThreadParticipants] = useState<
     Record<string, string[]>
   >(initialThreadParticipants);
+  // Current user's own last-viewed timestamp per thread — per-viewer state, never
+  // shared with or derived from other participants' read status.
+  const [lastReadAt, setLastReadAt] = useState<Record<string, string | null>>(
+    initialLastReadAt
+  );
   const [activeThreadId, setActiveThreadId] = useState<string | null>(
     // Threads arrive newest-first, so the most recent conversation opens.
     initialThreads[0]?.id ?? null
@@ -294,6 +308,8 @@ export default function RoomView({
             createdAt: row.created_at as string,
             modelTier: (row.model_tier as ChatMessage["modelTier"]) ?? null,
             modelProvider: (row.model_provider as string | null) ?? null,
+            usedRoomMemory: Boolean(row.used_room_memory),
+            flagged: Boolean(row.flagged),
           };
 
           setMessages((prev) => {
@@ -394,6 +410,13 @@ export default function RoomView({
             if (list.includes(userId)) return prev;
             return { ...prev, [threadId]: [...list, userId] };
           });
+
+          // Only our own read-state is meaningful to track — this is what keeps
+          // "opened on another tab/device" reflected here without a page reload.
+          if (userId === currentUserId) {
+            const lastRead = (row?.last_read_at as string | null) ?? null;
+            setLastReadAt((prev) => ({ ...prev, [threadId]: lastRead }));
+          }
         }
       )
       .subscribe();
@@ -401,7 +424,7 @@ export default function RoomView({
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [supabase, roomId]);
+  }, [supabase, roomId, currentUserId]);
 
   // --- realtime: room settings (personality) ------------------------------
   useEffect(() => {
@@ -510,6 +533,46 @@ export default function RoomView({
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [threadMessages]);
+
+  // --- read tracking --------------------------------------------------------
+  // Persists to thread_participants.last_read_at; local state updates optimistically
+  // so the sidebar dot clears the instant you open a thread, not after the round trip.
+  const markThreadRead = useCallback(
+    (threadId: string) => {
+      const nowIso = new Date().toISOString();
+      setLastReadAt((prev) => ({ ...prev, [threadId]: nowIso }));
+      void supabase
+        .from("thread_participants")
+        .update({ last_read_at: nowIso })
+        .eq("thread_id", threadId)
+        .eq("user_id", currentUserId);
+    },
+    [supabase, currentUserId]
+  );
+
+  useEffect(() => {
+    if (activeThreadId) markThreadRead(activeThreadId);
+    // Only re-fires on an actual thread switch, deliberately — bumping this on every
+    // incoming message would spam writes. The currently-open thread is instead just
+    // excluded from the unread computation below, which handles "already looking at
+    // it" without needing last_read_at to track live.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeThreadId]);
+
+  // A thread counts as unread if it has a message newer than our last visit that we
+  // didn't send ourselves — our own messages don't need to notify us of themselves.
+  // The active thread is excluded outright: it's on screen, so by definition read.
+  const unreadThreadIds = useMemo(() => {
+    const unread = new Set<string>();
+    for (const m of messages) {
+      if (m.threadId === activeThreadId) continue;
+      if (m.senderType === "user" && m.senderId === currentUserId) continue;
+      const readAt = lastReadAt[m.threadId];
+      if (readAt && m.createdAt <= readAt) continue;
+      unread.add(m.threadId);
+    }
+    return unread;
+  }, [messages, lastReadAt, activeThreadId, currentUserId]);
 
   // --- actions ------------------------------------------------------------
   function handleThreadCreated(created: Thread, participantIds: string[]) {
@@ -694,6 +757,7 @@ export default function RoomView({
       <RoomSidebar
         threads={threads}
         threadParticipants={threadParticipants}
+        unreadThreadIds={unreadThreadIds}
         members={members}
         activeThreadId={activeThreadId}
         currentUserId={currentUserId}
@@ -789,11 +853,11 @@ export default function RoomView({
                   .filter((m) => m.userId !== currentUserId)
                   .slice(0, 4)
                   .map((m) => {
-                    const isOnline = presenceOf(m.lastSeenAt, now) === "online";
+                    const presence = presenceOf(m.lastSeenAt, now);
                     return (
                       <span
                         key={m.userId}
-                        title={`${m.username}${isOnline ? " — online" : ""}`}
+                        title={`${m.username} — ${presence}`}
                         className="relative"
                       >
                         <Avatar
@@ -802,9 +866,9 @@ export default function RoomView({
                           size="sm"
                           className="ring-2 ring-background"
                         />
-                        {isOnline && (
-                          <span className="absolute -bottom-0.5 -right-0.5 h-2 w-2 rounded-full bg-accent ring-2 ring-background" />
-                        )}
+                        <span
+                          className={`absolute -bottom-0.5 -right-0.5 h-2 w-2 rounded-full ring-2 ring-background ${PRESENCE_DOT[presence]}`}
+                        />
                       </span>
                     );
                   })}
@@ -866,13 +930,38 @@ export default function RoomView({
                       return (
                         <li key={m.id} className="flex gap-3">
                           {isAgent ? (
-                            <span
-                              aria-hidden="true"
-                              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent/15 text-base"
-                              title="Koopi Kapi"
-                            >
-                              🦫
-                            </span>
+                            (() => {
+                              const runningCode =
+                                m.type === "tool_call" && m.status === "streaming";
+                              const generating = m.type === "text" && m.status === "streaming";
+                              return (
+                                <span
+                                  aria-hidden="true"
+                                  title={
+                                    runningCode
+                                      ? "Koopi Kapi — running code"
+                                      : generating
+                                        ? "Koopi Kapi — responding"
+                                        : "Koopi Kapi"
+                                  }
+                                  className={`relative flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-base ${
+                                    runningCode
+                                      ? "animate-pulse bg-amber-500/15 ring-2 ring-amber-500/50"
+                                      : generating
+                                        ? "animate-pulse bg-accent/15 ring-2 ring-accent/50"
+                                        : "bg-accent/15"
+                                  }`}
+                                >
+                                  🦫
+                                  {runningCode && (
+                                    <Terminal
+                                      className="absolute -bottom-0.5 -right-0.5 h-3.5 w-3.5 rounded-full bg-amber-500 p-0.5 text-white"
+                                      strokeWidth={2.5}
+                                    />
+                                  )}
+                                </span>
+                              );
+                            })()
                           ) : (
                             <Avatar
                               name={author?.username ?? "Someone"}
@@ -914,6 +1003,24 @@ export default function RoomView({
                                   {m.modelProvider && m.modelProvider !== "cerebras"
                                     ? ` · ${m.modelProvider}`
                                     : ""}
+                                </span>
+                              )}
+                              {isAgent && m.usedRoomMemory && (
+                                <span
+                                  title="This reply drew on room memory — context from other threads in this room"
+                                  className="flex items-center gap-1 rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-medium text-violet-400"
+                                >
+                                  <Brain className="h-2.5 w-2.5" strokeWidth={2.5} />
+                                  Room memory
+                                </span>
+                              )}
+                              {isAgent && m.flagged && (
+                                <span
+                                  title="Koopi flagged a conflict, disagreement, or risk in this reply"
+                                  className="flex items-center gap-1 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-400"
+                                >
+                                  <AlertTriangle className="h-2.5 w-2.5" strokeWidth={2.5} />
+                                  Flagged
                                 </span>
                               )}
                             </div>
@@ -1030,9 +1137,25 @@ export default function RoomView({
                   <div className="flex items-center gap-0.5 rounded-full border border-border bg-surface p-0.5">
                     {(
                       [
-                        { key: "auto", label: "Auto", icon: Wand2, title: "Auto — picks the right model per message" },
-                        { key: "chat", label: "Efficient", icon: Zap, title: "Efficient — always use the fast, cheaper model" },
-                        { key: "build", label: "Powerful", icon: Sparkles, title: "Powerful — always use the stronger model" },
+                        {
+                          key: "auto",
+                          label: "Auto",
+                          icon: Wand2,
+                          title:
+                            "Auto — automatically picks based on your message: Powerful for code/build tasks, Efficient for quick questions.",
+                        },
+                        {
+                          key: "chat",
+                          label: "Efficient",
+                          icon: Zap,
+                          title: "Efficient — fast, lightweight model for casual questions and quick replies.",
+                        },
+                        {
+                          key: "build",
+                          label: "Powerful",
+                          icon: Sparkles,
+                          title: "Powerful — more capable model for code generation and complex tasks.",
+                        },
                       ] as const
                     ).map(({ key, label, icon: Icon, title }) => (
                       <button
