@@ -581,7 +581,16 @@ export default function RoomView({
         .from("thread_participants")
         .update({ koopi_active: active })
         .eq("thread_id", threadId)
-        .eq("user_id", currentUserId);
+        .eq("user_id", currentUserId)
+        .then(({ error: updateError }) => {
+          // The optimistic update above already changed what THIS user sees, so a
+          // write failure here is invisible unless logged — and everyone else's view
+          // depends on this write actually landing, since they only find out via the
+          // thread_participants realtime subscription.
+          if (updateError) {
+            console.error("Failed to persist Koopi toggle:", updateError);
+          }
+        });
     },
     [supabase, currentUserId]
   );
