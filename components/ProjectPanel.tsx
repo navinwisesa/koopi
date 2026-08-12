@@ -13,9 +13,12 @@ import {
   FilePlus,
   Trash2,
   FileCode,
+  Bot,
+  Code2,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import type { RoomMember, ProjectFile, ProjectRunState } from "@/components/RoomView";
+import ProjectAssistant from "@/components/ProjectAssistant";
 
 // CodeMirror touches browser globals at mount time — must never render on the
 // server. Same constraint CodePanel had, unchanged here.
@@ -93,6 +96,7 @@ export default function ProjectPanel({
   const [conflict, setConflict] = useState(false);
   const [newFileOpen, setNewFileOpen] = useState(false);
   const [newFilePath, setNewFilePath] = useState("");
+  const [rightTab, setRightTab] = useState<"editor" | "assistant">("editor");
 
   const savedContentRef = useRef(selectedFile?.content ?? "");
   const dirtyRef = useRef(false);
@@ -274,6 +278,31 @@ export default function ProjectPanel({
           Project
         </span>
 
+        <div className="flex items-center gap-0.5 rounded-md border border-border p-0.5">
+          <button
+            type="button"
+            onClick={() => setRightTab("editor")}
+            title="Editor"
+            className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] ${
+              rightTab === "editor" ? "bg-accent/20 text-accent" : "text-muted hover:text-foreground"
+            }`}
+          >
+            <Code2 className="h-3 w-3" strokeWidth={1.75} />
+            Editor
+          </button>
+          <button
+            type="button"
+            onClick={() => setRightTab("assistant")}
+            title="Per-user coding assistant — private to you until you accept a suggestion"
+            className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] ${
+              rightTab === "assistant" ? "bg-accent/20 text-accent" : "text-muted hover:text-foreground"
+            }`}
+          >
+            <Bot className="h-3 w-3" strokeWidth={1.75} />
+            Assistant
+          </button>
+        </div>
+
         {isRunning ? (
           <button
             type="button"
@@ -362,6 +391,15 @@ export default function ProjectPanel({
         </div>
 
         <div className="flex min-h-0 flex-1 flex-col">
+          {rightTab === "assistant" ? (
+            <ProjectAssistant
+              projectId={projectId}
+              files={sortedFiles}
+              activeFile={selectedFile}
+              currentUserId={currentUserId}
+            />
+          ) : (
+            <>
           {notice && !conflict && (
             <div className="shrink-0 border-b border-border bg-background px-4 py-1.5 text-xs text-muted">
               {notice}
@@ -464,6 +502,8 @@ export default function ProjectPanel({
               )}
             </div>
           </div>
+            </>
+          )}
         </div>
       </div>
     </div>
