@@ -22,6 +22,7 @@ type ParticipantRow = {
   display_name: string | null;
   last_seen_at: string | null;
   joined_at: string | null;
+  role: "owner" | "admin" | "member";
   profiles:
     | { username: string | null; avatar_url: string | null }
     | { username: string | null; avatar_url: string | null }[]
@@ -81,7 +82,7 @@ export default async function RoomPage({
   const { data: participantRows } = await supabase
     .from("participants")
     .select(
-      "user_id, display_name, last_seen_at, joined_at, profiles(username, avatar_url)"
+      "user_id, display_name, last_seen_at, joined_at, role, profiles(username, avatar_url)"
     )
     .eq("room_id", id);
 
@@ -243,6 +244,7 @@ export default async function RoomPage({
       avatarUrl: prof?.avatar_url ?? null,
       lastSeenAt: p.last_seen_at,
       joinedAt: p.joined_at,
+      role: p.role ?? "member",
     };
   });
 

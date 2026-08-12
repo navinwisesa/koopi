@@ -29,9 +29,11 @@ import {
   AlertTriangle,
   MonitorPlay,
   ExternalLink,
+  Users,
 } from "lucide-react";
 import Avatar from "@/components/Avatar";
 import ProjectPanel from "@/components/ProjectPanel";
+import RoomMembersModal from "@/components/RoomMembersModal";
 import NewChatModal from "@/components/NewChatModal";
 import ResizeHandle from "@/components/ResizeHandle";
 import PersonalitySelector, { type Personality } from "@/components/PersonalitySelector";
@@ -60,12 +62,15 @@ export type ChatMessage = {
   flagged: boolean;
 };
 
+export type RoomRole = "owner" | "admin" | "member";
+
 export type RoomMember = {
   userId: string;
   username: string;
   avatarUrl: string | null;
   lastSeenAt: string | null;
   joinedAt: string | null;
+  role: RoomRole;
 };
 
 export type Thread = {
@@ -308,6 +313,7 @@ export default function RoomView({
     initialThreads[0]?.id ?? null
   );
   const [newChatOpen, setNewChatOpen] = useState(false);
+  const [membersModalOpen, setMembersModalOpen] = useState(false);
 
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -347,6 +353,23 @@ export default function RoomView({
 
   const streamingMessage = threadMessages.find((m) => m.status === "streaming");
   const isStreaming = Boolean(streamingMessage);
+
+  // The role RLS/the DB triggers actually enforce — this is only ever used
+  // to decide what the UI offers; the real gate is server-side (see
+  // 20260817_add_room_roles_and_approval.sql), so a stale/wrong value here
+  // can make a control appear that a write would still be rejected for.
+  const currentUserRole = members.find((m) => m.userId === currentUserId)?.role ?? "member";
+  const canEditProjectDirectly = currentUserRole === "owner" || currentUserRole === "admin";
+
+  async function proposeProjectFileChange(file: ProjectFile, proposedContent: string) {
+    const { error } = await supabase.from("project_file_changes").insert({
+      project_file_id: file.id,
+      proposed_by: currentUserId,
+      proposed_content: proposedContent,
+      source: "manual",
+    });
+    if (error) console.error("RoomView: failed to propose project_files change", error);
+  }
 
   const sortedProjectFiles = useMemo(
     () =>
@@ -755,7 +778,7 @@ export default function RoomView({
     const { data } = await supabase
       .from("participants")
       .select(
-        "user_id, display_name, last_seen_at, joined_at, profiles(username, avatar_url)"
+        "user_id, display_name, last_seen_at, joined_at, role, profiles(username, avatar_url)"
       )
       .eq("room_id", roomId);
 
@@ -768,6 +791,7 @@ export default function RoomView({
           display_name: string | null;
           last_seen_at: string | null;
           joined_at: string | null;
+          role: RoomRole;
           profiles:
             | { username: string | null; avatar_url: string | null }
             | { username: string | null; avatar_url: string | null }[]
@@ -780,6 +804,7 @@ export default function RoomView({
           avatarUrl: prof?.avatar_url ?? null,
           lastSeenAt: raw.last_seen_at,
           joinedAt: raw.joined_at,
+          role: raw.role ?? "member",
         };
       })
     );
@@ -1222,6 +1247,16 @@ export default function RoomView({
                 {hasUnseenCodeUpdate && !projectPanelOpen && (
                   <span className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-accent" />
                 )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setMembersModalOpen(true)}
+                title="Room members and roles"
+                className="flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-muted transition-colors hover:text-foreground"
+              >
+                <Users className="h-3.5 w-3.5" strokeWidth={1.75} />
+                <span className="hidden sm:inline">Members</span>
               </button>
 
               <button
@@ -1746,7 +1781,10 @@ export default function RoomView({
                   files={sortedProjectFiles}
                   runState={project}
                   currentUserId={currentUserId}
+                  currentUserRole={currentUserRole}
                   memberById={memberById}
+                  canWriteDirectly={canEditProjectDirectly}
+                  onProposeChange={proposeProjectFileChange}
                 />
               </div>
             </>
@@ -1762,6 +1800,16 @@ export default function RoomView({
           invitable={members.filter((m) => m.userId !== currentUserId)}
           onCreated={handleThreadCreated}
           onClose={() => setNewChatOpen(false)}
+        />
+      )}
+
+      {membersModalOpen && (
+        <RoomMembersModal
+          roomId={roomId}
+          members={members}
+          currentUserId={currentUserId}
+          isOwner={isOwner}
+          onClose={() => setMembersModalOpen(false)}
         />
       )}
     </div>

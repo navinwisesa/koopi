@@ -15,10 +15,12 @@ import {
   FileCode,
   Bot,
   Code2,
+  GitPullRequest,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
-import type { RoomMember, ProjectFile, ProjectRunState } from "@/components/RoomView";
+import type { RoomMember, ProjectFile, ProjectRunState, RoomRole } from "@/components/RoomView";
 import ProjectAssistant from "@/components/ProjectAssistant";
+import ProjectChanges from "@/components/ProjectChanges";
 
 // CodeMirror touches browser globals at mount time — must never render on the
 // server. Same constraint CodePanel had, unchanged here.
@@ -62,12 +64,13 @@ export default function ProjectPanel({
   files,
   runState,
   currentUserId,
+  currentUserRole = "member",
   memberById,
-  // When false (a Member with a pending-approval-only role, see Phase 3),
-  // edits/creates/deletes are proposed instead of applied directly. Phase 1
-  // has no roles yet, so this always defaults to true — Phase 3 wires the
-  // real check in from RoomView without this component needing to know
-  // *why* it can't write, only whether it can.
+  // False for a Member (see 20260817_add_room_roles_and_approval.sql) —
+  // edits are proposed instead of applied directly. This prop is only ever
+  // advisory for what the UI offers; project_files' own RLS UPDATE policy
+  // is the actual gate, so a stale/wrong value here fails safely (a save
+  // attempt is just rejected server-side, never silently allowed).
   canWriteDirectly = true,
   onProposeChange,
 }: {
@@ -75,6 +78,7 @@ export default function ProjectPanel({
   files: ProjectFile[];
   runState: ProjectRunState;
   currentUserId: string;
+  currentUserRole?: RoomRole;
   memberById: Map<string, RoomMember>;
   canWriteDirectly?: boolean;
   onProposeChange?: (file: ProjectFile, proposedContent: string) => Promise<void>;
@@ -96,7 +100,7 @@ export default function ProjectPanel({
   const [conflict, setConflict] = useState(false);
   const [newFileOpen, setNewFileOpen] = useState(false);
   const [newFilePath, setNewFilePath] = useState("");
-  const [rightTab, setRightTab] = useState<"editor" | "assistant">("editor");
+  const [rightTab, setRightTab] = useState<"editor" | "assistant" | "changes">("editor");
 
   const savedContentRef = useRef(selectedFile?.content ?? "");
   const dirtyRef = useRef(false);
@@ -301,6 +305,17 @@ export default function ProjectPanel({
             <Bot className="h-3 w-3" strokeWidth={1.75} />
             Assistant
           </button>
+          <button
+            type="button"
+            onClick={() => setRightTab("changes")}
+            title={canWriteDirectly ? "Review pending changes" : "Your proposed changes"}
+            className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] ${
+              rightTab === "changes" ? "bg-accent/20 text-accent" : "text-muted hover:text-foreground"
+            }`}
+          >
+            <GitPullRequest className="h-3 w-3" strokeWidth={1.75} />
+            Changes
+          </button>
         </div>
 
         {isRunning ? (
@@ -397,6 +412,13 @@ export default function ProjectPanel({
               files={sortedFiles}
               activeFile={selectedFile}
               currentUserId={currentUserId}
+            />
+          ) : rightTab === "changes" ? (
+            <ProjectChanges
+              projectId={projectId}
+              files={sortedFiles}
+              memberById={memberById}
+              currentUserRole={currentUserRole}
             />
           ) : (
             <>
