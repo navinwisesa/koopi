@@ -224,6 +224,74 @@ function extractFileUpdateBlock(
   return best;
 }
 
+// Decides WHICH project_files row a piece of generated code targets — a
+// question extractFileUpdateBlock/classifyFileUpdate above never answered
+// at all, which was the actual bug: every file-worthy reply landed on the
+// same hardcoded "koopi_scratch" path regardless of whether it was a new,
+// unrelated task or a continuation of what was already open, silently
+// overwriting whatever came before.
+const FILE_TARGET_PROMPT = `You decide where generated code belongs in a shared multi-file
+coding project.
+
+If a "Currently open file" is given below, decide whether the user's request is clearly about
+modifying, continuing, or fixing what's already in THAT file (target: "existing") — e.g. "add
+error handling to this", "make this support email login", "fix the bug above" — versus a
+distinct, unrelated task that deserves its own file (target: "new"). If no open file is given,
+always answer "new" — there's nothing to continue.
+
+Whenever target is "new" (or no file is open), also suggest a short, descriptive filename for
+the code — lowercase, underscores instead of spaces, a sensible extension for the language
+(e.g. "palindrome_checker.py", "median_calculator.py"). Base it on what the code actually DOES,
+not the literal wording of the request.
+
+Respond with ONLY compact JSON: {"target": "existing"|"new", "filename": "short_name.ext"}
+(omit filename, or use null, when target is "existing")`;
+
+function extensionFor(language: string): string {
+  switch (language.trim().toLowerCase()) {
+    case "python":
+      return ".py";
+    case "javascript":
+      return ".js";
+    case "typescript":
+      return ".ts";
+    case "bash":
+    case "shell":
+      return ".sh";
+    default:
+      return ".py";
+  }
+}
+
+// Deterministic fallback filename — used when there's no OPENROUTER... no
+// Groq key configured, or the classifier call itself fails/returns
+// garbage. Crude (first few words of the request, slugified) but never
+// silently reuses a hardcoded name the way the bug being fixed here did.
+function slugFilename(text: string, language: string): string {
+  const words = text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .split("_")
+    .filter(Boolean)
+    .slice(0, 4);
+  const base = words.join("_") || "snippet";
+  return `${base}${extensionFor(language)}`;
+}
+
+// Appends _2, _3, ... until the name doesn't collide with an existing file
+// in the project — two unrelated "calculator" tasks land as calculator.py
+// and calculator_2.py, never one silently replacing the other.
+function uniquePath(name: string, existingPaths: string[]): string {
+  if (!existingPaths.includes(name)) return name;
+  const dot = name.lastIndexOf(".");
+  const base = dot === -1 ? name : name.slice(0, dot);
+  const ext = dot === -1 ? "" : name.slice(dot);
+  for (let i = 2; ; i++) {
+    const candidate = `${base}_${i}${ext}`;
+    if (!existingPaths.includes(candidate)) return candidate;
+  }
+}
+
 // Tone/style only — deliberately says nothing about tools, scoping, or what
 // Koopi is allowed to do. That's enforced entirely by SYSTEM_PROMPT above and
 // must never be reweighted by a personality choice.
@@ -417,10 +485,18 @@ export async function POST(request: Request) {
     ? new OpenAI({ apiKey: openrouterKey, baseURL: "https://openrouter.ai/api/v1" })
     : null;
 
-  const { threadId, triggerMessageId, modelOverride } = (await request.json()) as {
+  const { threadId, triggerMessageId, modelOverride, openFilePath } = (await request.json()) as {
     threadId?: string;
     triggerMessageId?: string;
     modelOverride?: "chat" | "build";
+    // Whichever project file (if any) is selected in the sender's Project
+    // panel at send time — the one cheap, reliable signal for "is this
+    // message about the file already open" vs. "this is a new task" that
+    // doesn't require guessing from chat text alone. Purely advisory: it's
+    // just one input to chooseFileTarget below, not trusted for anything
+    // security-relevant (there is nothing security-relevant about which
+    // file a reply's code lands in).
+    openFilePath?: string | null;
   };
   if (!threadId) {
     return NextResponse.json({ error: "threadId is required" }, { status: 400 });
@@ -749,6 +825,59 @@ export async function POST(request: Request) {
     }
   }
 
+  // Decides which project_files path a piece of file-worthy code lands on.
+  // `openFile` is the sender's currently-selected Project-panel file (from
+  // the request body, see the POST handler's destructuring above) — the
+  // one reliable "is this a continuation" signal that doesn't require
+  // guessing purely from chat text. `existingPaths` is fetched fresh by
+  // each call site right before calling this, so a second file-worthy
+  // reply in the same turn (tool call + a final text block, say) sees
+  // whatever the first one just created and won't collide with it.
+  async function chooseFileTarget(
+    triggerText: string,
+    language: string,
+    openFile: { path: string; content: string } | null,
+    existingPaths: string[]
+  ): Promise<{ path: string; isNewFile: boolean }> {
+    const fallbackToNewFile = () => ({
+      path: uniquePath(slugFilename(triggerText, language), existingPaths),
+      isNewFile: true,
+    });
+    if (!groq) return fallbackToNewFile();
+
+    try {
+      const completion = await groq.chat.completions.create({
+        model: GROQ_MODEL.chat,
+        max_completion_tokens: 60,
+        messages: [
+          { role: "system", content: FILE_TARGET_PROMPT },
+          {
+            role: "user",
+            content: openFile
+              ? `User's request:\n${triggerText}\n\nCurrently open file: ${openFile.path}\n` +
+                `--- its current content (may be empty or unrelated) ---\n${openFile.content.slice(0, 800)}\n\n` +
+                `Generated code language: ${language}`
+              : `User's request:\n${triggerText}\n\nNo file is currently open.\n\nGenerated code language: ${language}`,
+          },
+        ],
+      });
+      const raw = completion.choices[0]?.message?.content?.trim() ?? "";
+      const parsed = safeParse<{ target?: string; filename?: string }>(raw, {});
+      if (openFile && parsed.target === "existing") {
+        return { path: openFile.path, isNewFile: false };
+      }
+      const suggested = parsed.filename?.trim();
+      // Reject anything that doesn't look like a plausible bare filename
+      // (no path separators, no wild characters) rather than trust the
+      // model's output verbatim for something that becomes a DB row's key.
+      const name = suggested && /^[\w.-]{1,80}$/.test(suggested) ? suggested : slugFilename(triggerText, language);
+      return { path: uniquePath(name, existingPaths), isNewFile: true };
+    } catch (err) {
+      console.warn(`/api/chat: file-target classification failed for trigger ${triggerMessageId}, defaulting to a new file:`, err);
+      return fallbackToNewFile();
+    }
+  }
+
   // A no-op update guarded on `status = 'streaming'` — 0 rows affected means
   // someone else (Stop) already flipped it, same trick the text flush uses.
   async function isStillStreaming(messageId: string): Promise<boolean> {
@@ -1018,24 +1147,38 @@ export async function POST(request: Request) {
     return cachedProjectId;
   }
 
-  // Keeps a single Koopi-authored project file ("koopi_scratch") in sync with
-  // whatever code Koopi just ran/demoed via a tool call — unconditionally,
-  // since a run_code/open_gui_session call is always real code, unlike the
+  // Keeps a Koopi-authored project file in sync with whatever code Koopi
+  // just ran/demoed via a tool call — unconditionally, since a
+  // run_code/open_gui_session call is always real code, unlike the
   // isFileUpdate path below which has to guess from prose whether a fenced
   // block in the reply text is a "file" worth keeping. Without this, code
-  // that's only ever run (never echoed back into the chat text) never reaches
-  // the project at all. One fixed path, language column swapped per call —
-  // same "one slot, always latest" semantics thread_files had, just
-  // room-scoped now instead of thread-scoped.
-  const KOOPI_SCRATCH_PATH = "koopi_scratch";
+  // that's only ever run (never echoed back into the chat text) never
+  // reaches the project at all.
+  //
+  // WHICH file used to be hardcoded to a single "koopi_scratch" slot,
+  // overwritten by every unrelated task — chooseFileTarget (see its own
+  // comment) is what fixes that: a new, unrelated request gets its own
+  // sensibly-named file; a request that's clearly about the file the
+  // sender already has open updates that one instead.
   async function syncProjectFile(code: string, language: string) {
     if (!code.trim()) return;
     const projectId = await ensureRoomProjectId();
     if (!projectId) return;
+
+    const { data: fileRows } = await supabase
+      .from("project_files")
+      .select("path, content")
+      .eq("project_id", projectId);
+    const existingPaths = (fileRows ?? []).map((f) => f.path);
+    const openRow = openFilePath ? (fileRows ?? []).find((f) => f.path === openFilePath) : undefined;
+    const openFile = openRow ? { path: openRow.path, content: openRow.content ?? "" } : null;
+
+    const { path } = await chooseFileTarget(triggerText, language, openFile, existingPaths);
+
     const { error } = await supabase.from("project_files").upsert(
       {
         project_id: projectId,
-        path: KOOPI_SCRATCH_PATH,
+        path,
         content: code,
         language,
         last_edited_by: null,
@@ -1233,30 +1376,46 @@ export async function POST(request: Request) {
 
             // Give the reply's code a persistent home in the room's project
             // instead of (only) living as static text in the transcript.
+            // See chooseFileTarget for WHICH file this lands on — no longer
+            // a single hardcoded path shared across every unrelated task.
             if (isFileUpdate && block) {
               const projectId = await ensureRoomProjectId();
-              const { error: fileErr } = projectId
-                ? await supabase.from("project_files").upsert(
-                    {
-                      project_id: projectId,
-                      path: KOOPI_SCRATCH_PATH,
-                      content: block.code,
-                      language: block.language,
-                      // null = Koopi-authored — the agent has no profiles row, same
-                      // convention as sender_id: null on agent messages.
-                      last_edited_by: null,
-                      updated_at: new Date().toISOString(),
-                    },
-                    { onConflict: "project_id,path" }
-                  )
-                : { error: new Error("no project for room") };
+              let targetPath: string | null = null;
+              let fileErr: unknown = projectId ? null : new Error("no project for room");
+              if (projectId) {
+                const { data: fileRows } = await supabase
+                  .from("project_files")
+                  .select("path, content")
+                  .eq("project_id", projectId);
+                const existingPaths = (fileRows ?? []).map((f) => f.path);
+                const openRow = openFilePath ? (fileRows ?? []).find((f) => f.path === openFilePath) : undefined;
+                const openFile = openRow ? { path: openRow.path, content: openRow.content ?? "" } : null;
+                const target = await chooseFileTarget(triggerText, block.language, openFile, existingPaths);
+                targetPath = target.path;
+
+                const { error } = await supabase.from("project_files").upsert(
+                  {
+                    project_id: projectId,
+                    path: target.path,
+                    content: block.code,
+                    language: block.language,
+                    // null = Koopi-authored — the agent has no profiles row, same
+                    // convention as sender_id: null on agent messages.
+                    last_edited_by: null,
+                    updated_at: new Date().toISOString(),
+                  },
+                  { onConflict: "project_id,path" }
+                );
+                fileErr = error;
+              }
               if (!fileErr) {
                 // Replace just the fenced block with a short reference, preserving
                 // any surrounding prose — not a duplicate copy of the file in every
-                // message once it already lives in the project.
+                // message once it already lives in the project. Names the actual
+                // file now that there's more than one possible target.
                 updates.content = outcome.text.replace(
                   block.fullMatch,
-                  "📄 Updated the project — see it on the right →"
+                  `📄 Updated ${targetPath} — see it on the right →`
                 );
               } else {
                 console.warn(

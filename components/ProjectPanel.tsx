@@ -87,6 +87,13 @@ export default function ProjectPanel({
   // attempt is just rejected server-side, never silently allowed).
   canWriteDirectly = true,
   onProposeChange,
+  // RoomView needs to know which file (if any) is open so it can tell
+  // /api/chat — that's the signal chooseFileTarget uses server-side to
+  // decide "continue this file" vs. "unrelated task, make a new one" (see
+  // app/api/chat/route.ts). Fired on every selection change, not just
+  // user-initiated ones, so it stays correct through auto-selection (e.g.
+  // the first file being selected on mount) too.
+  onActiveFileChange,
 }: {
   projectId: string;
   files: ProjectFile[];
@@ -96,6 +103,7 @@ export default function ProjectPanel({
   memberById: Map<string, RoomMember>;
   canWriteDirectly?: boolean;
   onProposeChange?: (file: ProjectFile, proposedContent: string) => Promise<void>;
+  onActiveFileChange?: (file: ProjectFile | null) => void;
 }) {
   const sortedFiles = useMemo(() => [...files].sort((a, b) => a.path.localeCompare(b.path)), [files]);
   const [selectedId, setSelectedId] = useState<string | null>(sortedFiles[0]?.id ?? null);
@@ -105,6 +113,16 @@ export default function ProjectPanel({
   }, [sortedFiles, selectedId]);
 
   const selectedFile = sortedFiles.find((f) => f.id === selectedId) ?? null;
+
+  useEffect(() => {
+    onActiveFileChange?.(selectedFile);
+    // Only re-fire when the SELECTION changes, not on every content edit
+    // (selectedFile is a fresh object each render since it's derived via
+    // .find()) — onActiveFileChange itself is intentionally excluded too,
+    // since RoomView passes a plain setState function whose identity is
+    // already stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFile?.id]);
 
   const [draft, setDraft] = useState(selectedFile?.content ?? "");
   const [dirty, setDirty] = useState(false);

@@ -294,6 +294,14 @@ export default function RoomView({
   const [projectFiles, setProjectFiles] = useState<Record<string, ProjectFile>>(
     () => Object.fromEntries(initialProjectFiles.map((f) => [f.id, f]))
   );
+  // Whichever project file is currently selected in ProjectPanel, reported
+  // up via its onActiveFileChange prop — sent along with chat messages so
+  // /api/chat's chooseFileTarget knows whether a reply's code is "about
+  // the file already open" vs. an unrelated task that wants its own file.
+  // Only the path is actually used (see handleSend); the object itself can
+  // go briefly stale on a content edit, which doesn't matter since the
+  // server re-fetches live content by path when it needs it.
+  const [activeProjectFile, setActiveProjectFile] = useState<ProjectFile | null>(null);
   // Whether the project panel is visible at all — defaults closed.
   const [projectPanelOpen, setProjectPanelOpen] = useState(false);
   // The most recent project_files.updatedAt this viewer has actually had the
@@ -993,6 +1001,10 @@ export default function RoomView({
             threadId,
             triggerMessageId: inserted.id,
             modelOverride: modelMode === "auto" ? undefined : modelMode,
+            // Which project file (if any) is open in THIS sender's Project
+            // panel right now — not the room's shared state, a per-sender
+            // snapshot at send time. See chooseFileTarget server-side.
+            openFilePath: activeProjectFile?.path ?? null,
           }),
         });
 
@@ -1795,6 +1807,7 @@ export default function RoomView({
                   memberById={memberById}
                   canWriteDirectly={canEditProjectDirectly}
                   onProposeChange={proposeProjectFileChange}
+                  onActiveFileChange={setActiveProjectFile}
                 />
               </div>
             </>
