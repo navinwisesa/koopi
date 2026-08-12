@@ -98,6 +98,11 @@ export type ProjectFile = {
 export type ProjectRunState = {
   status: "idle" | "running";
   entryPath: string | null;
+  // Who the CURRENTLY running process (if any) belongs to — the one person
+  // allowed to submit stdin to it. null once idle. Distinct from
+  // lastRunBy, which is the historical record of who ran it last and
+  // persists after the run ends.
+  runOwnerId: string | null;
   lastRunStdout: string | null;
   lastRunStderr: string | null;
   lastRunExitCode: number | null;
@@ -202,6 +207,7 @@ function rowToProject(row: Record<string, unknown>): Project {
     createdBy: (row.created_by as string | null) ?? null,
     status: ((row.run_status as string) ?? "idle") as "idle" | "running",
     entryPath: (row.run_entry_path as string | null) ?? null,
+    runOwnerId: (row.run_owner_id as string | null) ?? null,
     lastRunStdout: (row.last_run_stdout as string | null) ?? null,
     lastRunStderr: (row.last_run_stderr as string | null) ?? null,
     lastRunExitCode: (row.last_run_exit_code as number | null) ?? null,

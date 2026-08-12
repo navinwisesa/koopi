@@ -198,7 +198,7 @@ export default async function RoomPage({
   const { data: projectRow } = await supabase
     .from("projects")
     .select(
-      "id, room_id, name, created_by, run_status, run_entry_path, last_run_stdout, last_run_stderr, last_run_exit_code, last_run_at, last_run_by"
+      "id, room_id, name, created_by, run_status, run_entry_path, run_owner_id, last_run_stdout, last_run_stderr, last_run_exit_code, last_run_at, last_run_by"
     )
     .eq("room_id", id)
     .maybeSingle();
@@ -211,6 +211,7 @@ export default async function RoomPage({
         createdBy: projectRow.created_by,
         status: (projectRow.run_status as "idle" | "running") ?? "idle",
         entryPath: projectRow.run_entry_path,
+        runOwnerId: projectRow.run_owner_id,
         lastRunStdout: projectRow.last_run_stdout,
         lastRunStderr: projectRow.last_run_stderr,
         lastRunExitCode: projectRow.last_run_exit_code,

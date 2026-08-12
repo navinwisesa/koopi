@@ -1,4 +1,4 @@
-import { Sandbox, CommandExitError } from "e2b";
+import { Sandbox, CommandExitError, type CommandHandle } from "e2b";
 
 export type RunResult = {
   stdout: string;
@@ -8,6 +8,15 @@ export type RunResult = {
 
 const SANDBOX_TIMEOUT_MS = 60_000;
 const EXEC_TIMEOUT_MS = 20_000;
+
+// Interactive Project-mode runs are a different shape entirely — a human
+// may take minutes to respond to a prompt, so both the sandbox's own
+// idle timeout and the command's timeout need real headroom, not the 20s
+// fire-and-forget budget SandboxRun (below) uses for the chat run_code
+// tool. Scoped to SandboxProjectRun only — SandboxRun's constants above are
+// untouched, deliberately, per the chat flow staying fire-and-forget.
+const INTERACTIVE_SANDBOX_TIMEOUT_MS = 10 * 60_000;
+const INTERACTIVE_EXEC_TIMEOUT_MS = 10 * 60_000;
 
 const RUNNERS: Record<string, { file: string; cmd: (path: string) => string }> = {
   python: { file: "/tmp/run/main.py", cmd: (p) => `python3 ${p}` },
@@ -147,19 +156,29 @@ export class SandboxRun {
 const PROJECT_ROOT = "/tmp/project";
 
 /**
- * Multi-file counterpart to SandboxRun, for Project mode. Writes every file
- * in the project into one sandbox working directory (preserving relative
- * paths, so imports between files resolve normally) and then executes a
- * single entry file from within that directory — same
- * connect-existing-or-create-fresh, pause-on-success/kill-on-cancel lifecycle
- * as SandboxRun, deliberately not reimplemented differently here. The two
- * classes aren't merged into one because their run() shapes genuinely
- * differ (one file written vs. N files written + a chosen entry path) and
- * forcing a single method to cover both would obscure both cases.
+ * Multi-file counterpart to SandboxRun, for Project mode — and, unlike
+ * SandboxRun, genuinely interactive: the process is started with a live
+ * stdin channel held open (`stdin: true`) and stdout/stderr are streamed to
+ * the caller as they're produced via callbacks, not batched into a single
+ * result after the process exits. This is what actually fixes the EOFError
+ * a script calling input() used to hit — previously `commands.run()` here
+ * had no stdin channel at all, so any input() call would read EOF
+ * immediately and crash before a human could ever respond.
+ *
+ * Same connect-existing-or-create-fresh, pause-on-success/kill-on-cancel
+ * sandbox lifecycle as SandboxRun. The two classes still aren't merged —
+ * their run() shapes differ even more now (interactive/streaming vs.
+ * one-shot/batched) than the multi-file-vs-single-file split already
+ * justified.
  */
 export class SandboxProjectRun {
   private sandboxPromise: Promise<Sandbox>;
   private cancelled = false;
+  // Set once the interactive command actually starts — sendStdin()/kill()
+  // before that point are no-ops rather than throwing, since a Stop click
+  // or stdin submission racing the sandbox's own startup is expected, not
+  // exceptional.
+  private handle: CommandHandle | null = null;
 
   constructor(
     private files: { path: string; content: string }[],
@@ -174,7 +193,7 @@ export class SandboxProjectRun {
     if (this.existingSandboxId) {
       try {
         return await Sandbox.connect(this.existingSandboxId, {
-          timeoutMs: SANDBOX_TIMEOUT_MS,
+          timeoutMs: INTERACTIVE_SANDBOX_TIMEOUT_MS,
         });
       } catch (err) {
         console.warn(
@@ -183,10 +202,23 @@ export class SandboxProjectRun {
         );
       }
     }
-    return Sandbox.create({ timeoutMs: SANDBOX_TIMEOUT_MS });
+    return Sandbox.create({ timeoutMs: INTERACTIVE_SANDBOX_TIMEOUT_MS });
   }
 
-  async run(): Promise<{ result: RunResult; sandboxId: string | null }> {
+  /**
+   * Writes every project file, starts the entry file as a live, interactive
+   * command, and resolves once it exits (normally, killed, or errored) —
+   * `onStdout`/`onStderr` fire incrementally the whole time it's running,
+   * which is the caller's only way to see output before then. Every project
+   * file is rewritten on each run so edits/deletes since the last run
+   * (including files other than the entry point) are always reflected —
+   * the sandbox's /tmp/project is disposable, derived state, never the
+   * source of truth.
+   */
+  async run(callbacks: {
+    onStdout: (data: string) => void;
+    onStderr: (data: string) => void;
+  }): Promise<{ result: RunResult; sandboxId: string | null }> {
     const interrupted = {
       result: { stdout: "", stderr: "Execution was interrupted.", exit_code: -1 },
       sandboxId: null,
@@ -212,10 +244,6 @@ export class SandboxProjectRun {
     }
 
     try {
-      // Every project file is rewritten on each run so edits/deletes made
-      // since the last run (including in files other than the entry point)
-      // are always reflected — the sandbox's /tmp/project is treated as
-      // disposable, derived state, never the source of truth.
       for (const f of this.files) {
         // Guard against a path escaping PROJECT_ROOT (e.g. "../../etc/passwd")
         // before it ever reaches the sandbox — join-then-check, not a naive
@@ -227,11 +255,35 @@ export class SandboxProjectRun {
       const entryTarget = joinUnderRoot(PROJECT_ROOT, this.entryPath);
       const cmd = entryCommand(this.entryLanguage, entryTarget);
 
+      if (this.cancelled) {
+        await sandbox.kill().catch(() => {});
+        return interrupted;
+      }
+
       const handle = await sandbox.commands.run(cmd, {
         cwd: PROJECT_ROOT,
         background: true,
-        timeoutMs: EXEC_TIMEOUT_MS,
+        stdin: true,
+        // Python fully buffers stdout by default once it's not attached to
+        // a TTY (which it isn't here — it's a pipe) — without this, a
+        // prompt like input("Enter numbers: ") sits in Python's internal
+        // buffer and never reaches onStdout until the buffer fills or the
+        // process exits, which looks identical to a hang from the UI's
+        // side. -u forces every stream unbuffered. Harmless for the other
+        // languages (bash/node don't take -u; this only prefixes python's
+        // own invocation inside entryCommand).
+        envs: { PYTHONUNBUFFERED: "1" },
+        onStdout: callbacks.onStdout,
+        onStderr: callbacks.onStderr,
+        timeoutMs: INTERACTIVE_EXEC_TIMEOUT_MS,
       });
+      this.handle = handle;
+
+      if (this.cancelled) {
+        await handle.kill().catch(() => {});
+        await sandbox.kill().catch(() => {});
+        return interrupted;
+      }
 
       const result = await handle.wait();
       return {
@@ -256,6 +308,7 @@ export class SandboxProjectRun {
       }
       throw err;
     } finally {
+      this.handle = null;
       if (this.cancelled) {
         await sandbox.kill().catch(() => {});
       } else {
@@ -264,9 +317,26 @@ export class SandboxProjectRun {
     }
   }
 
+  /** Writes to the running process's stdin. No-op if nothing is running. */
+  async sendStdin(data: string) {
+    if (!this.handle) return;
+    await this.handle.sendStdin(data).catch((err) => {
+      console.warn("[sandbox] sendStdin failed (process likely already exited):", err);
+    });
+  }
+
+  /**
+   * Terminates the process (if any) whether it's actively computing or
+   * blocked reading stdin — SIGKILL ends a blocked read() the same as any
+   * other syscall, no special-casing needed for "waiting on input" vs
+   * "running" — and kills the sandbox itself, so nothing is left orphaned.
+   * `run()`'s own `finally` skips the pause-for-reuse path once `cancelled`
+   * is set, so this is always the sandbox's last word on this run.
+   */
   async cancel() {
     if (this.cancelled) return;
     this.cancelled = true;
+    if (this.handle) await this.handle.kill().catch(() => {});
     const sandbox = await this.sandboxPromise.catch(() => null);
     if (sandbox) await sandbox.kill().catch(() => {});
   }

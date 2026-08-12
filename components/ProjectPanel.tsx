@@ -9,7 +9,6 @@ import {
   Square,
   Save,
   AlertTriangle,
-  Terminal,
   FilePlus,
   Trash2,
   FileCode,
@@ -27,6 +26,7 @@ import { createClient } from "@/lib/supabase/client";
 import type { RoomMember, ProjectFile, ProjectRunState, RoomRole } from "@/components/RoomView";
 import ProjectAssistant from "@/components/ProjectAssistant";
 import ProjectChanges from "@/components/ProjectChanges";
+import ProjectTerminal from "@/components/ProjectTerminal";
 
 // CodeMirror touches browser globals at mount time — must never render on the
 // server. Same constraint CodePanel had, unchanged here.
@@ -581,28 +581,12 @@ export default function ProjectPanel({
             </div>
           )}
 
-          <div className="shrink-0 border-t border-border bg-background">
-            <div className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-medium text-muted">
-              <Terminal className={`h-3.5 w-3.5 ${isRunning ? "animate-pulse text-accent" : ""}`} strokeWidth={1.75} />
-              {isRunning ? `Running ${runState.entryPath ?? ""}…` : "Output"}
-            </div>
-            <div className="max-h-40 overflow-y-auto px-4 pb-3 font-mono text-xs">
-              {!isRunning && runState.lastRunAt && (
-                <>
-                  {runState.lastRunStdout && (
-                    <pre className="whitespace-pre-wrap break-words text-foreground">{runState.lastRunStdout}</pre>
-                  )}
-                  {runState.lastRunStderr && (
-                    <pre className="whitespace-pre-wrap break-words text-red-400">{runState.lastRunStderr}</pre>
-                  )}
-                  <p className="mt-1 text-muted">exit code: {runState.lastRunExitCode}</p>
-                </>
-              )}
-              {!isRunning && !runState.lastRunAt && (
-                <p className="py-2 text-muted">Run a file to see output here.</p>
-              )}
-            </div>
-          </div>
+          <ProjectTerminal
+            projectId={projectId}
+            runState={runState}
+            currentUserId={currentUserId}
+            memberById={memberById}
+          />
             </>
           )}
         </div>
