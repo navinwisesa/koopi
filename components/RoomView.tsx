@@ -19,6 +19,7 @@ import {
   Square,
   ArrowUp,
   PanelLeft,
+  PanelRight,
   MessageSquarePlus,
   Terminal,
   Wand2,
@@ -26,14 +27,19 @@ import {
   Sparkles,
   Brain,
   AlertTriangle,
+  MonitorPlay,
+  ExternalLink,
 } from "lucide-react";
 import Avatar from "@/components/Avatar";
+import ProjectPanel from "@/components/ProjectPanel";
 import NewChatModal from "@/components/NewChatModal";
+import ResizeHandle from "@/components/ResizeHandle";
 import PersonalitySelector, { type Personality } from "@/components/PersonalitySelector";
 import ProfileMenu from "@/components/ProfileMenu";
 import RoomSidebar from "@/components/RoomSidebar";
 import { presenceOf, PRESENCE_DOT } from "@/lib/presence";
 import { createClient } from "@/lib/supabase/client";
+import { useResizableWidth } from "@/lib/useResizableWidth";
 
 export type ChatMessage = {
   id: string;
@@ -45,7 +51,7 @@ export type ChatMessage = {
   type: "text" | "tool_call" | "tool_result";
   interruptedBy: string | null;
   createdAt: string;
-  modelTier: "chat" | "build" | null;
+  modelTier: "chat" | "build" | "code" | null;
   modelProvider: string | null;
   // Set by /api/chat's post-reply classification pass — never inferred client-side,
   // since "was room memory available" is true on nearly every message once a room has
@@ -70,6 +76,37 @@ export type Thread = {
   updatedAt: string;
 };
 
+// Room-scoped (not thread-scoped) — one project per room, keyed by fileId
+// client-side. Replaces the old ThreadFile / single-file-per-thread model.
+export type ProjectFile = {
+  id: string;
+  projectId: string;
+  path: string;
+  content: string;
+  language: string;
+  // null = Koopi-authored — the agent has no profiles row, same convention as
+  // ChatMessage.senderId being null for agent messages.
+  lastEditedBy: string | null;
+  updatedAt: string;
+};
+
+export type ProjectRunState = {
+  status: "idle" | "running";
+  entryPath: string | null;
+  lastRunStdout: string | null;
+  lastRunStderr: string | null;
+  lastRunExitCode: number | null;
+  lastRunAt: string | null;
+  lastRunBy: string | null;
+};
+
+export type Project = {
+  id: string;
+  roomId: string;
+  name: string;
+  createdBy: string | null;
+} & ProjectRunState;
+
 const HEARTBEAT_MS = 30_000;
 // Tailwind's `lg` breakpoint — below this the sidebar is a drawer that
 // should get out of the way after a selection; above it, it stays put.
@@ -87,7 +124,14 @@ function timeLabel(iso: string) {
 }
 
 type ToolCallPayload = { code: string; language: string };
-type ToolResultPayload = { stdout: string; stderr: string; exit_code: number };
+type ToolResultPayload = {
+  stdout: string;
+  stderr: string;
+  exit_code: number;
+  // Only present for open_gui_session results — a live, watchable view of a
+  // GUI app running in a virtual desktop, in place of stdout/stderr.
+  streamUrl?: string | null;
+};
 
 function parseJson<T>(raw: string, fallback: T): T {
   try {
@@ -145,6 +189,34 @@ function rowToThread(row: Record<string, unknown>): Thread {
   };
 }
 
+function rowToProject(row: Record<string, unknown>): Project {
+  return {
+    id: row.id as string,
+    roomId: row.room_id as string,
+    name: (row.name as string | null) ?? "Project",
+    createdBy: (row.created_by as string | null) ?? null,
+    status: ((row.run_status as string) ?? "idle") as "idle" | "running",
+    entryPath: (row.run_entry_path as string | null) ?? null,
+    lastRunStdout: (row.last_run_stdout as string | null) ?? null,
+    lastRunStderr: (row.last_run_stderr as string | null) ?? null,
+    lastRunExitCode: (row.last_run_exit_code as number | null) ?? null,
+    lastRunAt: (row.last_run_at as string | null) ?? null,
+    lastRunBy: (row.last_run_by as string | null) ?? null,
+  };
+}
+
+function rowToProjectFile(row: Record<string, unknown>): ProjectFile {
+  return {
+    id: row.id as string,
+    projectId: row.project_id as string,
+    path: row.path as string,
+    content: (row.content as string) ?? "",
+    language: (row.language as string) ?? "python",
+    lastEditedBy: (row.last_edited_by as string | null) ?? null,
+    updatedAt: row.updated_at as string,
+  };
+}
+
 export default function RoomView({
   roomId,
   initialName,
@@ -158,6 +230,8 @@ export default function RoomView({
   initialLastReadAt,
   initialKoopiActive,
   initialParticipantKoopiActive,
+  initialProject,
+  initialProjectFiles,
   initialPersonality,
 }: {
   roomId: string;
@@ -172,6 +246,8 @@ export default function RoomView({
   initialLastReadAt: Record<string, string | null>;
   initialKoopiActive: Record<string, boolean>;
   initialParticipantKoopiActive: Record<string, Record<string, boolean>>;
+  initialProject: Project | null;
+  initialProjectFiles: ProjectFile[];
   initialPersonality: Personality;
 }) {
   const supabase = useMemo(() => createClient(), []);
@@ -200,6 +276,33 @@ export default function RoomView({
   // Threads with a Koopi reply currently in flight (broadcast, not persisted — purely
   // ephemeral UI state, same as any chat app's typing indicator).
   const [typingThreads, setTypingThreads] = useState<Set<string>>(new Set());
+  // Room-scoped project (one per room) and its files — replaces the old
+  // per-thread threadFiles map. `project` is null until someone opens the
+  // panel for the first time, which lazily creates it (see ensureProject).
+  const [project, setProject] = useState<Project | null>(initialProject);
+  const [projectFiles, setProjectFiles] = useState<Record<string, ProjectFile>>(
+    () => Object.fromEntries(initialProjectFiles.map((f) => [f.id, f]))
+  );
+  // Whether the project panel is visible at all — defaults closed.
+  const [projectPanelOpen, setProjectPanelOpen] = useState(false);
+  // The most recent project_files.updatedAt this viewer has actually had the
+  // panel open for — not persisted, purely "have I looked since this
+  // changed" for the toggle button's unseen-update dot. Room-scoped now
+  // (single value), not per-thread.
+  const [projectSeenAt, setProjectSeenAt] = useState<string | null>(null);
+  const {
+    width: codePanelWidth,
+    onHandleMouseDown: onCodePanelHandleMouseDown,
+    onHandleDoubleClick: onCodePanelHandleDoubleClick,
+  } = useResizableWidth({
+    storageKey: "koopi:code-panel-width",
+    defaultWidth: 480,
+    min: 360,
+    max: 720,
+    // Anchored to the right edge of the screen — dragging the handle left
+    // (toward the chat column) grows it.
+    direction: "left",
+  });
   const [activeThreadId, setActiveThreadId] = useState<string | null>(
     // Threads arrive newest-first, so the most recent conversation opens.
     initialThreads[0]?.id ?? null
@@ -244,6 +347,50 @@ export default function RoomView({
 
   const streamingMessage = threadMessages.find((m) => m.status === "streaming");
   const isStreaming = Boolean(streamingMessage);
+
+  const sortedProjectFiles = useMemo(
+    () =>
+      Object.values(projectFiles)
+        .filter((f) => f.projectId === project?.id)
+        .sort((a, b) => a.path.localeCompare(b.path)),
+    [projectFiles, project]
+  );
+  const latestProjectFileUpdate = useMemo(
+    () => sortedProjectFiles.reduce<string | null>((max, f) => (!max || f.updatedAt > max ? f.updatedAt : max), null),
+    [sortedProjectFiles]
+  );
+  const hasUnseenCodeUpdate = Boolean(latestProjectFileUpdate && latestProjectFileUpdate !== projectSeenAt);
+
+  // Marks the project as "seen" the moment its panel is actually open and on
+  // screen — covers both opening the panel on an already-updated project and
+  // a fresh update arriving while it's already open.
+  useEffect(() => {
+    if (!projectPanelOpen || !latestProjectFileUpdate) return;
+    setProjectSeenAt((prev) => (prev === latestProjectFileUpdate ? prev : latestProjectFileUpdate));
+  }, [projectPanelOpen, latestProjectFileUpdate]);
+
+  // Lazily creates the room's single project on first panel open. A unique
+  // constraint on projects.room_id makes a simultaneous double-create by two
+  // participants harmless — the loser's insert 23505s and just re-fetches
+  // what the winner created.
+  async function ensureProject(): Promise<void> {
+    if (project) return;
+    const { data: inserted, error: insertErr } = await supabase
+      .from("projects")
+      .insert({ room_id: roomId, created_by: currentUserId })
+      .select("*")
+      .single();
+    if (!insertErr && inserted) {
+      setProject(rowToProject(inserted as Record<string, unknown>));
+      return;
+    }
+    const { data: existing } = await supabase
+      .from("projects")
+      .select("*")
+      .eq("room_id", roomId)
+      .maybeSingle();
+    if (existing) setProject(rowToProject(existing as Record<string, unknown>));
+  }
 
   const memberById = useMemo(() => {
     const map = new Map<string, RoomMember>();
@@ -518,6 +665,66 @@ export default function RoomView({
     };
   }, [supabase, roomId, currentUserId]);
 
+  // --- realtime: projects + project_files (project panel) -----------------
+  useEffect(() => {
+    // Neither table carries a filterable room_id column client-side query
+    // params can key on directly in the postgres_changes filter — same
+    // unfiltered-subscription, RLS-does-the-filtering shape thread_files used.
+    const channel = supabase
+      .channel(`room:${roomId}:projects`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "projects" },
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            setProject(null);
+            return;
+          }
+          const row = payload.new as Record<string, unknown> | null;
+          if (!row || row.room_id !== roomId) return;
+          setProject(rowToProject(row));
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "project_files" },
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            const old = payload.old as Record<string, unknown> | null;
+            const id = old?.id as string | undefined;
+            if (!id) return;
+            setProjectFiles((prev) => {
+              const next = { ...prev };
+              delete next[id];
+              return next;
+            });
+            return;
+          }
+
+          const row = payload.new as Record<string, unknown> | null;
+          const id = row?.id as string | undefined;
+          // project_files has no room_id column, and this effect intentionally
+          // doesn't depend on `project` (avoids resubscribing the channel
+          // every time the project row changes) — so a stale/cross-room
+          // entry could in principle land in this dict. That's safe: it's
+          // scoped out at read time by sortedProjectFiles filtering on
+          // f.projectId === project?.id below, the same
+          // "store everything, filter at read time" shape threadFiles used.
+          if (!id) return;
+
+          setProjectFiles((prev) => ({
+            ...prev,
+            [id]: rowToProjectFile(row!),
+          }));
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [supabase, roomId]);
+
   // --- realtime: room settings (personality) ------------------------------
   useEffect(() => {
     const channel = supabase
@@ -780,16 +987,42 @@ export default function RoomView({
   }
 
   async function handleStop() {
-    if (!streamingMessage) return;
+    if (!isStreaming || !activeThreadId) return;
     setError(null);
 
-    const { error: stopError } = await supabase
-      .from("messages")
-      .update({ status: "interrupted", interrupted_by: currentUserId })
-      .eq("id", streamingMessage.id)
-      .eq("status", "streaming");
+    // Clears every streaming row in this thread, not just the one
+    // `streamingMessage` happened to point at — a thread can end up with more
+    // than one row stuck at status='streaming' (e.g. a dev-server crash mid
+    // tool_call leaves that row orphaned forever, same as the text-flush
+    // ticker dying does), and stopping only the first one left Stop looking
+    // like it did nothing: the UI would immediately re-lock onto the next
+    // stuck row and show "responding…" again.
+    //
+    // Also sets threads.stop_requested_at unconditionally — a multi-round
+    // tool loop (run_code, look at the result, call it again...) can spend
+    // several seconds between rounds with NO row streaming at all (waiting
+    // on the next model call, which can itself fail over through multiple
+    // providers). During one of those gaps the update above touches zero
+    // rows, so it alone can't stop a reply that's mid-loop; the server polls
+    // this column once per round to catch exactly that case.
+    const [{ error: stopError }, { error: signalError }] = await Promise.all([
+      supabase
+        .from("messages")
+        .update({ status: "interrupted", interrupted_by: currentUserId })
+        .eq("thread_id", activeThreadId)
+        .eq("status", "streaming"),
+      supabase
+        .from("threads")
+        .update({ stop_requested_at: new Date().toISOString() })
+        .eq("id", activeThreadId),
+    ]);
 
     if (stopError) setError(stopError.message);
+    // Best-effort, logged not surfaced — the row-flip above already covers
+    // the common case (something visibly streaming right now), so a failure
+    // here (e.g. the stop_requested_at migration not applied yet) shouldn't
+    // block the user with an error banner over what's still a working Stop.
+    if (signalError) console.warn("handleStop: failed to set stop_requested_at", signalError);
   }
 
   async function saveName() {
@@ -966,6 +1199,33 @@ export default function RoomView({
 
               <button
                 type="button"
+                onClick={() => {
+                  setProjectPanelOpen((v) => !v);
+                  void ensureProject();
+                }}
+                aria-pressed={projectPanelOpen}
+                title={
+                  hasUnseenCodeUpdate && !projectPanelOpen
+                    ? "Project — updated since you last looked"
+                    : projectPanelOpen
+                      ? "Hide project panel"
+                      : "Show project panel"
+                }
+                className={`relative flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs transition-colors ${
+                  projectPanelOpen
+                    ? "border-accent text-accent"
+                    : "border-border text-muted hover:text-foreground"
+                }`}
+              >
+                <PanelRight className="h-3.5 w-3.5" strokeWidth={1.75} />
+                <span className="hidden sm:inline">Project</span>
+                {hasUnseenCodeUpdate && !projectPanelOpen && (
+                  <span className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-accent" />
+                )}
+              </button>
+
+              <button
+                type="button"
                 onClick={copyInvite}
                 className="flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-muted transition-colors hover:text-foreground"
               >
@@ -1041,7 +1301,8 @@ export default function RoomView({
             )}
           </div>
         ) : (
-          <>
+          <div className="flex min-h-0 flex-1">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col">
             {/* ---------- transcript ---------- */}
             <div className="min-h-0 flex-1 overflow-y-auto">
               <div className="mx-auto max-w-3xl px-6 py-8">
@@ -1116,30 +1377,28 @@ export default function RoomView({
                               <span className="text-xs text-muted">
                                 {timeLabel(m.createdAt)}
                               </span>
-                              {isAgent && m.modelTier && (
-                                <span
-                                  title={
-                                    m.modelProvider && m.modelProvider !== "cerebras"
-                                      ? `Served via ${m.modelProvider} (fallback)`
-                                      : undefined
-                                  }
-                                  className={`flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
-                                    m.modelTier === "build"
-                                      ? "bg-accent/15 text-accent"
-                                      : "bg-surface text-muted"
-                                  }`}
-                                >
-                                  {m.modelTier === "build" ? (
-                                    <Sparkles className="h-2.5 w-2.5" strokeWidth={2.5} />
-                                  ) : (
-                                    <Zap className="h-2.5 w-2.5" strokeWidth={2.5} />
-                                  )}
-                                  {m.modelTier === "build" ? "Powerful" : "Efficient"}
-                                  {m.modelProvider && m.modelProvider !== "cerebras"
-                                    ? ` · ${m.modelProvider}`
-                                    : ""}
-                                </span>
-                              )}
+                              {isAgent && m.modelTier && (() => {
+                                // Groq is the primary provider for chat/build; OpenRouter is its
+                                // fallback there, but is the sole (never "fallback") provider for
+                                // code — cohere/north-mini-code only lives on OpenRouter.
+                                const isFallback = m.modelTier !== "code" && m.modelProvider === "openrouter";
+                                const style =
+                                  m.modelTier === "build"
+                                    ? { icon: Sparkles, label: "Powerful", className: "bg-accent/15 text-accent" }
+                                    : m.modelTier === "code"
+                                      ? { icon: Terminal, label: "Code", className: "bg-blue-500/15 text-blue-400" }
+                                      : { icon: Zap, label: "Efficient", className: "bg-surface text-muted" };
+                                return (
+                                  <span
+                                    title={m.modelProvider && isFallback ? `Served via ${m.modelProvider} (fallback)` : undefined}
+                                    className={`flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${style.className}`}
+                                  >
+                                    <style.icon className="h-2.5 w-2.5" strokeWidth={2.5} />
+                                    {style.label}
+                                    {isFallback ? ` · ${m.modelProvider}` : ""}
+                                  </span>
+                                );
+                              })()}
                               {isAgent && m.usedRoomMemory && (
                                 <span
                                   title="This reply drew on room memory — context from other threads in this room"
@@ -1192,12 +1451,33 @@ export default function RoomView({
                               </div>
                             ) : m.type === "tool_result" ? (
                               (() => {
-                                const { stdout, stderr, exit_code } =
+                                const { stdout, stderr, exit_code, streamUrl } =
                                   parseJson<ToolResultPayload>(m.content, {
                                     stdout: "",
                                     stderr: "",
                                     exit_code: 0,
                                   });
+
+                                if (streamUrl) {
+                                  return (
+                                    <div className="mt-1 overflow-hidden rounded-lg border border-accent/40 bg-accent/5">
+                                      <a
+                                        href={streamUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="flex items-center gap-2 px-3 py-2.5 text-sm font-medium text-accent hover:underline"
+                                      >
+                                        <MonitorPlay className="h-4 w-4 shrink-0" strokeWidth={2} />
+                                        Open live view
+                                        <ExternalLink className="h-3.5 w-3.5 shrink-0" strokeWidth={2} />
+                                      </a>
+                                      <p className="border-t border-accent/20 px-3 py-1.5 text-xs text-muted">
+                                        Opens in a new tab — live for about 5 minutes.
+                                      </p>
+                                    </div>
+                                  );
+                                }
+
                                 return (
                                   <div className="mt-1 overflow-hidden rounded-lg border border-border">
                                     <div className="flex items-center justify-between border-b border-border bg-surface px-3 py-1.5 text-xs font-medium text-muted">
@@ -1447,7 +1727,31 @@ export default function RoomView({
                 </form>
               </div>
             </div>
-          </>
+          </div>
+
+          {projectPanelOpen && project && (
+            <>
+              <div className="hidden md:block">
+                <ResizeHandle
+                  onMouseDown={onCodePanelHandleMouseDown}
+                  onDoubleClick={onCodePanelHandleDoubleClick}
+                />
+              </div>
+              <div
+                style={{ width: codePanelWidth }}
+                className="hidden shrink-0 md:flex md:flex-col"
+              >
+                <ProjectPanel
+                  projectId={project.id}
+                  files={sortedProjectFiles}
+                  runState={project}
+                  currentUserId={currentUserId}
+                  memberById={memberById}
+                />
+              </div>
+            </>
+          )}
+          </div>
         )}
       </div>
 

@@ -8,6 +8,8 @@ import RoomView, {
   type ChatMessage,
   type RoomMember,
   type Thread,
+  type Project,
+  type ProjectFile,
 } from "@/components/RoomView";
 import { type Personality } from "@/components/PersonalitySelector";
 
@@ -188,6 +190,51 @@ export default async function RoomPage({
     flagged: m.flagged ?? false,
   }));
 
+  // Project mode: one project per room (not per thread) — replaces the old
+  // thread_files single-file-per-thread model. Not lazily created here;
+  // RoomView creates it client-side the first time anyone opens the panel,
+  // so a room nobody has opened Project on yet simply has no project row.
+  const { data: projectRow } = await supabase
+    .from("projects")
+    .select(
+      "id, room_id, name, created_by, run_status, run_entry_path, last_run_stdout, last_run_stderr, last_run_exit_code, last_run_at, last_run_by"
+    )
+    .eq("room_id", id)
+    .maybeSingle();
+
+  const initialProject: Project | null = projectRow
+    ? {
+        id: projectRow.id,
+        roomId: projectRow.room_id,
+        name: projectRow.name ?? "Project",
+        createdBy: projectRow.created_by,
+        status: (projectRow.run_status as "idle" | "running") ?? "idle",
+        entryPath: projectRow.run_entry_path,
+        lastRunStdout: projectRow.last_run_stdout,
+        lastRunStderr: projectRow.last_run_stderr,
+        lastRunExitCode: projectRow.last_run_exit_code,
+        lastRunAt: projectRow.last_run_at,
+        lastRunBy: projectRow.last_run_by,
+      }
+    : null;
+
+  const { data: projectFileRows } = projectRow
+    ? await supabase
+        .from("project_files")
+        .select("id, project_id, path, content, language, last_edited_by, updated_at")
+        .eq("project_id", projectRow.id)
+    : { data: [] };
+
+  const initialProjectFiles: ProjectFile[] = (projectFileRows ?? []).map((row) => ({
+    id: row.id,
+    projectId: row.project_id,
+    path: row.path,
+    content: row.content ?? "",
+    language: row.language ?? "python",
+    lastEditedBy: row.last_edited_by,
+    updatedAt: row.updated_at,
+  }));
+
   const initialMembers: RoomMember[] = participants.map((p) => {
     const prof = firstOf(p.profiles);
     return {
@@ -213,6 +260,8 @@ export default async function RoomPage({
       initialLastReadAt={initialLastReadAt}
       initialKoopiActive={initialKoopiActive}
       initialParticipantKoopiActive={initialParticipantKoopiActive}
+      initialProject={initialProject}
+      initialProjectFiles={initialProjectFiles}
       initialPersonality={(room.personality as Personality | null) ?? "default"}
     />
   );

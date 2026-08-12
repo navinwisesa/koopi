@@ -3,33 +3,34 @@ import OpenAI from "openai";
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { SandboxRun, type RunResult } from "@/lib/sandbox";
+import { runGuiSession } from "@/lib/desktopSandbox";
 import { classifyIntent } from "@/lib/intentClassifier";
 import type { Personality } from "@/components/PersonalitySelector";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-// Both modes run the same Cerebras model — gpt-oss-120b is the only
-// production-supported model there (Gemma and GLM-4.7 are preview-only).
-// Efficient mode uses low reasoning effort for quick conversational replies;
-// Powerful mode uses high effort for anything that needs real reasoning or
-// the run_code tool.
-const CEREBRAS_MODEL = "gpt-oss-120b";
-const REASONING_EFFORT: Record<"chat" | "build", "low" | "high"> = {
-  chat: "low",
-  build: "high",
-};
-
-// Fallback models, used only when Cerebras itself is unavailable (missing
-// key, rate limit, or any other error) — first Groq, then OpenRouter, the
-// same tiering Koopi used before Cerebras became the primary provider.
-const FALLBACK_GROQ_MODEL: Record<"chat" | "build", string> = {
+// No single primary provider anymore — Cerebras is gone (not worth the extra
+// hop once free-tier Groq/OpenRouter models cover the same ground). Routing
+// is a straight three-way split:
+//   code request        → cohere/north-mini-code:free on OpenRouter (Groq has
+//                          no comparable free code model, so there's no
+//                          primary leg to try before this one)
+//   non-code, Powerful   → Groq llama-3.3-70b-versatile, falling back to
+//                          nvidia/nemotron-3-super-120b-a12b:free on OpenRouter
+//   non-code, Efficient  → Groq llama-3.1-8b-instant, falling back to
+//                          openai/gpt-oss-20b:free on OpenRouter
+// "code" is decided purely from the message content (see isCode below) and
+// wins regardless of the Efficient/Powerful tier — once it's code, the tier
+// selector stops mattering.
+const OPENROUTER_CODE_MODEL = "cohere/north-mini-code:free";
+const GROQ_MODEL: Record<"chat" | "build", string> = {
   chat: "llama-3.1-8b-instant",
   build: "llama-3.3-70b-versatile",
 };
-const FALLBACK_OPENROUTER_MODEL: Record<"chat" | "build", string> = {
-  chat: "meta-llama/llama-3.1-8b-instruct",
-  build: "meta-llama/llama-3.3-70b-instruct",
+const OPENROUTER_MODEL: Record<"chat" | "build", string> = {
+  chat: "openai/gpt-oss-20b:free",
+  build: "nvidia/nemotron-3-super-120b-a12b:free",
 };
 
 const MAX_HISTORY = 40;
@@ -78,9 +79,51 @@ format, organize, or "print out" a text answer — opinions, explanations,
 comparisons, and general-knowledge questions should be answered directly as plain
 text, never wrapped in a code execution. If you're unsure whether a question needs
 code, default to answering as plain text. Supported languages: python, javascript,
-typescript, bash. The sandbox is fresh and stateless for every call — it has no
-files or state from earlier in the conversation, so include everything the snippet
-needs to run standalone.
+typescript, bash. The sandbox persists for the whole room — files and state from
+an earlier run_code call anywhere in this room, in ANY thread, are still there
+(it's the same working environment), so you can build on or modify something
+created earlier instead of rewriting it from scratch. If a call reconnects to a
+stale or expired sandbox, it transparently falls back to a fresh one — don't
+assume persistence succeeded if output suggests a clean state. run_code's sandbox
+has no display and cannot show anyone anything visual — if the code opens a
+window (Tkinter, Pygame, or any other GUI toolkit), it will crash there with a
+"no display" error. There is no workaround for this inside run_code: don't try
+to fake a display by opening a browser, generating a URL yourself, writing an
+image to disk, or any other trick — none of that makes a GUI visible to the
+person.
+
+Before reaching for a native GUI toolkit at all, consider whether what's being
+asked for can just be a webpage instead — a single self-contained HTML file
+with inline <style> and <script>, no build step, no dependencies. Default to
+that for anything that's fundamentally a UI (a calculator, a form, a simple
+game, a small dashboard, etc.): write it as one HTML file the normal way (a
+fenced code block — it lands in the thread's code panel), then tell them to
+save it and open it in their own browser. That's instant, costs no
+infrastructure, and needs nothing from you beyond the code. Only reach for a
+native toolkit (Tkinter, PyQt, etc.) — and therefore open_gui_session, since
+that's the only way anyone can actually SEE a native window — when the person
+explicitly asks for a native/desktop app, or the task genuinely needs
+something a browser can't do.
+
+When open_gui_session is genuinely the right call, call it with the actual,
+complete application code (the same code you'd otherwise put in run_code or
+the code panel — e.g. if they're asking to see something already built
+earlier in this thread, pass that exact code, not a placeholder or a new
+unrelated snippet). It returns a real streamUrl in its tool result. Never write
+out, guess, or invent a link yourself — only ever share the exact streamUrl a
+tool result actually returned this turn, and only after that tool call
+succeeded. If open_gui_session's result has no streamUrl (it failed), say so
+plainly instead of claiming a link exists.
+
+Separately, each thread has its own persistent code panel — a single file the
+team can view, edit, and run outside the chat transcript. When you're asked to
+build or update the actual project/script this thread is centered on (not a
+one-off illustrative snippet), a fenced code block in your reply is detected and
+saved there automatically. That means the fenced block must be the COMPLETE
+current file, not a partial diff or "just add this line" fragment — it fully
+replaces whatever was there before. If you're only making a small change to
+something already in the panel, still write out the whole file with that change
+applied, not just the changed lines.
 
 After a tool result, only add a follow-up message if it genuinely adds something
 the output didn't already convey (e.g. tying it back to what was asked). Don't
@@ -129,6 +172,58 @@ ONLY that reply:
 
 Respond with ONLY a compact JSON object and nothing else: {"used_room_memory": true|false, "flagged": true|false}`;
 
+// A dedicated classifier call, deliberately WITHOUT room-memory context — tested
+// empirically against this project's actual (code-heavy) room-memory summaries and
+// found to flip unreliably when folded into SIGNAL_CLASSIFIER_PROMPT above (that
+// summary text itself talks about prior code/files, which confuses a single combined
+// judgment). Kept as its own focused call with just the trigger + reply instead.
+const FILE_UPDATE_CLASSIFIER_PROMPT = `You are a strict binary classifier deciding ONE fact about
+an assistant's reply in a coding chat: does this reply present a fenced code block that IS (or
+fully replaces) a persistent project file the user is building or iterating on in this
+conversation — as opposed to a short illustrative snippet used only to answer a narrow question
+or demonstrate one idea?
+
+Signals that this IS a file update:
+- The user's message asks to build, write, create, update, fix, or add to "the" script/file/app/project.
+- The reply's code block is a complete, substantial, self-contained unit (not a one-liner or a
+  single function shown in isolation to explain a concept).
+
+Signals that this is NOT a file update:
+- The code is a short example embedded in an explanation, answering "how would I do X" in the
+  abstract.
+- The reply contains no fenced code block at all — this must always be false in that case.
+
+Respond with ONLY a compact JSON object and nothing else: {"is_file_update": true|false}`;
+
+// Largest fenced code block wins when a reply has more than one — "the file" is
+// assumed to be the substantial one, not an inline one-liner elsewhere in the reply.
+const FENCE_RE = /```(\w+)?\n([\s\S]*?)```/g;
+
+// At or above this many lines, a fenced block is unambiguously "the file" —
+// route it to the code panel unconditionally instead of spending an LLM call
+// asking classifyFileUpdate to guess something a line count already answers.
+// Below it, a block could still be a short illustrative snippet, so it's
+// worth the classifier's judgment call.
+const FILE_UPDATE_LINE_THRESHOLD = 10;
+
+function extractFileUpdateBlock(
+  text: string
+): { code: string; language: string; fullMatch: string } | null {
+  let best: { code: string; language: string; fullMatch: string } | null = null;
+  for (const match of text.matchAll(FENCE_RE)) {
+    const code = match[2] ?? "";
+    if (!code.trim()) continue;
+    if (!best || code.length > best.code.length) {
+      best = {
+        code,
+        language: (match[1] ?? "").trim().toLowerCase() || "python",
+        fullMatch: match[0],
+      };
+    }
+  }
+  return best;
+}
+
 // Tone/style only — deliberately says nothing about tools, scoping, or what
 // Koopi is allowed to do. That's enforced entirely by SYSTEM_PROMPT above and
 // must never be reweighted by a personality choice.
@@ -174,8 +269,9 @@ const RUN_CODE_TOOL: Groq.Chat.ChatCompletionTool = {
       "and exit code. Use ONLY for genuine computation, data transformation, running " +
       "an algorithm, or testing logic — never to format or present a plain-text answer " +
       "(opinions, explanations, comparisons, general knowledge) that doesn't need code " +
-      "to actually run. The sandbox is stateless — nothing persists between calls, so " +
-      "the snippet must be self-contained.",
+      "to actually run. The sandbox persists across calls for this whole room, across " +
+      "every thread in it (same filesystem, so files from an earlier call — in this " +
+      "thread or another one — are still there).",
     parameters: {
       type: "object",
       properties: {
@@ -183,6 +279,32 @@ const RUN_CODE_TOOL: Groq.Chat.ChatCompletionTool = {
         language: {
           type: "string",
           enum: ["python", "javascript", "typescript", "bash"],
+          description: "The language to run the code as.",
+        },
+      },
+      required: ["code", "language"],
+    },
+  },
+};
+
+const OPEN_GUI_TOOL: Groq.Chat.ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: "open_gui_session",
+    description:
+      "Run code that needs an actual graphical display to work — Tkinter, Pygame, or any " +
+      "other GUI toolkit. run_code's sandbox is headless and this kind of code will crash " +
+      "there with a 'no display' error, so use this instead whenever the code opens a " +
+      "window. This does NOT return stdout/stderr to read — it opens a real virtual desktop " +
+      "and hands back a link the person can open in a new tab to watch (and interact with) " +
+      "the app live, for a few minutes. Never use this for anything that can run headlessly.",
+    parameters: {
+      type: "object",
+      properties: {
+        code: { type: "string", description: "The full source code to run." },
+        language: {
+          type: "string",
+          enum: ["python", "bash"],
           description: "The language to run the code as.",
         },
       },
@@ -280,27 +402,16 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Not signed in" }, { status: 401 });
   }
 
-  const cerebrasKey = process.env.CEREBRAS_API_KEY;
-  if (!cerebrasKey) {
-    return NextResponse.json(
-      { error: "CEREBRAS_API_KEY is not set in .env.local" },
-      { status: 500 }
-    );
-  }
-
-  // Both optional — without either, a Cerebras failure just surfaces the
-  // visible failure message instead of failing over to a backup provider.
+  // Both optional — Groq is the primary provider for the two non-code tiers
+  // (OpenRouter is its fallback there), and OpenRouter is the sole provider
+  // for code requests. Missing either just means that leg is skipped;
+  // postFailureNotice covers the case where nothing is left to try.
   const groqKey = process.env.GROQ_API_KEY;
   const openrouterKey = process.env.OPENROUTER_API_KEY;
 
   // maxRetries: 0 — the SDK's default retry-with-backoff would silently eat
   // 30+ seconds retrying a rate-limited call before our own fallback chain
   // ever gets a chance to run. A 429 should surface immediately.
-  const cerebras = new OpenAI({
-    apiKey: cerebrasKey,
-    baseURL: "https://api.cerebras.ai/v1",
-    maxRetries: 0,
-  });
   const groq = groqKey ? new Groq({ apiKey: groqKey, maxRetries: 0 }) : null;
   const openrouter = openrouterKey
     ? new OpenAI({ apiKey: openrouterKey, baseURL: "https://openrouter.ai/api/v1" })
@@ -330,6 +441,32 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Thread not found" }, { status: 404 });
   }
   const roomId = thread.room_id;
+
+  // Clear any stop signal left over from a previous (already-finished) reply
+  // in this thread before starting a fresh one — see stopRequested() below
+  // for why this signal exists at all. Best-effort: a failed clear here just
+  // means this new reply could spuriously read as already-cancelled, which
+  // fails safe (a visible early stop) rather than unsafe.
+  await supabase.from("threads").update({ stop_requested_at: null }).eq("id", threadId);
+
+  // Durable "stop this reply" check, independent of whichever message row
+  // happens to be status='streaming' right now. The old interrupt path was
+  // purely reactive to a specific row's status — fine while text or a
+  // run_code/open_gui_session call is actively streaming, but there are real
+  // multi-second gaps between tool-call rounds (waiting on the next model
+  // call, which can itself fail over through two or three providers) where
+  // no row is streaming at all. Stop had nothing to flip during one of those
+  // gaps, so it looked like it silently did nothing and the round loop below
+  // had no way to know a stop had landed. Polled once at the top of every
+  // round instead of relying on row status alone.
+  async function stopRequested(): Promise<boolean> {
+    const { data } = await supabase
+      .from("threads")
+      .select("stop_requested_at")
+      .eq("id", threadId)
+      .maybeSingle();
+    return Boolean(data?.stop_requested_at);
+  }
 
   // Anchor history to the message that triggered this call, not "everything in
   // the thread right now" — two people tagging Koopi close together each fire
@@ -367,32 +504,48 @@ export async function POST(request: Request) {
   const triggerUsername = firstOf(triggerRow.profiles)?.username ?? "there";
   const triggerCreatedAt = triggerRow.created_at;
 
+  // Most recent MAX_HISTORY messages up to the trigger — fetched newest-first so the
+  // limit caps off the oldest end of the window, then reversed back to chronological
+  // order for the model. (A straight ascending order+limit would instead return the
+  // thread's *earliest* messages once it grows past MAX_HISTORY, permanently freezing
+  // context at the start of the conversation.)
   const { data: history, error: historyError } = await supabase
     .from("messages")
     .select("id, sender_type, content, sender_id, type, profiles!sender_id(username)")
     .eq("thread_id", threadId)
     .lte("created_at", triggerCreatedAt)
-    .order("created_at", { ascending: true })
+    .order("created_at", { ascending: false })
     .limit(MAX_HISTORY);
 
   if (historyError) {
     return NextResponse.json({ error: historyError.message }, { status: 403 });
   }
 
-  const turns = historyToTurns((history ?? []) as MessageRow[], triggerMessageId);
+  const turns = historyToTurns(((history ?? []) as MessageRow[]).reverse(), triggerMessageId);
   if (turns.length === 0) {
     return NextResponse.json({ error: "Nothing to respond to" }, { status: 400 });
   }
 
   // Route on the raw trigger text, not the annotated turn — casual chatter
   // stays on the cheap model, anything build/code-shaped gets the real one.
-  // A manual override from the composer's model switcher always wins over
-  // the heuristic — the person sending the message knows better than a guess.
+  //
+  // Two independent signals come out of this: `isCode` decides whether the
+  // code-specialized model handles the reply at all, and is read purely from
+  // the message content (classifyIntent's own heuristics) — a manual
+  // Efficient/Powerful override doesn't change whether something IS code, so
+  // it doesn't affect isCode. `tier` decides Efficient vs Powerful for
+  // everything that ISN'T code, and there the manual override from the
+  // composer's model switcher does win over the heuristic guess — the person
+  // sending the message knows better than a guess.
   const triggerText = (history ?? []).find((row) => row.id === triggerMessageId)?.content ?? "";
-  const intent = modelOverride ?? classifyIntent(triggerText);
+  const autoIntent = classifyIntent(triggerText);
+  const tier: "chat" | "build" = modelOverride ?? autoIntent;
+  const isCode = autoIntent === "build";
+  // What actually gets recorded on the reply and shown in the UI badge —
+  // "code" takes precedence over the Efficient/Powerful tier once it applies.
+  const displayTier: "chat" | "build" | "code" = isCode ? "code" : tier;
   console.log(
-    `/api/chat: trigger=${triggerMessageId} intent=${intent} model=${CEREBRAS_MODEL} ` +
-      `reasoning_effort=${REASONING_EFFORT[intent]}` +
+    `/api/chat: trigger=${triggerMessageId} tier=${tier} isCode=${isCode}` +
       (modelOverride ? " (manual override)" : "")
   );
 
@@ -455,7 +608,7 @@ export async function POST(request: Request) {
 
     try {
       const completion = await groq.chat.completions.create({
-        model: FALLBACK_GROQ_MODEL.chat,
+        model: GROQ_MODEL.chat,
         max_completion_tokens: 400,
         messages: [
           { role: "system", content: MEMORY_SYSTEM_PROMPT },
@@ -542,7 +695,7 @@ export async function POST(request: Request) {
 
     try {
       const completion = await groq.chat.completions.create({
-        model: FALLBACK_GROQ_MODEL.chat,
+        model: GROQ_MODEL.chat,
         max_completion_tokens: 40,
         messages: [
           { role: "system", content: SIGNAL_CLASSIFIER_PROMPT },
@@ -565,6 +718,34 @@ export async function POST(request: Request) {
     } catch (err) {
       console.warn(`/api/chat: signal classification skipped for trigger ${triggerMessageId}:`, err);
       return none;
+    }
+  }
+
+  // Separate, focused call for the file-update decision — see the prompt's own
+  // comment for why this can't just be a third field on classifySignals above.
+  // Cheap short-circuit: no fenced block at all means an LLM call can't change
+  // the answer, so skip it entirely.
+  async function classifyFileUpdate(triggerText: string, replyText: string): Promise<boolean> {
+    if (!groq || !replyText.includes("```")) return false;
+
+    try {
+      const completion = await groq.chat.completions.create({
+        model: GROQ_MODEL.chat,
+        max_completion_tokens: 20,
+        messages: [
+          { role: "system", content: FILE_UPDATE_CLASSIFIER_PROMPT },
+          {
+            role: "user",
+            content: `User's request:\n${triggerText}\n\nAssistant reply:\n${replyText}`,
+          },
+        ],
+      });
+      const raw = completion.choices[0]?.message?.content?.trim() ?? "";
+      const parsed = safeParse<{ is_file_update?: boolean }>(raw, {});
+      return Boolean(parsed.is_file_update);
+    } catch (err) {
+      console.warn(`/api/chat: file-update classification skipped for trigger ${triggerMessageId}:`, err);
+      return false;
     }
   }
 
@@ -622,28 +803,23 @@ export async function POST(request: Request) {
 
     const requestMessages = [{ role: "system" as const, content: effectiveSystemPrompt }, ...turns];
 
-    // Cerebras, Groq, and OpenRouter are all cast to the same ChatStream shape —
-    // Cerebras and OpenRouter speak OpenAI's wire format natively, and Groq's
+    // Groq and OpenRouter are both cast to the same ChatStream shape —
+    // OpenRouter speaks OpenAI's wire format natively, and Groq's
     // separately-typed SDK speaks the same format under the hood.
-    async function attemptOpenrouterOrFail(prevErr: unknown): Promise<ChatStream | null> {
-      if (!openrouter) {
-        await postFailureNotice(prevErr);
-        return null;
-      }
+    async function tryOpenrouter(model: string): Promise<{ stream: ChatStream } | { error: unknown }> {
+      if (!openrouter) return { error: new Error("OPENROUTER_API_KEY is not set") };
       try {
-        console.log(`/api/chat: trigger=${triggerMessageId} failing over to openrouter`);
-        return (await openrouter.chat.completions.create({
-          model: FALLBACK_OPENROUTER_MODEL[intent],
-          max_completion_tokens: 4096,
-          stream: true,
-          tools: [RUN_CODE_TOOL] as unknown as OpenAI.Chat.ChatCompletionTool[],
-          messages: requestMessages as unknown as OpenAI.Chat.ChatCompletionMessageParam[],
-        })) as ChatStream;
-      } catch (fallbackErr) {
-        // Every provider failed — this must still surface visibly, same as
-        // a single-provider failure would.
-        await postFailureNotice(fallbackErr);
-        return null;
+        return {
+          stream: (await openrouter.chat.completions.create({
+            model,
+            max_completion_tokens: 4096,
+            stream: true,
+            tools: [RUN_CODE_TOOL, OPEN_GUI_TOOL] as unknown as OpenAI.Chat.ChatCompletionTool[],
+            messages: requestMessages as unknown as OpenAI.Chat.ChatCompletionMessageParam[],
+          })) as ChatStream,
+        };
+      } catch (err) {
+        return { error: err };
       }
     }
 
@@ -651,52 +827,60 @@ export async function POST(request: Request) {
     // Recorded onto the agent's message row so the UI can show which tier and
     // provider actually answered — the composer's tier choice doesn't always
     // match reality once a fallback kicks in.
-    let provider: "cerebras" | "groq" | "openrouter" = "cerebras";
-    try {
-      stream = (await cerebras.chat.completions.create({
-        model: CEREBRAS_MODEL,
-        reasoning_effort: REASONING_EFFORT[intent],
-        max_completion_tokens: 4096,
-        stream: true,
-        tools: [RUN_CODE_TOOL] as unknown as OpenAI.Chat.ChatCompletionTool[],
-        messages: requestMessages as unknown as OpenAI.Chat.ChatCompletionMessageParam[],
-      })) as ChatStream;
-    } catch (cerebrasErr) {
-      // Cerebras is new here — fail over on any error, not just rate limits,
-      // straight into the existing Groq/OpenRouter chain below.
-      console.log(
-        `/api/chat: trigger=${triggerMessageId} cerebras failed, failing over:`,
-        cerebrasErr instanceof Error ? cerebrasErr.message : cerebrasErr
-      );
+    let provider: "groq" | "openrouter";
 
-      if (!groq) {
-        const fallback = await attemptOpenrouterOrFail(cerebrasErr);
-        if (!fallback) return { kind: "text", messageId: null, text: "" };
-        stream = fallback;
-        provider = "openrouter";
-      } else {
-        try {
-          stream = (await groq.chat.completions.create({
-            model: FALLBACK_GROQ_MODEL[intent],
-            max_completion_tokens: 4096,
-            stream: true,
-            tools: [RUN_CODE_TOOL],
-            messages: requestMessages,
-          })) as ChatStream;
-          provider = "groq";
-        } catch (groqErr) {
-          // Only fail over further on a genuine quota/availability problem —
-          // anything else would just fail identically on OpenRouter too.
-          if (!isRateLimited(groqErr)) {
-            await postFailureNotice(groqErr);
-            return { kind: "text", messageId: null, text: "" };
-          }
-          const fallback = await attemptOpenrouterOrFail(groqErr);
-          if (!fallback) return { kind: "text", messageId: null, text: "" };
-          stream = fallback;
-          provider = "openrouter";
-        }
+    if (isCode) {
+      // Code always goes straight to the code-specialized OpenRouter model —
+      // Groq has no comparable free-tier code model, so there's no primary
+      // leg to try before this one.
+      const result = await tryOpenrouter(OPENROUTER_CODE_MODEL);
+      if ("error" in result) {
+        await postFailureNotice(result.error);
+        return { kind: "text", messageId: null, text: "" };
       }
+      stream = result.stream;
+      provider = "openrouter";
+    } else if (groq) {
+      try {
+        stream = (await groq.chat.completions.create({
+          model: GROQ_MODEL[tier],
+          max_completion_tokens: 4096,
+          stream: true,
+          tools: [RUN_CODE_TOOL, OPEN_GUI_TOOL],
+          messages: requestMessages,
+        })) as ChatStream;
+        provider = "groq";
+      } catch (groqErr) {
+        // Fail over to OpenRouter unconditionally, not just on a classified
+        // rate limit — Groq's own SDK doesn't reliably map every quota/
+        // availability failure to RateLimitError (its TPM-cap response
+        // comes back as a plain HTTP 413, which isn't classified as a rate
+        // limit at all), so gating the fallback on isRateLimited() was
+        // silently skipping OpenRouter on exactly the kind of failure this
+        // fallback chain exists for. OpenRouter is the last resort anyway —
+        // trying it costs at most one extra failed-then-retried request.
+        console.log(
+          `/api/chat: trigger=${triggerMessageId} groq failed, failing over to openrouter:`,
+          groqErr instanceof Error ? groqErr.message : groqErr
+        );
+        const result = await tryOpenrouter(OPENROUTER_MODEL[tier]);
+        if ("error" in result) {
+          await postFailureNotice(result.error);
+          return { kind: "text", messageId: null, text: "" };
+        }
+        stream = result.stream;
+        provider = "openrouter";
+      }
+    } else {
+      // No Groq key at all — go straight to OpenRouter as if it were the
+      // primary for this tier.
+      const result = await tryOpenrouter(OPENROUTER_MODEL[tier]);
+      if ("error" in result) {
+        await postFailureNotice(result.error);
+        return { kind: "text", messageId: null, text: "" };
+      }
+      stream = result.stream;
+      provider = "openrouter";
     }
 
     const ticker = setInterval(async () => {
@@ -733,7 +917,7 @@ export async function POST(request: Request) {
                 type: "text",
                 content: "",
                 status: "streaming",
-                model_tier: intent,
+                model_tier: displayTier,
                 model_provider: provider,
               })
               .select("id")
@@ -798,8 +982,75 @@ export async function POST(request: Request) {
     return { kind: "text", messageId: textMessageId, text };
   }
 
+  // Room's Project mode replaced the old per-thread thread_files panel — a
+  // single project per room (see 20260815_add_projects.sql), so Koopi's
+  // auto-saved code now needs a project_id to write into rather than just a
+  // thread_id. Lazily creates the room's project exactly like RoomView's own
+  // ensureProject() does client-side; the projects.room_id unique constraint
+  // makes a race between the two harmless (loser's insert 23505s, re-selects).
+  let cachedProjectId: string | null = null;
+  async function ensureRoomProjectId(): Promise<string | null> {
+    if (cachedProjectId) return cachedProjectId;
+    const { data: existing } = await supabase
+      .from("projects")
+      .select("id")
+      .eq("room_id", roomId)
+      .maybeSingle();
+    if (existing) {
+      cachedProjectId = existing.id;
+      return cachedProjectId;
+    }
+    const { data: inserted, error: insertErr } = await supabase
+      .from("projects")
+      .insert({ room_id: roomId, created_by: null })
+      .select("id")
+      .single();
+    if (!insertErr && inserted) {
+      cachedProjectId = inserted.id;
+      return cachedProjectId;
+    }
+    const { data: afterRace } = await supabase
+      .from("projects")
+      .select("id")
+      .eq("room_id", roomId)
+      .maybeSingle();
+    cachedProjectId = afterRace?.id ?? null;
+    return cachedProjectId;
+  }
+
+  // Keeps a single Koopi-authored project file ("koopi_scratch") in sync with
+  // whatever code Koopi just ran/demoed via a tool call — unconditionally,
+  // since a run_code/open_gui_session call is always real code, unlike the
+  // isFileUpdate path below which has to guess from prose whether a fenced
+  // block in the reply text is a "file" worth keeping. Without this, code
+  // that's only ever run (never echoed back into the chat text) never reaches
+  // the project at all. One fixed path, language column swapped per call —
+  // same "one slot, always latest" semantics thread_files had, just
+  // room-scoped now instead of thread-scoped.
+  const KOOPI_SCRATCH_PATH = "koopi_scratch";
+  async function syncProjectFile(code: string, language: string) {
+    if (!code.trim()) return;
+    const projectId = await ensureRoomProjectId();
+    if (!projectId) return;
+    const { error } = await supabase.from("project_files").upsert(
+      {
+        project_id: projectId,
+        path: KOOPI_SCRATCH_PATH,
+        content: code,
+        language,
+        last_edited_by: null,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "project_id,path" }
+    );
+    if (error) {
+      console.warn(`/api/chat: failed to upsert project_files for room ${roomId}:`, error);
+    }
+  }
+
   async function runToolCall(call: PendingToolCall): Promise<"interrupted" | "done"> {
     const { code, language } = safeParse(call.arguments, { code: "", language: "bash" });
+    await syncProjectFile(code, language);
 
     const { data: toolCallRow, error: toolCallErr } = await supabase
       .from("messages")
@@ -818,7 +1069,19 @@ export async function POST(request: Request) {
     if (toolCallErr || !toolCallRow) return "done";
     const toolCallId = toolCallRow.id;
 
-    const sandboxRun = new SandboxRun(code, language);
+    // Reconnect to this room's shared sandbox if it has one, so a snippet can
+    // build on files/state a previous run_code call left behind — from this
+    // thread OR any other thread in the same room. Room-scoped (not
+    // thread-scoped) is a deliberate choice: it matches "same project,
+    // different chat" rather than the stricter per-thread isolation used
+    // for messages/memory.
+    const { data: roomRow } = await supabase
+      .from("rooms")
+      .select("sandbox_id")
+      .eq("id", roomId)
+      .maybeSingle();
+
+    const sandboxRun = new SandboxRun(code, language, roomRow?.sandbox_id ?? null);
     let interruptedTool = false;
 
     const ticker = setInterval(async () => {
@@ -830,8 +1093,11 @@ export async function POST(request: Request) {
     }, FLUSH_MS);
 
     let result: RunResult;
+    let sandboxId: string | null = null;
     try {
-      result = await sandboxRun.run();
+      const outcome = await sandboxRun.run();
+      result = outcome.result;
+      sandboxId = outcome.sandboxId;
     } catch (err) {
       result = {
         stdout: "",
@@ -844,6 +1110,23 @@ export async function POST(request: Request) {
 
     if (interruptedTool || !(await isStillStreaming(toolCallId))) {
       return "interrupted";
+    }
+
+    // Persist the (possibly new) sandbox ID so the next run_code call
+    // anywhere in this room reconnects to it instead of starting over.
+    // Goes through the same SECURITY DEFINER RPC pattern as
+    // update_room_personality/update_room_memory — rooms' UPDATE RLS policy
+    // is creator-only, so a plain table update would silently fail (or throw)
+    // for any non-owner participant. Best-effort — losing this just means
+    // the next call falls back to a fresh sandbox.
+    if (sandboxId && sandboxId !== roomRow?.sandbox_id) {
+      const { error: sandboxPersistErr } = await supabase.rpc("update_room_sandbox", {
+        p_room_id: roomId,
+        p_sandbox_id: sandboxId,
+      });
+      if (sandboxPersistErr) {
+        console.warn(`/api/chat: failed to persist sandbox_id for room ${roomId}:`, sandboxPersistErr);
+      }
     }
 
     await supabase
@@ -871,21 +1154,119 @@ export async function POST(request: Request) {
     return "done";
   }
 
+  // Mirrors runToolCall's shape (insert tool_call → run → insert tool_result)
+  // but simpler: no ticker/cancel polling, since this returns almost as soon
+  // as the stream URL is ready rather than waiting out a whole execution.
+  async function runGuiToolCall(call: PendingToolCall): Promise<"done"> {
+    const { code, language } = safeParse(call.arguments, { code: "", language: "python" });
+    await syncProjectFile(code, language);
+
+    await supabase.from("messages").insert({
+      room_id: roomId,
+      thread_id: threadId,
+      sender_type: "agent",
+      sender_id: null,
+      type: "tool_call",
+      content: JSON.stringify({ code, language }),
+      status: "complete",
+    });
+
+    const { streamUrl, error } = await runGuiSession(code, language);
+
+    // Same ToolResultPayload shape the client already parses for run_code,
+    // plus one optional field — no new message type, no migration.
+    const result = {
+      stdout: "",
+      stderr: error ?? "",
+      exit_code: streamUrl ? 0 : -1,
+      streamUrl,
+    };
+
+    await supabase.from("messages").insert({
+      room_id: roomId,
+      thread_id: threadId,
+      sender_type: "agent",
+      sender_id: null,
+      type: "tool_result",
+      content: JSON.stringify(result),
+      status: "complete",
+    });
+
+    turns.push({
+      role: "tool",
+      tool_call_id: call.id,
+      content: JSON.stringify(result),
+    });
+
+    return "done";
+  }
+
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+          // Only from round 1 onward — round 0 is the reply the user just
+          // asked for, and stop_requested_at was just cleared for it above.
+          if (round > 0 && (await stopRequested())) break;
+
           const outcome = await runModelTurn(controller);
 
           // Every completed text reply gets its own classification pass, independent of
           // whichever round produced it — a tool-use round's follow-up text is just as
           // eligible for either badge as a first-round reply.
           if (outcome.kind === "text" && outcome.messageId && outcome.text) {
-            const signals = await classifySignals(outcome.text);
-            await supabase
-              .from("messages")
-              .update({ used_room_memory: signals.usedRoomMemory, flagged: signals.flagged })
-              .eq("id", outcome.messageId);
+            // Extracted once upfront (cheap, regex-only) so its line count can
+            // decide isFileUpdate deterministically for anything long enough
+            // to be unambiguous — classifyFileUpdate (an LLM call) only gets
+            // asked to judge the genuinely ambiguous, short-block case.
+            const block = extractFileUpdateBlock(outcome.text);
+            const isLongBlock = (block?.code.split("\n").length ?? 0) > FILE_UPDATE_LINE_THRESHOLD;
+
+            const [signals, isFileUpdate] = await Promise.all([
+              classifySignals(outcome.text),
+              isLongBlock ? Promise.resolve(true) : classifyFileUpdate(triggerText, outcome.text),
+            ]);
+            const updates: { used_room_memory: boolean; flagged: boolean; content?: string } = {
+              used_room_memory: signals.usedRoomMemory,
+              flagged: signals.flagged,
+            };
+
+            // Give the reply's code a persistent home in the room's project
+            // instead of (only) living as static text in the transcript.
+            if (isFileUpdate && block) {
+              const projectId = await ensureRoomProjectId();
+              const { error: fileErr } = projectId
+                ? await supabase.from("project_files").upsert(
+                    {
+                      project_id: projectId,
+                      path: KOOPI_SCRATCH_PATH,
+                      content: block.code,
+                      language: block.language,
+                      // null = Koopi-authored — the agent has no profiles row, same
+                      // convention as sender_id: null on agent messages.
+                      last_edited_by: null,
+                      updated_at: new Date().toISOString(),
+                    },
+                    { onConflict: "project_id,path" }
+                  )
+                : { error: new Error("no project for room") };
+              if (!fileErr) {
+                // Replace just the fenced block with a short reference, preserving
+                // any surrounding prose — not a duplicate copy of the file in every
+                // message once it already lives in the project.
+                updates.content = outcome.text.replace(
+                  block.fullMatch,
+                  "📄 Updated the project — see it on the right →"
+                );
+              } else {
+                console.warn(
+                  `/api/chat: failed to upsert project_files for room ${roomId}:`,
+                  fileErr
+                );
+              }
+            }
+
+            await supabase.from("messages").update(updates).eq("id", outcome.messageId);
           }
 
           if (outcome.kind !== "tool_use") break;
@@ -893,7 +1274,8 @@ export async function POST(request: Request) {
 
           let stoppedEarly = false;
           for (const call of outcome.calls) {
-            const toolOutcome = await runToolCall(call);
+            const toolOutcome =
+              call.name === "open_gui_session" ? await runGuiToolCall(call) : await runToolCall(call);
             if (toolOutcome === "interrupted") {
               stoppedEarly = true;
               break;
