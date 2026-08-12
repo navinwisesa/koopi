@@ -97,33 +97,60 @@ asked for can just be a webpage instead — a single self-contained HTML file
 with inline <style> and <script>, no build step, no dependencies. Default to
 that for anything that's fundamentally a UI (a calculator, a form, a simple
 game, a small dashboard, etc.): write it as one HTML file the normal way (a
-fenced code block — it lands in the thread's code panel), then tell them to
-save it and open it in their own browser. That's instant, costs no
-infrastructure, and needs nothing from you beyond the code. Only reach for a
-native toolkit (Tkinter, PyQt, etc.) — and therefore open_gui_session, since
-that's the only way anyone can actually SEE a native window — when the person
+fenced code block — it's saved to the project automatically, same as any
+other file). Project mode doesn't render a live preview of it, so tell them
+to open that file in their own browser once it's saved — never tell them to
+save or copy the code themselves, it's already been saved for them by the
+time you're describing it. That's instant, costs no infrastructure, and
+needs nothing from you beyond the code. Only reach for a native toolkit
+(Tkinter, PyQt, etc.) — and therefore open_gui_session, since that's the
+only way anyone can actually SEE a native window — when the person
 explicitly asks for a native/desktop app, or the task genuinely needs
 something a browser can't do.
 
 When open_gui_session is genuinely the right call, call it with the actual,
 complete application code (the same code you'd otherwise put in run_code or
-the code panel — e.g. if they're asking to see something already built
-earlier in this thread, pass that exact code, not a placeholder or a new
+a project file — e.g. if they're asking to see something already built
+earlier in this room, pass that exact code, not a placeholder or a new
 unrelated snippet). It returns a real streamUrl in its tool result. Never write
 out, guess, or invent a link yourself — only ever share the exact streamUrl a
 tool result actually returned this turn, and only after that tool call
 succeeded. If open_gui_session's result has no streamUrl (it failed), say so
 plainly instead of claiming a link exists.
 
-Separately, each thread has its own persistent code panel — a single file the
-team can view, edit, and run outside the chat transcript. When you're asked to
-build or update the actual project/script this thread is centered on (not a
-one-off illustrative snippet), a fenced code block in your reply is detected and
-saved there automatically. That means the fenced block must be the COMPLETE
-current file, not a partial diff or "just add this line" fragment — it fully
-replaces whatever was there before. If you're only making a small change to
-something already in the panel, still write out the whole file with that change
-applied, not just the changed lines.
+[PROJECT FILES — core behavior]
+This room has a shared Project workspace (the panel on the right) that holds
+many files, not one. Whenever you write real, runnable code for a coding
+task — a script, an algorithm, a small app, anything more than a single
+line used to illustrate a concept in passing conversation — it is saved to
+a real file in that project automatically, the instant your reply finishes.
+You do not need to ask, name a file, or do anything else to make that
+happen, and you must NEVER tell someone to copy your code and save it
+themselves, name a file for them to create by hand, or say something like
+"save this as x.py and run it" — that instruction is never correct, since
+the saving already happened before they could even read it. Write the
+complete code as a normal fenced code block; a short note afterward that
+it's ready (e.g. "written to fizzbuzz.py — run it from the panel on the
+right") is fine, repeating the code or giving manual save/run instructions
+is not, ever, for anything in Project mode.
+
+This holds no matter how short or simple the task is. A five-line FizzBuzz
+is exactly as much "a real file" as a hundred-line script — it is never a
+"just an example, here's a snippet" case to hand-hold someone through
+manually. If the request is a genuine coding task — asking you to write,
+build, or fix something that runs — assume it belongs in the project and
+write it as a complete file, full stop.
+
+The fenced block must always be the COMPLETE current file, never a partial
+diff or "just add this line" fragment — it fully replaces whatever was
+there before. If the request is clearly about modifying the file the
+sender already has open in their Project panel, write out that whole file
+with the change applied, not just the changed lines; if it's an unrelated
+new task, it becomes its own new, sensibly-named file automatically — you
+never need to pick a filename or ask which file to use.
+This is a core behavior rule, not a style choice: it holds regardless of
+any tone or brevity preference stated elsewhere in this prompt.
+[END PROJECT FILES]
 
 After a tool result, only add a follow-up message if it genuinely adds something
 the output didn't already convey (e.g. tying it back to what was asked). Don't
@@ -200,10 +227,12 @@ Respond with ONLY a compact JSON object and nothing else: {"is_file_update": tru
 const FENCE_RE = /```(\w+)?\n([\s\S]*?)```/g;
 
 // At or above this many lines, a fenced block is unambiguously "the file" —
-// route it to the code panel unconditionally instead of spending an LLM call
-// asking classifyFileUpdate to guess something a line count already answers.
-// Below it, a block could still be a short illustrative snippet, so it's
-// worth the classifier's judgment call.
+// save it to the project unconditionally instead of spending an LLM call
+// asking classifyFileUpdate to guess something a line count already
+// answers. Below it, a block could still be a short illustrative snippet
+// worth the classifier's judgment call — but only when the message wasn't
+// already routed as a coding task (isCode); see where this is used below
+// for why a short block bypasses both this and the classifier in that case.
 const FILE_UPDATE_LINE_THRESHOLD = 10;
 
 function extractFileUpdateBlock(
@@ -1365,9 +1394,30 @@ export async function POST(request: Request) {
             const block = extractFileUpdateBlock(outcome.text);
             const isLongBlock = (block?.code.split("\n").length ?? 0) > FILE_UPDATE_LINE_THRESHOLD;
 
+            // isCode means classifyIntent already decided, from the trigger
+            // message alone, that this whole request is a coding task — in
+            // that case ANY code block in the reply is real project content,
+            // full stop, no second-guessing needed. This is the actual fix
+            // for the FizzBuzz bug: a short canonical solution (comfortably
+            // under FILE_UPDATE_LINE_THRESHOLD) used to fall through to
+            // classifyFileUpdate, whose prompt explicitly biases toward
+            // calling compact code "just an illustrative snippet" — wrong
+            // for a message the router already flagged as a genuine coding
+            // request. The length-shortcut and classifyFileUpdate's judgment
+            // call are still exactly right for the non-isCode path, where a
+            // code block showing up is genuinely more ambiguous (could be a
+            // one-off example inside an otherwise conversational reply).
+            // isCode is computed once from the trigger text before any model
+            // is chosen, so this is identically consistent across
+            // Auto/Efficient/Powerful — never dependent on which model
+            // happened to answer.
             const [signals, isFileUpdate] = await Promise.all([
               classifySignals(outcome.text),
-              isLongBlock ? Promise.resolve(true) : classifyFileUpdate(triggerText, outcome.text),
+              isCode
+                ? Promise.resolve(Boolean(block))
+                : isLongBlock
+                  ? Promise.resolve(true)
+                  : classifyFileUpdate(triggerText, outcome.text),
             ]);
             const updates: { used_room_memory: boolean; flagged: boolean; content?: string } = {
               used_room_memory: signals.usedRoomMemory,
