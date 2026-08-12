@@ -16,6 +16,12 @@ import {
   Bot,
   Code2,
   GitPullRequest,
+  ChevronDown,
+  ChevronUp,
+  Crown,
+  Shield,
+  User as UserIcon,
+  Lock,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import type { RoomMember, ProjectFile, ProjectRunState, RoomRole } from "@/components/RoomView";
@@ -27,6 +33,14 @@ import ProjectChanges from "@/components/ProjectChanges";
 const CodeMirror = dynamic(() => import("@uiw/react-codemirror"), { ssr: false });
 
 const LANGUAGES = ["python", "javascript", "typescript", "bash"] as const;
+
+// Same icon-per-role convention as RoomMembersModal, so the badge here and
+// the one in the members list read as the same concept.
+const ROLE_ICON: Record<RoomRole, typeof Crown> = {
+  owner: Crown,
+  admin: Shield,
+  member: UserIcon,
+};
 
 function extensionsFor(language: string) {
   switch (language.toLowerCase()) {
@@ -100,7 +114,14 @@ export default function ProjectPanel({
   const [conflict, setConflict] = useState(false);
   const [newFileOpen, setNewFileOpen] = useState(false);
   const [newFilePath, setNewFilePath] = useState("");
-  const [rightTab, setRightTab] = useState<"editor" | "assistant" | "changes">("editor");
+  const [rightTab, setRightTab] = useState<"editor" | "changes">("editor");
+  // Docked assistant drawer within the Editor tab — replaces the old
+  // standalone "Assistant" tab (usability review: two competing "talk to
+  // AI" surfaces, room chat and this, was confusing). Same underlying
+  // ProjectAssistant component/behavior, just relocated; not tied to
+  // whether a file is selected, so the empty-state "ask the assistant"
+  // hint below can open it too.
+  const [assistantOpen, setAssistantOpen] = useState(false);
 
   const savedContentRef = useRef(selectedFile?.content ?? "");
   const dirtyRef = useRef(false);
@@ -282,6 +303,22 @@ export default function ProjectPanel({
           Project
         </span>
 
+        {/* Persistently visible so a Member always knows their standing
+            without having to open the Members modal — updates live since
+            currentUserRole is derived from RoomView's `members` state,
+            which the existing participants realtime subscription already
+            keeps fresh. */}
+        <span
+          title={`Your role in this room: ${currentUserRole}`}
+          className="flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[10px] font-medium text-muted"
+        >
+          {(() => {
+            const RoleIcon = ROLE_ICON[currentUserRole];
+            return <RoleIcon className="h-3 w-3" strokeWidth={1.75} />;
+          })()}
+          {currentUserRole[0].toUpperCase() + currentUserRole.slice(1)}
+        </span>
+
         <div className="flex items-center gap-0.5 rounded-md border border-border p-0.5">
           <button
             type="button"
@@ -293,17 +330,6 @@ export default function ProjectPanel({
           >
             <Code2 className="h-3 w-3" strokeWidth={1.75} />
             Editor
-          </button>
-          <button
-            type="button"
-            onClick={() => setRightTab("assistant")}
-            title="Per-user coding assistant — private to you until you accept a suggestion"
-            className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] ${
-              rightTab === "assistant" ? "bg-accent/20 text-accent" : "text-muted hover:text-foreground"
-            }`}
-          >
-            <Bot className="h-3 w-3" strokeWidth={1.75} />
-            Assistant
           </button>
           <button
             type="button"
@@ -399,21 +425,24 @@ export default function ProjectPanel({
                 </button>
               </div>
             ))}
-            {sortedFiles.length === 0 && (
-              <p className="px-2 py-2 text-[11px] text-muted">No files yet.</p>
+            {sortedFiles.length === 0 && !newFileOpen && (
+              <div className="px-2 py-3 text-center">
+                <p className="mb-2 text-[11px] text-muted">No files yet.</p>
+                <button
+                  type="button"
+                  onClick={() => setNewFileOpen(true)}
+                  className="inline-flex items-center gap-1 rounded-md bg-accent px-2 py-1 text-[11px] font-medium text-accent-foreground transition-opacity hover:opacity-90"
+                >
+                  <FilePlus className="h-3 w-3" strokeWidth={2} />
+                  New file
+                </button>
+              </div>
             )}
           </div>
         </div>
 
         <div className="flex min-h-0 flex-1 flex-col">
-          {rightTab === "assistant" ? (
-            <ProjectAssistant
-              projectId={projectId}
-              files={sortedFiles}
-              activeFile={selectedFile}
-              currentUserId={currentUserId}
-            />
-          ) : rightTab === "changes" ? (
+          {rightTab === "changes" ? (
             <ProjectChanges
               projectId={projectId}
               files={sortedFiles}
@@ -457,6 +486,15 @@ export default function ProjectPanel({
             <>
               <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-1.5">
                 <span className="truncate text-xs text-foreground">{selectedFile.path}</span>
+                {!canWriteDirectly && (
+                  <span
+                    title="Your edits go to an admin/owner for review before they apply"
+                    className="flex shrink-0 items-center gap-1 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600"
+                  >
+                    <Lock className="h-2.5 w-2.5" strokeWidth={2} />
+                    Requires approval
+                  </span>
+                )}
                 <select
                   value={selectedFile.language}
                   onChange={async (e) => {
@@ -474,6 +512,22 @@ export default function ProjectPanel({
                     </option>
                   ))}
                 </select>
+                <button
+                  type="button"
+                  onClick={() => setAssistantOpen((v) => !v)}
+                  title="Ask about this file — private to you until you accept a suggestion"
+                  className={`flex items-center gap-1 rounded-md border px-2 py-1 text-xs transition-colors ${
+                    assistantOpen ? "border-accent text-accent" : "border-border text-muted hover:text-foreground"
+                  }`}
+                >
+                  <Bot className="h-3.5 w-3.5" strokeWidth={1.75} />
+                  Ask about this file
+                  {assistantOpen ? (
+                    <ChevronUp className="h-3 w-3" strokeWidth={2} />
+                  ) : (
+                    <ChevronDown className="h-3 w-3" strokeWidth={2} />
+                  )}
+                </button>
                 <button
                   type="button"
                   onClick={() => void save()}
@@ -497,8 +551,33 @@ export default function ProjectPanel({
               </div>
             </>
           ) : (
-            <div className="flex flex-1 items-center justify-center text-xs text-muted">
-              Create a file to get started.
+            <div className="flex flex-1 flex-col items-center justify-center gap-1.5 px-4 text-center text-xs text-muted">
+              <p>
+                Create a file, or{" "}
+                <button
+                  type="button"
+                  onClick={() => setAssistantOpen(true)}
+                  className="font-medium text-accent underline-offset-2 hover:underline"
+                >
+                  ask the assistant to generate one
+                </button>
+                .
+              </p>
+            </div>
+          )}
+
+          {assistantOpen && (
+            <div className="flex shrink-0 flex-col border-t border-border" style={{ height: 260 }}>
+              <div className="flex shrink-0 items-center gap-1.5 border-b border-border bg-background px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted">
+                <Bot className="h-3 w-3" strokeWidth={1.75} />
+                Assistant — private to you
+              </div>
+              <ProjectAssistant
+                projectId={projectId}
+                files={sortedFiles}
+                activeFile={selectedFile}
+                currentUserId={currentUserId}
+              />
             </div>
           )}
 

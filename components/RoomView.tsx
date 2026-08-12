@@ -1774,7 +1774,11 @@ export default function RoomView({
               </div>
               <div
                 style={{ width: codePanelWidth }}
-                className="hidden shrink-0 md:flex md:flex-col"
+                // Deliberate elevation/border break from the chat column,
+                // same "distinct pane" language RoomSidebar's border-r
+                // already uses on the opposite edge — the two modes
+                // shouldn't blend together at a glance.
+                className="hidden shrink-0 border-l border-border bg-surface md:flex md:flex-col"
               >
                 <ProjectPanel
                   projectId={project.id}
