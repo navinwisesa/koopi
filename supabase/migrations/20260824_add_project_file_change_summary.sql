@@ -6,7 +6,7 @@
 -- NOT YET APPLIED — authored without a live DB connection this session,
 -- same standing limitation every migration in this repo has been written
 -- under (see 20260815_add_projects.sql's own note, and this session's
--- earlier 20260814_add_message_attachments.sql). Nothing reading or writing
+-- earlier 20260823_add_message_attachments.sql). Nothing reading or writing
 -- this column works until it's applied.
 ALTER TABLE public.project_file_changes
   ADD COLUMN IF NOT EXISTS summary text;

@@ -68,7 +68,7 @@ export type ChatMessage = {
 };
 
 // An image or PDF attached to a message (Phase 1 of the debugging-tools
-// build) — see 20260814_add_message_attachments.sql. Stored in the private
+// build) — see 20260823_add_message_attachments.sql. Stored in the private
 // "message-attachments" Storage bucket; storagePath is the object path
 // there, never a directly-usable URL (every read goes through a signed URL,
 // see AttachmentChip below), matching the private-bucket-plus-RLS pattern
@@ -260,7 +260,7 @@ function rowToAttachment(row: Record<string, unknown>): MessageAttachment {
 }
 
 // One attached image or PDF, rendered in the transcript. The bucket is
-// private (see 20260814_add_message_attachments.sql) — there's no directly
+// private (see 20260823_add_message_attachments.sql) — there's no directly
 // usable URL on the row itself, so every render fetches its own short-lived
 // signed URL, same "the client only ever gets a scoped, temporary
 // credential" shape the rest of this app already applies to writes via RLS.
