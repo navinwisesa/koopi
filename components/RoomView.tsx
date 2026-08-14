@@ -99,6 +99,11 @@ export type Thread = {
   title: string | null;
   createdAt: string;
   updatedAt: string;
+  // Koopi's response style for THIS thread specifically — moved off
+  // rooms.personality (room-wide) so different threads in the same room
+  // can run different active styles independently. See
+  // 20260825_thread_scoped_personality.sql.
+  personality: Personality;
 };
 
 // Room-scoped (not thread-scoped) — one project per room, keyed by fileId
@@ -216,6 +221,10 @@ function rowToThread(row: Record<string, unknown>): Thread {
     title: (row.title as string | null) ?? null,
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
+    // postgres_changes streams the full row via replication regardless of
+    // any .select() elsewhere — undefined here (not an error) just means
+    // the migration adding this column hasn't landed yet.
+    personality: (row.personality as Personality | null | undefined) ?? "default",
   };
 }
 
@@ -332,7 +341,6 @@ export default function RoomView({
   initialParticipantKoopiActive,
   initialProject,
   initialProjectFiles,
-  initialPersonality,
   initialAttachments,
 }: {
   roomId: string;
@@ -349,7 +357,6 @@ export default function RoomView({
   initialParticipantKoopiActive: Record<string, Record<string, boolean>>;
   initialProject: Project | null;
   initialProjectFiles: ProjectFile[];
-  initialPersonality: Personality;
   initialAttachments: MessageAttachment[];
 }) {
   const supabase = useMemo(() => createClient(), []);
@@ -455,7 +462,6 @@ export default function RoomView({
   const [name, setName] = useState(initialName);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(initialName);
-  const [personality, setPersonality] = useState<Personality>(initialPersonality);
 
   const [now, setNow] = useState(() => Date.now());
 
@@ -471,6 +477,21 @@ export default function RoomView({
         : [],
     [messages, activeThreadId]
   );
+
+  const activeThread = useMemo(
+    () => (activeThreadId ? (threads.find((t) => t.id === activeThreadId) ?? null) : null),
+    [threads, activeThreadId]
+  );
+
+  // Optimistic local update on top of whatever PersonalitySelector's RPC
+  // call does server-side — same "flip it locally, RPC confirms/reverts"
+  // shape the selector's own onChanged already assumes (see its prop type),
+  // just applied to one entry in `threads` now instead of a single
+  // top-level state variable.
+  function handleThreadPersonalityChanged(next: Personality) {
+    if (!activeThreadId) return;
+    setThreads((prev) => prev.map((t) => (t.id === activeThreadId ? { ...t, personality: next } : t)));
+  }
 
   const streamingMessage = threadMessages.find((m) => m.status === "streaming");
   const isStreaming = Boolean(streamingMessage);
@@ -896,30 +917,12 @@ export default function RoomView({
     };
   }, [supabase, roomId]);
 
-  // --- realtime: room settings (personality) ------------------------------
-  useEffect(() => {
-    const channel = supabase
-      .channel(`room:${roomId}:settings`)
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "rooms",
-          filter: `id=eq.${roomId}`,
-        },
-        (payload) => {
-          const row = payload.new as Record<string, unknown> | null;
-          const next = row?.personality as Personality | undefined;
-          if (next) setPersonality(next);
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [supabase, roomId]);
+  // Personality used to be room-wide and live here as its own realtime
+  // subscription against `rooms`. Now thread-scoped (see the Thread type's
+  // own comment) — the existing "realtime: threads" subscription above
+  // already streams the full row on every UPDATE, personality included, so
+  // a second dedicated channel would just be redundant plumbing for a value
+  // that's already kept current as part of each thread's own row.
 
   // --- realtime: participants --------------------------------------------
   const refreshMembers = useCallback(async () => {
@@ -1420,12 +1423,6 @@ export default function RoomView({
             </div>
 
             <div className="ml-auto flex shrink-0 items-center gap-3">
-              <PersonalitySelector
-                roomId={roomId}
-                personality={personality}
-                onChanged={setPersonality}
-              />
-
               <button
                 type="button"
                 onClick={() => {
@@ -1542,6 +1539,24 @@ export default function RoomView({
         ) : (
           <div className="flex min-h-0 flex-1">
           <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+            {/* ---------- thread header: personality is scoped to the ACTIVE
+                thread, not the room (see the Thread type's own comment) —
+                lives here rather than the room-wide header above so its
+                placement itself makes that scope obvious, not just its
+                label text. ---------- */}
+            {activeThread && (
+              <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border px-6 py-2">
+                <span className="min-w-0 truncate text-sm font-medium text-foreground">
+                  {activeThread.title || "Untitled thread"}
+                </span>
+                <PersonalitySelector
+                  threadId={activeThread.id}
+                  personality={activeThread.personality}
+                  onChanged={handleThreadPersonalityChanged}
+                />
+              </div>
+            )}
+
             {/* ---------- transcript ---------- */}
             <div className="min-h-0 flex-1 overflow-y-auto">
               <div className="mx-auto max-w-3xl px-6 py-8">

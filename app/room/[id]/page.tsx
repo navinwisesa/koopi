@@ -45,7 +45,7 @@ export default async function RoomPage({
 
   const { data: room } = await supabase
     .from("rooms")
-    .select("id, name, created_by, personality")
+    .select("id, name, created_by")
     .eq("id", id)
     .maybeSingle();
 
@@ -122,9 +122,18 @@ export default async function RoomPage({
     );
   }
 
+  // select("*") deliberately, not an explicit column list — confirmed live
+  // against this project (a direct REST probe, not assumed) that naming a
+  // column PostgREST doesn't have yet HARD-FAILS THE WHOLE QUERY (42703),
+  // not just that one field: `select=id,personality` on a threads table
+  // without the column errors outright, while `select=*` succeeds and
+  // simply omits it. Naming `personality` explicitly here — before this
+  // migration is applied — would have taken down the entire thread list
+  // (threadRows -> null -> initialThreads -> [] -> no sidebar, no active
+  // thread, nothing), not just degraded the personality feature alone.
   const { data: threadRows } = await supabase
     .from("threads")
-    .select("id, created_by, title, created_at, updated_at")
+    .select("*")
     .eq("room_id", id)
     .order("updated_at", { ascending: false });
 
@@ -134,6 +143,9 @@ export default async function RoomPage({
     title: t.title,
     createdAt: t.created_at,
     updatedAt: t.updated_at,
+    // Undefined (not present in the row at all) until the migration above
+    // is applied — falls back to "default" the same as a genuine NULL.
+    personality: (t.personality as Personality | null | undefined) ?? "default",
   }));
 
   const threadIds = initialThreads.map((t) => t.id);
@@ -239,12 +251,19 @@ export default async function RoomPage({
   }));
 
   const messageIds = initialMessages.map((m) => m.id);
-  const { data: attachmentRows } = messageIds.length
+  const { data: attachmentRows, error: attachmentRowsError } = messageIds.length
     ? await supabase
         .from("message_attachments")
         .select("id, message_id, storage_path, filename, mime_type, kind")
         .in("message_id", messageIds)
-    : { data: [] };
+    : { data: [], error: null };
+  // Was silently discarded before — same "migration not applied yet" gap
+  // confirmed live this session via a direct probe against this project's
+  // Supabase REST API. Still degrades to an empty attachment list either
+  // way (nothing here depends on this succeeding), just not silently.
+  if (attachmentRowsError) {
+    console.warn("RoomPage: message_attachments query failed (migration not applied?):", attachmentRowsError);
+  }
 
   const initialAttachments: MessageAttachment[] = (attachmentRows ?? []).map((a) => ({
     id: a.id,
@@ -283,7 +302,6 @@ export default async function RoomPage({
       initialParticipantKoopiActive={initialParticipantKoopiActive}
       initialProject={initialProject}
       initialProjectFiles={initialProjectFiles}
-      initialPersonality={(room.personality as Personality | null) ?? "default"}
       initialAttachments={initialAttachments}
     />
   );

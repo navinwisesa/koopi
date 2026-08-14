@@ -19,14 +19,16 @@ const PERSONALITIES: {
   { key: "direct", label: "Direct", description: "Blunt and matter-of-fact, not diplomatic-by-default.", icon: Target },
 ];
 
-// Room-wide, not per-person — any participant can change it and everyone's
-// @Koopi replies pick it up on their next message via realtime.
+// Thread-wide (not room-wide, not per-person) — any participant in THIS
+// thread can change it, and everyone's @Koopi replies in this specific
+// thread pick it up on their next message via realtime. A sibling thread
+// in the same room keeps whatever it's independently set to.
 export default function PersonalitySelector({
-  roomId,
+  threadId,
   personality,
   onChanged,
 }: {
-  roomId: string;
+  threadId: string;
   personality: Personality;
   onChanged: (next: Personality) => void;
 }) {
@@ -60,8 +62,8 @@ export default function PersonalitySelector({
     onChanged(next);
     setSaving(true);
 
-    const { error } = await createClient().rpc("update_room_personality", {
-      p_room_id: roomId,
+    const { error } = await createClient().rpc("update_thread_personality", {
+      p_thread_id: threadId,
       p_personality: next,
     });
 
@@ -79,7 +81,7 @@ export default function PersonalitySelector({
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="menu"
         aria-expanded={open}
-        title="Koopi's response style for this room"
+        title="Koopi's response style for this thread"
         disabled={saving}
         className="flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-muted transition-colors hover:text-foreground disabled:opacity-60"
       >
@@ -95,7 +97,7 @@ export default function PersonalitySelector({
         >
           <div className="border-b border-border px-3 py-2">
             <p className="font-sans text-[11px] font-semibold uppercase tracking-wider text-muted">
-              Koopi&apos;s style in this room
+              Koopi&apos;s style in this thread
             </p>
           </div>
           <ul>

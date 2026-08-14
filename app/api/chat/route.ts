@@ -51,6 +51,32 @@ const MAX_HISTORY = 40;
 const FLUSH_MS = 120;
 const MAX_TOOL_ROUNDS = 4;
 
+// How long to wait with NO data at all from the model before giving up and
+// failing fast. Confirmed live (this session, a real failed request) that
+// neither SDK client's own `timeout` option reliably bounds this: that
+// request's stream connection opened fine (real response headers came
+// back), then sat idle for 138 SECONDS before OpenRouter's own upstream
+// proxy finally gave up and returned a 504 embedded in the stream itself —
+// a client `timeout` option governs connection setup, not an already-open
+// stream going quiet, so nothing on our side was cutting this off early.
+// The ticker in runModelTurn already polls every FLUSH_MS for the Stop
+// button; it tracks time-since-last-chunk the same way and aborts once
+// this elapses, well before a person would give up waiting and assume
+// they were ignored.
+const IDLE_TIMEOUT_MS = 45_000;
+
+// Thrown (client-side, deliberately, in runModelTurn — never something a
+// provider's SDK raises on its own) when IDLE_TIMEOUT_MS elapses with
+// nothing received. A distinct class so postFailureNotice can tell "took
+// too long" apart from a generic failure and say so plainly, instead of
+// both landing on the same unhelpful "I hit an error" text.
+class UpstreamIdleTimeoutError extends Error {
+  constructor() {
+    super("No response from the model for too long.");
+    this.name = "UpstreamIdleTimeoutError";
+  }
+}
+
 // ProjectPanel.tsx's placeholder for representing an otherwise-empty folder
 // as a real project_files row (see its own FOLDER_MARKER comment) — never a
 // real file, filtered out of every existingPaths list below so it doesn't
@@ -603,12 +629,24 @@ export async function POST(request: Request) {
   const groqKey = process.env.GROQ_API_KEY;
   const openrouterKey = process.env.OPENROUTER_API_KEY;
 
-  // maxRetries: 0 — the SDK's default retry-with-backoff would silently eat
-  // 30+ seconds retrying a rate-limited call before our own fallback chain
-  // ever gets a chance to run. A 429 should surface immediately.
-  const groq = groqKey ? new Groq({ apiKey: groqKey, maxRetries: 0 }) : null;
+  // maxRetries: 0 on BOTH clients — the SDK's default retry-with-backoff
+  // would silently eat 30+ seconds retrying a rate-limited call before our
+  // own fallback chain ever gets a chance to run (a 429 should surface
+  // immediately), and would just as silently multiply the `timeout` below
+  // by up to (1 + default retries) if left on the OpenRouter client, which
+  // used to have no explicit retry setting at all. timeout is a client-level
+  // default here mainly for documentation/intent — see IDLE_TIMEOUT_MS's own
+  // comment for why runModelTurn's ticker is what actually enforces this in
+  // practice (an already-open stream going idle isn't reliably caught by
+  // this option alone, confirmed live this session).
+  const groq = groqKey ? new Groq({ apiKey: groqKey, maxRetries: 0, timeout: IDLE_TIMEOUT_MS }) : null;
   const openrouter = openrouterKey
-    ? new OpenAI({ apiKey: openrouterKey, baseURL: "https://openrouter.ai/api/v1" })
+    ? new OpenAI({
+        apiKey: openrouterKey,
+        baseURL: "https://openrouter.ai/api/v1",
+        maxRetries: 0,
+        timeout: IDLE_TIMEOUT_MS,
+      })
     : null;
 
   const { threadId, triggerMessageId, modelOverride, openFilePath } = (await request.json()) as {
@@ -734,10 +772,21 @@ export async function POST(request: Request) {
   // whole thread's history: an image attached three messages ago isn't
   // re-sent to the model on every later reply, same "anchor to the
   // trigger" scoping the rest of this function already applies to text.
-  const { data: attachmentRows } = await supabase
+  const { data: attachmentRows, error: attachmentQueryError } = await supabase
     .from("message_attachments")
     .select("storage_path, filename, mime_type, kind")
     .eq("message_id", triggerMessageId);
+  // Was silently discarded before — confirmed live this session that this
+  // is exactly how "the attachment table/bucket migration isn't applied
+  // yet" surfaced: zero errors anywhere, just an image that silently never
+  // reached the model. Still degrades the same way (an empty attachment
+  // list, handled below), just not silently anymore.
+  if (attachmentQueryError) {
+    console.warn(
+      `/api/chat: message_attachments query failed for trigger ${triggerMessageId} (migration not applied?):`,
+      attachmentQueryError
+    );
+  }
 
   const visionImageParts: OpenAI.Chat.ChatCompletionContentPartImage[] = [];
   let attachmentTextBlock = "";
@@ -912,18 +961,30 @@ export async function POST(request: Request) {
 
   // Style only — kept independent of getRoomMemory's more involved query so a
   // personality change is never gated on the memory-regeneration logic above.
-  async function getRoomPersonality(): Promise<Personality> {
-    const { data: room } = await supabase
-      .from("rooms")
-      .select("personality")
-      .eq("id", roomId)
+  // Thread-scoped, not room-scoped (see threads.personality's own migration,
+  // 20260825_thread_scoped_personality.sql) — different threads in the same
+  // room can run different active styles independently now.
+  //
+  // select("*") deliberately, not select("personality") — confirmed live
+  // against this project that naming a column PostgREST doesn't have yet
+  // hard-fails the WHOLE query (42703), not just this one field. Since this
+  // function sits on the path every single reply goes through, that failure
+  // mode would have silently broken every Koopi response in every room
+  // (not just personality) the moment this shipped ahead of the migration
+  // being applied — select("*") + an optional-chained field read degrades
+  // to "default" instead, exactly like this always intended to.
+  async function getThreadPersonality(): Promise<Personality> {
+    const { data: thread } = await supabase
+      .from("threads")
+      .select("*")
+      .eq("id", threadId)
       .maybeSingle();
-    return (room?.personality as Personality | null) ?? "default";
+    return (thread?.personality as Personality | null | undefined) ?? "default";
   }
 
   const [roomMemory, personality] = await Promise.all([
     getRoomMemory(),
-    getRoomPersonality(),
+    getThreadPersonality(),
   ]);
 
   const effectiveSystemPrompt =
@@ -940,7 +1001,9 @@ export async function POST(request: Request) {
   async function postFailureNotice(err: unknown) {
     const reason = isRateLimited(err)
       ? "we've hit today's usage limit for the model — try again a bit later."
-      : "I hit an error trying to respond — try asking again.";
+      : err instanceof UpstreamIdleTimeoutError
+        ? "the model took too long to respond — try asking again."
+        : "I hit an error trying to respond — try asking again.";
     console.error(`/api/chat: model call failed for trigger ${triggerMessageId}:`, err);
     await supabase.from("messages").insert({
       room_id: roomId,
@@ -1216,6 +1279,11 @@ export async function POST(request: Request) {
     let text = "";
     let flushed = "";
     let interrupted = false;
+    // Distinct from `interrupted` (a Stop-button abort, no failure notice)
+    // — this IS a failure, just one we caused ourselves by giving up early
+    // rather than one the provider reported. See IDLE_TIMEOUT_MS.
+    let timedOut = false;
+    let lastChunkAt = Date.now();
     let finishReason: string | null = null;
     let streamError: unknown = null;
     const toolCallAcc = new Map<number, PendingToolCall>();
@@ -1333,6 +1401,11 @@ export async function POST(request: Request) {
     }
 
     const ticker = setInterval(async () => {
+      if (Date.now() - lastChunkAt > IDLE_TIMEOUT_MS) {
+        timedOut = true;
+        stream.controller.abort();
+        return;
+      }
       try {
         if (!(await flush("streaming"))) {
           interrupted = true;
@@ -1345,6 +1418,12 @@ export async function POST(request: Request) {
 
     try {
       for await (const chunk of stream) {
+        // ANY chunk proves the connection is still alive, whether or not it
+        // carries actual content this time (a keepalive ping, a delta with
+        // no text, etc.) — this is what's actually missing from the SDK's
+        // own timeout: it covers connection setup, not an already-open
+        // stream that's gone quiet mid-response.
+        lastChunkAt = Date.now();
         const choice = chunk.choices[0];
         if (!choice) continue;
 
@@ -1384,11 +1463,14 @@ export async function POST(request: Request) {
         }
       }
     } catch (err) {
-      // Aborting the stream throws — that's the expected shape of a Stop-button
-      // interrupt (`interrupted` is already true by the time it happens). Any
-      // other error here is a genuine failure (network blip, provider outage)
-      // that must not be treated the same way.
-      if (!interrupted) streamError = err;
+      // Aborting the stream throws — that's the expected shape of both a
+      // Stop-button interrupt (`interrupted` already true) and our own idle
+      // abort (`timedOut` already true) by the time it happens. Substitute
+      // a clean, recognizable error for the latter rather than whatever
+      // generic AbortError the abort() call itself throws, so
+      // postFailureNotice can name it specifically instead of falling into
+      // the same bucket as a genuine unclassified failure.
+      if (!interrupted) streamError = timedOut ? new UpstreamIdleTimeoutError() : err;
     } finally {
       clearInterval(ticker);
     }
@@ -1583,7 +1665,7 @@ export async function POST(request: Request) {
     // Persist the (possibly new) sandbox ID so the next run_code call
     // anywhere in this room reconnects to it instead of starting over.
     // Goes through the same SECURITY DEFINER RPC pattern as
-    // update_room_personality/update_room_memory — rooms' UPDATE RLS policy
+    // update_thread_personality/update_room_memory — rooms' UPDATE RLS policy
     // is creator-only, so a plain table update would silently fail (or throw)
     // for any non-owner participant. Best-effort — losing this just means
     // the next call falls back to a fresh sandbox.
