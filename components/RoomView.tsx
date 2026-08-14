@@ -46,6 +46,7 @@ import RoomSidebar from "@/components/RoomSidebar";
 import { presenceOf, PRESENCE_DOT } from "@/lib/presence";
 import { createClient } from "@/lib/supabase/client";
 import { useResizableWidth } from "@/lib/useResizableWidth";
+import { requestChangeSummary } from "@/lib/requestChangeSummary";
 
 export type ChatMessage = {
   id: string;
@@ -482,13 +483,21 @@ export default function RoomView({
   const canEditProjectDirectly = currentUserRole === "owner" || currentUserRole === "admin";
 
   async function proposeProjectFileChange(file: ProjectFile, proposedContent: string) {
-    const { error } = await supabase.from("project_file_changes").insert({
-      project_file_id: file.id,
-      proposed_by: currentUserId,
-      proposed_content: proposedContent,
-      source: "manual",
-    });
-    if (error) console.error("RoomView: failed to propose project_files change", error);
+    const { data, error } = await supabase
+      .from("project_file_changes")
+      .insert({
+        project_file_id: file.id,
+        proposed_by: currentUserId,
+        proposed_content: proposedContent,
+        source: "manual",
+      })
+      .select("id")
+      .single();
+    if (error) {
+      console.error("RoomView: failed to propose project_files change", error);
+      return;
+    }
+    void requestChangeSummary(data.id);
   }
 
   const sortedProjectFiles = useMemo(

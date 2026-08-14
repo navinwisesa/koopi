@@ -169,6 +169,95 @@ export default function ProjectPanel({
   onActiveFileChange?: (file: ProjectFile | null) => void;
 }) {
   const sortedFiles = useMemo(() => [...files].sort((a, b) => a.path.localeCompare(b.path)), [files]);
+
+  // Phase 3: role-aware live change notifications. canReviewChanges gates
+  // not just the badge/toast UI but whether this effect below even fetches
+  // or subscribes at all — a Member's client never asks for the pending
+  // queue in the first place, on top of (not instead of) the RLS policy
+  // that would only ever hand them their own rows anyway. Kept independent
+  // of ProjectChanges' own realtime subscription (same table, unfiltered,
+  // same "check membership client-side after the fact" shape) rather than
+  // lifting that component's state up, so it stays visible from the Editor
+  // tab where ProjectChanges isn't even mounted — that's the actual gap
+  // this phase closes: the Pending panel already updated live, just only
+  // for someone already looking at it.
+  const canReviewChanges = currentUserRole === "owner" || currentUserRole === "admin";
+  const fileIds = useMemo(() => files.map((f) => f.id), [files]);
+  const fileById = useMemo(() => new Map(files.map((f) => [f.id, f])), [files]);
+  const [pendingChangeIds, setPendingChangeIds] = useState<Set<string>>(new Set());
+  const [changeToast, setChangeToast] = useState<string | null>(null);
+  const changeToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (!canReviewChanges || fileIds.length === 0) {
+      setPendingChangeIds(new Set());
+      return;
+    }
+    const supabase = createClient();
+    let cancelled = false;
+
+    void supabase
+      .from("project_file_changes")
+      .select("id, project_file_id, status")
+      .in("project_file_id", fileIds)
+      .eq("status", "pending")
+      .then(({ data }) => {
+        if (!cancelled && data) setPendingChangeIds(new Set(data.map((r) => r.id as string)));
+      });
+
+    const channel = supabase
+      .channel(`project-pending-badge:${projectId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "project_file_changes" },
+        (payload) => {
+          const row = (payload.new ?? payload.old) as Record<string, unknown> | null;
+          const id = row?.id as string | undefined;
+          const fileId = row?.project_file_id as string | undefined;
+          if (!id || !fileId || !fileIds.includes(fileId)) return;
+          const status = row?.status as string | undefined;
+
+          if (payload.eventType === "DELETE" || status !== "pending") {
+            setPendingChangeIds((prev) => {
+              if (!prev.has(id)) return prev;
+              const next = new Set(prev);
+              next.delete(id);
+              return next;
+            });
+            return;
+          }
+
+          setPendingChangeIds((prev) => {
+            if (prev.has(id)) return prev;
+            return new Set(prev).add(id);
+          });
+
+          // Only a genuinely NEW pending proposal toasts, not every update
+          // to the row (a summary landing a moment later shouldn't re-toast
+          // the same change) — INSERT is the one event type that always
+          // means "this proposal didn't exist a moment ago".
+          if (payload.eventType === "INSERT") {
+            const proposedBy = row?.proposed_by as string | null;
+            const who = proposedBy ? (memberById.get(proposedBy)?.username ?? "Someone") : "Koopi";
+            const path = fileById.get(fileId)?.path ?? "a file";
+            setChangeToast(`${who} proposed a change to ${path}`);
+            if (changeToastTimerRef.current) clearTimeout(changeToastTimerRef.current);
+            changeToastTimerRef.current = setTimeout(() => setChangeToast(null), 6000);
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      supabase.removeChannel(channel);
+    };
+    // memberById/fileById are stable-ish maps derived from props each
+    // render — deliberately excluded so this doesn't resubscribe on every
+    // parent re-render, only when the actual project/file-id-set changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canReviewChanges, projectId, fileIds]);
+
   const [selectedId, setSelectedId] = useState<string | null>(sortedFiles[0]?.id ?? null);
   useEffect(() => {
     if (selectedId && sortedFiles.some((f) => f.id === selectedId)) return;
@@ -525,6 +614,11 @@ export default function ProjectPanel({
           >
             <GitPullRequest className="h-3 w-3" strokeWidth={1.75} />
             Changes
+            {canReviewChanges && pendingChangeIds.size > 0 && (
+              <span className="flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-amber-500 px-1 text-[9px] font-bold leading-none text-white">
+                {pendingChangeIds.size}
+              </span>
+            )}
           </button>
         </div>
 
@@ -551,6 +645,24 @@ export default function ProjectPanel({
           </button>
         )}
       </div>
+
+      {/* Only ever set when canReviewChanges is true (see the subscription
+          effect above) — a Member never sees this, for their own change or
+          anyone else's, on top of never even fetching the data behind it. */}
+      {changeToast && (
+        <button
+          type="button"
+          onClick={() => {
+            setRightTab("changes");
+            setChangeToast(null);
+          }}
+          title="Open the Changes tab"
+          className="flex shrink-0 items-center gap-1.5 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-left text-xs font-medium text-amber-600 transition-colors hover:bg-amber-500/15"
+        >
+          <GitPullRequest className="h-3.5 w-3.5 shrink-0" strokeWidth={1.75} />
+          <span className="truncate">{changeToast}</span>
+        </button>
+      )}
 
       <div className="flex min-h-0 flex-1">
         <div className="flex w-36 shrink-0 flex-col border-r border-border">

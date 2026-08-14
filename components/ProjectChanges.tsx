@@ -15,6 +15,12 @@ type ChangeRow = {
   reviewedBy: string | null;
   reviewedAt: string | null;
   createdAt: string;
+  // Plain-language "what and why" (Phase 3) — generated asynchronously by
+  // /api/projects/summarize-change right after the row is created, so this
+  // is null for a brief window on every new proposal until that call lands
+  // its own UPDATE (picked up by this component's existing realtime
+  // subscription below, same as any other change to the row).
+  summary: string | null;
 };
 
 function rowToChange(row: Record<string, unknown>): ChangeRow {
@@ -28,6 +34,7 @@ function rowToChange(row: Record<string, unknown>): ChangeRow {
     reviewedBy: (row.reviewed_by as string | null) ?? null,
     reviewedAt: (row.reviewed_at as string | null) ?? null,
     createdAt: row.created_at as string,
+    summary: (row.summary as string | null) ?? null,
   };
 }
 
@@ -142,6 +149,9 @@ export default function ProjectChanges({
         <p className="mt-1 flex items-center gap-1 text-[11px] text-muted">
           <User className="h-3 w-3" strokeWidth={1.75} />
           {who(change.proposedBy)} · {change.source === "ai_assistant" ? "AI suggestion" : "manual edit"}
+        </p>
+        <p className="mt-1.5 text-[11px] leading-relaxed text-foreground">
+          {change.summary ?? <span className="italic text-muted">Summary pending…</span>}
         </p>
         <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-background p-2 font-mono text-[10px] text-foreground">
           {change.proposedContent}

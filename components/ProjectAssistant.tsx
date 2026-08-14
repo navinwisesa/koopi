@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Bot, Send, Check, Loader2 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import type { ProjectFile } from "@/components/RoomView";
+import { requestChangeSummary } from "@/lib/requestChangeSummary";
 
 type Proposal = { path: string; language: string; code: string };
 type Message = { role: "user" | "assistant"; content: string; proposal?: Proposal | null };
@@ -76,16 +77,21 @@ export default function ProjectAssistant({
     const targetFile = files.find((f) => f.path === proposal.path) ?? activeFile;
     if (!targetFile) return;
     const supabase = createClient();
-    const { error } = await supabase.from("project_file_changes").insert({
-      project_file_id: targetFile.id,
-      proposed_by: currentUserId,
-      proposed_content: proposal.code,
-      source: "ai_assistant",
-    });
+    const { data, error } = await supabase
+      .from("project_file_changes")
+      .insert({
+        project_file_id: targetFile.id,
+        proposed_by: currentUserId,
+        proposed_content: proposal.code,
+        source: "ai_assistant",
+      })
+      .select("id")
+      .single();
     if (error) {
       console.error("ProjectAssistant: failed to propose change", error);
       return;
     }
+    requestChangeSummary(data.id);
     setAcceptedFor((prev) => new Set(prev).add(index));
   }
 
