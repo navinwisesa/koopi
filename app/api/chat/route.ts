@@ -51,6 +51,15 @@ const MAX_HISTORY = 40;
 const FLUSH_MS = 120;
 const MAX_TOOL_ROUNDS = 4;
 
+// ProjectPanel.tsx's placeholder for representing an otherwise-empty folder
+// as a real project_files row (see its own FOLDER_MARKER comment) — never a
+// real file, filtered out of every existingPaths list below so it doesn't
+// show up as noise in front of the classifier deciding where new code goes.
+const FOLDER_MARKER = ".gitkeep";
+function isFolderMarker(path: string): boolean {
+  return path === FOLDER_MARKER || path.endsWith(`/${FOLDER_MARKER}`);
+}
+
 const SYSTEM_PROMPT = `You are Koopi, a coding agent in a shared multiplayer session.
 
 Several teammates may be in the room at once. Each human turn is prefixed with the
@@ -1484,7 +1493,7 @@ export async function POST(request: Request) {
       .from("project_files")
       .select("path, content")
       .eq("project_id", projectId);
-    const existingPaths = (fileRows ?? []).map((f) => f.path);
+    const existingPaths = (fileRows ?? []).map((f) => f.path).filter((p) => !isFolderMarker(p));
     const candidate = explicitOpenCandidate(fileRows ?? []) ?? (await resolveContinuationHint(projectId));
 
     const { path } = await chooseFileTarget(triggerText, language, candidate, existingPaths);
@@ -1724,7 +1733,7 @@ export async function POST(request: Request) {
                   .from("project_files")
                   .select("path, content")
                   .eq("project_id", projectId);
-                const existingPaths = (fileRows ?? []).map((f) => f.path);
+                const existingPaths = (fileRows ?? []).map((f) => f.path).filter((p) => !isFolderMarker(p));
                 const candidate =
                   explicitOpenCandidate(fileRows ?? []) ?? (await resolveContinuationHint(projectId));
                 const target = await chooseFileTarget(triggerText, block.language, candidate, existingPaths);

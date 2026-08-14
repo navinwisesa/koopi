@@ -10,6 +10,7 @@ import {
   Save,
   AlertTriangle,
   FilePlus,
+  FolderPlus,
   Trash2,
   Pencil,
   FileCode,
@@ -85,6 +86,20 @@ function languageFromPath(path: string): string {
 // path had. No new table or column for this: the tree below is derived
 // entirely from splitting `path` on "/", same source of truth the flat
 // list already used, just organized differently.
+//
+// There's no standalone "folder" row anywhere in this schema — a folder is
+// purely an implication of some file's path containing a "/". That's fine
+// for a folder created by dropping/naming a file into it, but "New folder"
+// (an explicitly EMPTY folder, nothing in it yet) has nothing to anchor
+// its existence to without one. FOLDER_MARKER is that anchor: an empty,
+// hidden placeholder file real UNIX tooling has used for the same reason
+// for decades — created alongside a new folder, filtered out of every
+// visible row (see renderFolder below) but still a real project_files row,
+// so the folder keeps existing (and keeps showing up as a real path for
+// chooseFileTarget to nest new files into server-side) even with nothing
+// "real" in it yet.
+const FOLDER_MARKER = ".gitkeep";
+
 type FileTreeFolder = {
   name: string;
   path: string; // full path from the project root, e.g. "src/utils" — "" for the root
@@ -169,6 +184,17 @@ export default function ProjectPanel({
   onActiveFileChange?: (file: ProjectFile | null) => void;
 }) {
   const sortedFiles = useMemo(() => [...files].sort((a, b) => a.path.localeCompare(b.path)), [files]);
+  // Everywhere that isn't the tree itself (selection, the editor, what
+  // ProjectChanges/ProjectAssistant see) should never know FOLDER_MARKER
+  // rows exist at all — they're an implementation detail of how an empty
+  // folder stays represented (see FOLDER_MARKER's own comment), not
+  // something a person could meaningfully open, propose a change to, or
+  // have Koopi reason about. Only buildFileTree(sortedFiles) (unfiltered)
+  // needs to see them, to keep detecting the folder they anchor.
+  const visibleFiles = useMemo(
+    () => sortedFiles.filter((f) => !f.path.endsWith(`/${FOLDER_MARKER}`) && f.path !== FOLDER_MARKER),
+    [sortedFiles]
+  );
 
   // Phase 3: role-aware live change notifications. canReviewChanges gates
   // not just the badge/toast UI but whether this effect below even fetches
@@ -258,13 +284,13 @@ export default function ProjectPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canReviewChanges, projectId, fileIds]);
 
-  const [selectedId, setSelectedId] = useState<string | null>(sortedFiles[0]?.id ?? null);
+  const [selectedId, setSelectedId] = useState<string | null>(visibleFiles[0]?.id ?? null);
   useEffect(() => {
-    if (selectedId && sortedFiles.some((f) => f.id === selectedId)) return;
-    setSelectedId(sortedFiles[0]?.id ?? null);
-  }, [sortedFiles, selectedId]);
+    if (selectedId && visibleFiles.some((f) => f.id === selectedId)) return;
+    setSelectedId(visibleFiles[0]?.id ?? null);
+  }, [visibleFiles, selectedId]);
 
-  const selectedFile = sortedFiles.find((f) => f.id === selectedId) ?? null;
+  const selectedFile = visibleFiles.find((f) => f.id === selectedId) ?? null;
 
   useEffect(() => {
     onActiveFileChange?.(selectedFile);
@@ -289,6 +315,11 @@ export default function ProjectPanel({
   const [conflict, setConflict] = useState(false);
   const [newFileOpen, setNewFileOpen] = useState(false);
   const [newFilePath, setNewFilePath] = useState("");
+  // Same single-active-input shape as newFileOpen/newFilePath, kept as its
+  // own pair rather than a shared "mode" flag so opening one always closes
+  // the other without extra bookkeeping (see the two toggle buttons below).
+  const [newFolderOpen, setNewFolderOpen] = useState(false);
+  const [newFolderPath, setNewFolderPath] = useState("");
   // Inline rename — only one file can be mid-rename at a time, same
   // single-active-editor-state pattern as newFileOpen/newFilePath above.
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -457,6 +488,33 @@ export default function ProjectPanel({
     setNewFilePath("");
     setNewFileOpen(false);
     if (data?.id) setSelectedId(data.id);
+  }
+
+  // Creates an EMPTY folder by inserting FOLDER_MARKER at its path — see
+  // that constant's own comment for why. Never selects the marker row
+  // (unlike createFile, which selects the file it just made) — there's
+  // nothing meaningful to open, it's not a real file the person asked for.
+  async function createFolder() {
+    const raw = newFolderPath.trim();
+    // A trailing slash reads as "make the folder itself", which is exactly
+    // what's happening — strip it so path + "/" + marker below doesn't
+    // double up.
+    const path = raw.endsWith("/") ? raw.slice(0, -1) : raw;
+    if (!path) return;
+    const supabase = createClient();
+    const { error } = await supabase.from("project_files").insert({
+      project_id: projectId,
+      path: `${path}/${FOLDER_MARKER}`,
+      content: "",
+      language: "python",
+      last_edited_by: currentUserId,
+    });
+    if (error) {
+      console.error("ProjectPanel: failed to create folder", error);
+      return;
+    }
+    setNewFolderPath("");
+    setNewFolderOpen(false);
   }
 
   async function deleteFile(file: ProjectFile) {
@@ -668,14 +726,30 @@ export default function ProjectPanel({
         <div className="flex w-36 shrink-0 flex-col border-r border-border">
           <div className="flex items-center justify-between px-2 py-1.5">
             <span className="text-[10px] font-semibold uppercase tracking-wider text-muted">Files</span>
-            <button
-              type="button"
-              onClick={() => setNewFileOpen((v) => !v)}
-              title="New file"
-              className="rounded p-0.5 text-muted transition-colors hover:text-foreground"
-            >
-              <FilePlus className="h-3.5 w-3.5" strokeWidth={1.75} />
-            </button>
+            <div className="flex items-center gap-0.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setNewFolderOpen(false);
+                  setNewFileOpen((v) => !v);
+                }}
+                title="New file"
+                className="rounded p-0.5 text-muted transition-colors hover:text-foreground"
+              >
+                <FilePlus className="h-3.5 w-3.5" strokeWidth={1.75} />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setNewFileOpen(false);
+                  setNewFolderOpen((v) => !v);
+                }}
+                title="New folder"
+                className="rounded p-0.5 text-muted transition-colors hover:text-foreground"
+              >
+                <FolderPlus className="h-3.5 w-3.5" strokeWidth={1.75} />
+              </button>
+            </div>
           </div>
           {newFileOpen && (
             <form
@@ -690,6 +764,23 @@ export default function ProjectPanel({
                 value={newFilePath}
                 onChange={(e) => setNewFilePath(e.target.value)}
                 placeholder="path/to/file.py"
+                className="w-full rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground placeholder:text-muted focus:border-accent focus:outline-none"
+              />
+            </form>
+          )}
+          {newFolderOpen && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                void createFolder();
+              }}
+              className="px-2 pb-1.5"
+            >
+              <input
+                autoFocus
+                value={newFolderPath}
+                onChange={(e) => setNewFolderPath(e.target.value)}
+                placeholder="path/to/folder"
                 className="w-full rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground placeholder:text-muted focus:border-accent focus:outline-none"
               />
             </form>
@@ -826,13 +917,19 @@ export default function ProjectPanel({
                   );
                   if (!collapsed) rows.push(...renderFolder(folder, depth + 1));
                 }
-                for (const file of node.files) rows.push(renderFileRow(file, depth));
+                for (const file of node.files) {
+                  // The marker exists purely to anchor an otherwise-empty
+                  // folder's existence (see FOLDER_MARKER above) — never a
+                  // real row someone would open, rename, or delete.
+                  if (file.path.endsWith(`/${FOLDER_MARKER}`) || file.path === FOLDER_MARKER) continue;
+                  rows.push(renderFileRow(file, depth));
+                }
                 return rows;
               }
 
               return renderFolder(buildFileTree(sortedFiles), 0);
             })()}
-            {sortedFiles.length === 0 && !newFileOpen && (
+            {visibleFiles.length === 0 && !newFileOpen && !newFolderOpen && (
               <div className="px-2 py-3 text-center">
                 <p className="mb-2 text-[11px] text-muted">
                   No files yet — create one, or drag files from your computer here.
@@ -854,7 +951,7 @@ export default function ProjectPanel({
           {rightTab === "changes" ? (
             <ProjectChanges
               projectId={projectId}
-              files={sortedFiles}
+              files={visibleFiles}
               memberById={memberById}
               currentUserRole={currentUserRole}
             />
@@ -983,7 +1080,7 @@ export default function ProjectPanel({
               </div>
               <ProjectAssistant
                 projectId={projectId}
-                files={sortedFiles}
+                files={visibleFiles}
                 activeFile={selectedFile}
                 currentUserId={currentUserId}
               />
