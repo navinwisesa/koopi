@@ -320,6 +320,15 @@ export default function ProjectPanel({
   // the other without extra bookkeeping (see the two toggle buttons below).
   const [newFolderOpen, setNewFolderOpen] = useState(false);
   const [newFolderPath, setNewFolderPath] = useState("");
+  // WHERE the open input renders in the tree — set once when opened (see
+  // openNewFile/openNewFolder), separate from newFilePath/newFolderPath's
+  // actual text, which the person can go on to edit freely (including
+  // retyping the folder part entirely). "" positions it at the very top of
+  // the panel, above the tree (root has no folder row of its own to render
+  // under); any other value renders it as a child row directly under that
+  // folder, so it appears where the new item is actually about to go
+  // instead of always at the top regardless of which folder was targeted.
+  const [newItemTargetFolder, setNewItemTargetFolder] = useState("");
   // Inline rename — only one file can be mid-rename at a time, same
   // single-active-editor-state pattern as newFileOpen/newFilePath above.
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -553,16 +562,29 @@ export default function ProjectPanel({
   // for blank space/a file row). The prefix is just the input's starting
   // value, not locked in any way — still a plain editable text field, same
   // as before this existed.
+  // A collapsed folder's children (including the eventual new-item form
+  // rendered as one of them, see renderFolder) never get rendered at all —
+  // opening the form for a folder the person can't currently see into
+  // would silently do nothing visible, so make sure it's expanded first.
+  function expandFolder(folderPath: string) {
+    if (!folderPath) return;
+    setCollapsedFolders((prev) => (prev.has(folderPath) ? new Set([...prev].filter((p) => p !== folderPath)) : prev));
+  }
+
   function openNewFile(folderPath: string) {
     setContextMenu(null);
     setNewFolderOpen(false);
     setNewFilePath(folderPath ? `${folderPath}/` : "");
+    setNewItemTargetFolder(folderPath);
+    expandFolder(folderPath);
     setNewFileOpen(true);
   }
   function openNewFolder(folderPath: string) {
     setContextMenu(null);
     setNewFileOpen(false);
     setNewFolderPath(folderPath ? `${folderPath}/` : "");
+    setNewItemTargetFolder(folderPath);
+    expandFolder(folderPath);
     setNewFolderOpen(true);
   }
 
@@ -817,40 +839,6 @@ export default function ProjectPanel({
               </button>
             </div>
           </div>
-          {newFileOpen && (
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                void createFile();
-              }}
-              className="px-2 pb-1.5"
-            >
-              <input
-                autoFocus
-                value={newFilePath}
-                onChange={(e) => setNewFilePath(e.target.value)}
-                placeholder="path/to/file.py"
-                className="w-full rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground placeholder:text-muted focus:border-accent focus:outline-none"
-              />
-            </form>
-          )}
-          {newFolderOpen && (
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                void createFolder();
-              }}
-              className="px-2 pb-1.5"
-            >
-              <input
-                autoFocus
-                value={newFolderPath}
-                onChange={(e) => setNewFolderPath(e.target.value)}
-                placeholder="path/to/folder"
-                className="w-full rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground placeholder:text-muted focus:border-accent focus:outline-none"
-              />
-            </form>
-          )}
           <div
             className={`min-h-0 flex-1 overflow-y-auto ${dragOverPath === "" ? "bg-accent/5" : ""}`}
             onDragOver={(e) => {
@@ -882,6 +870,59 @@ export default function ProjectPanel({
               // produces has no such issue: React still reconciles by the
               // keys on those elements, same as the flat .map() this
               // replaced.
+              //
+              // The open new-file/new-folder input renders wherever
+              // newItemTargetFolder says it should (see that state's own
+              // comment) rather than always at the top of the panel — this
+              // is what actually place it there, called from inside
+              // renderFolder below once per node, keyed to that node's own
+              // path.
+              function renderNewItemForm(depth: number) {
+                if (newFileOpen) {
+                  return (
+                    <form
+                      key="new-item-form"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        void createFile();
+                      }}
+                      className="px-2 pb-1.5"
+                      style={{ paddingLeft: 8 + depth * 14 }}
+                    >
+                      <input
+                        autoFocus
+                        value={newFilePath}
+                        onChange={(e) => setNewFilePath(e.target.value)}
+                        placeholder="path/to/file.py"
+                        className="w-full rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground placeholder:text-muted focus:border-accent focus:outline-none"
+                      />
+                    </form>
+                  );
+                }
+                if (newFolderOpen) {
+                  return (
+                    <form
+                      key="new-item-form"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        void createFolder();
+                      }}
+                      className="px-2 pb-1.5"
+                      style={{ paddingLeft: 8 + depth * 14 }}
+                    >
+                      <input
+                        autoFocus
+                        value={newFolderPath}
+                        onChange={(e) => setNewFolderPath(e.target.value)}
+                        placeholder="path/to/folder"
+                        className="w-full rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground placeholder:text-muted focus:border-accent focus:outline-none"
+                      />
+                    </form>
+                  );
+                }
+                return null;
+              }
+
               function renderFileRow(f: ProjectFile, depth: number) {
                 if (renamingId === f.id) {
                   return (
@@ -1019,6 +1060,10 @@ export default function ProjectPanel({
                   // real row someone would open, rename, or delete.
                   if (file.path.endsWith(`/${FOLDER_MARKER}`) || file.path === FOLDER_MARKER) continue;
                   rows.push(renderFileRow(file, depth));
+                }
+                if (newItemTargetFolder === node.path) {
+                  const form = renderNewItemForm(depth);
+                  if (form) rows.push(form);
                 }
                 return rows;
               }
