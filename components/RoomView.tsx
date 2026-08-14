@@ -30,6 +30,10 @@ import {
   MonitorPlay,
   ExternalLink,
   Users,
+  Paperclip,
+  FileText,
+  Image as ImageIcon,
+  X,
 } from "lucide-react";
 import Avatar from "@/components/Avatar";
 import ProjectPanel from "@/components/ProjectPanel";
@@ -53,13 +57,28 @@ export type ChatMessage = {
   type: "text" | "tool_call" | "tool_result";
   interruptedBy: string | null;
   createdAt: string;
-  modelTier: "chat" | "build" | "code" | null;
+  modelTier: "chat" | "build" | "code" | "vision" | null;
   modelProvider: string | null;
   // Set by /api/chat's post-reply classification pass — never inferred client-side,
   // since "was room memory available" is true on nearly every message once a room has
   // any history, and would make the badge meaningless.
   usedRoomMemory: boolean;
   flagged: boolean;
+};
+
+// An image or PDF attached to a message (Phase 1 of the debugging-tools
+// build) — see 20260814_add_message_attachments.sql. Stored in the private
+// "message-attachments" Storage bucket; storagePath is the object path
+// there, never a directly-usable URL (every read goes through a signed URL,
+// see AttachmentChip below), matching the private-bucket-plus-RLS pattern
+// every other read in this app already goes through.
+export type MessageAttachment = {
+  id: string;
+  messageId: string;
+  storagePath: string;
+  filename: string;
+  mimeType: string;
+  kind: "image" | "pdf";
 };
 
 export type RoomRole = "owner" | "admin" | "member";
@@ -228,6 +247,75 @@ function rowToProjectFile(row: Record<string, unknown>): ProjectFile {
   };
 }
 
+function rowToAttachment(row: Record<string, unknown>): MessageAttachment {
+  return {
+    id: row.id as string,
+    messageId: row.message_id as string,
+    storagePath: row.storage_path as string,
+    filename: row.filename as string,
+    mimeType: row.mime_type as string,
+    kind: row.kind as MessageAttachment["kind"],
+  };
+}
+
+// One attached image or PDF, rendered in the transcript. The bucket is
+// private (see 20260814_add_message_attachments.sql) — there's no directly
+// usable URL on the row itself, so every render fetches its own short-lived
+// signed URL, same "the client only ever gets a scoped, temporary
+// credential" shape the rest of this app already applies to writes via RLS.
+function AttachmentChip({ attachment }: { attachment: MessageAttachment }) {
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const supabase = createClient();
+    void supabase.storage
+      .from("message-attachments")
+      .createSignedUrl(attachment.storagePath, 3600)
+      .then(({ data }) => {
+        if (!cancelled && data?.signedUrl) setUrl(data.signedUrl);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [attachment.storagePath]);
+
+  if (attachment.kind === "image") {
+    return (
+      <a
+        href={url ?? undefined}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={attachment.filename}
+        className="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border bg-surface"
+      >
+        {url ? (
+          // A signed Storage URL, not a static asset — next/image's remote-pattern
+          // allowlist would need reconfiguring per-project for a URL host that's
+          // otherwise the same on every deploy; a plain <img> avoids that entirely.
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={url} alt={attachment.filename} className="h-full w-full object-cover" />
+        ) : (
+          <ImageIcon className="h-5 w-5 text-muted" strokeWidth={1.5} />
+        )}
+      </a>
+    );
+  }
+
+  return (
+    <a
+      href={url ?? undefined}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={attachment.filename}
+      className="flex items-center gap-1.5 rounded-lg border border-border bg-surface px-2.5 py-1.5 text-xs text-foreground transition-colors hover:border-accent"
+    >
+      <FileText className="h-3.5 w-3.5 shrink-0 text-muted" strokeWidth={1.75} />
+      <span className="max-w-[160px] truncate">{attachment.filename}</span>
+    </a>
+  );
+}
+
 export default function RoomView({
   roomId,
   initialName,
@@ -244,6 +332,7 @@ export default function RoomView({
   initialProject,
   initialProjectFiles,
   initialPersonality,
+  initialAttachments,
 }: {
   roomId: string;
   initialName: string;
@@ -260,10 +349,20 @@ export default function RoomView({
   initialProject: Project | null;
   initialProjectFiles: ProjectFile[];
   initialPersonality: Personality;
+  initialAttachments: MessageAttachment[];
 }) {
   const supabase = useMemo(() => createClient(), []);
 
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
+  // Keyed by messageId — mirrors projectFiles' "keyed map, built from a
+  // realtime INSERT stream" shape below. Attachments are immutable once
+  // sent (no UPDATE/DELETE policy — see the migration), so this only ever
+  // grows, never needs the update-in-place branch projectFiles' handler has.
+  const [attachmentsByMessage, setAttachmentsByMessage] = useState<Record<string, MessageAttachment[]>>(() => {
+    const map: Record<string, MessageAttachment[]> = {};
+    for (const a of initialAttachments) (map[a.messageId] ??= []).push(a);
+    return map;
+  });
   const [members, setMembers] = useState<RoomMember[]>(initialMembers);
   const [threads, setThreads] = useState<Thread[]>(initialThreads);
   const [threadParticipants, setThreadParticipants] = useState<
@@ -331,6 +430,13 @@ export default function RoomView({
 
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  // Files picked via the composer's paperclip button, waiting to go out with
+  // the next send — cleared on a successful send (or left in place on
+  // failure, same "the person can just hit send again" recovery the text
+  // draft itself doesn't get here, since re-picking files is unlike
+  // re-typing a message).
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const attachInputRef = useRef<HTMLInputElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -559,6 +665,25 @@ export default function RoomView({
               return copy;
             });
           }
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "message_attachments",
+          filter: `room_id=eq.${roomId}`,
+        },
+        (payload) => {
+          const row = payload.new as Record<string, unknown> | null;
+          if (!row?.id) return;
+          const next = rowToAttachment(row);
+          setAttachmentsByMessage((prev) => {
+            const existing = prev[next.messageId] ?? [];
+            if (existing.some((a) => a.id === next.id)) return prev;
+            return { ...prev, [next.messageId]: [...existing, next] };
+          });
         }
       )
       .on("broadcast", { event: "typing" }, (payload) => {
@@ -962,10 +1087,56 @@ export default function RoomView({
     if (isNarrowViewport()) setSidebarOpen(false);
   }
 
+  // Storage object names only tolerate a limited charset reliably across
+  // providers/CDNs — the ORIGINAL filename is preserved separately in
+  // message_attachments.filename for display, this is only ever used to
+  // build the storage_path.
+  function sanitizeFilename(name: string): string {
+    return name.trim().replace(/[^\w.-]+/g, "_").slice(-120) || "file";
+  }
+
+  function mimeToAttachmentKind(mimeType: string): "image" | "pdf" | null {
+    if (mimeType.startsWith("image/")) return "image";
+    if (mimeType === "application/pdf") return "pdf";
+    return null;
+  }
+
+  async function uploadAttachments(messageId: string, files: File[]) {
+    for (const file of files) {
+      const kind = mimeToAttachmentKind(file.type);
+      if (!kind) {
+        console.warn(`RoomView: skipping attachment with unsupported type: ${file.type}`);
+        continue;
+      }
+      const storagePath = `${roomId}/${messageId}/${sanitizeFilename(file.name)}`;
+      const { error: uploadError } = await supabase.storage
+        .from("message-attachments")
+        .upload(storagePath, file, { contentType: file.type, upsert: false });
+      if (uploadError) {
+        // Best-effort per file — one bad upload (name collision, a transient
+        // network blip) shouldn't take the rest of the batch or the
+        // already-sent message text down with it.
+        console.error(`RoomView: failed to upload attachment ${file.name}`, uploadError);
+        continue;
+      }
+      const { error: rowError } = await supabase.from("message_attachments").insert({
+        message_id: messageId,
+        room_id: roomId,
+        storage_path: storagePath,
+        filename: file.name,
+        mime_type: file.type,
+        kind,
+        byte_size: file.size,
+      });
+      if (rowError) console.error(`RoomView: failed to record attachment row for ${file.name}`, rowError);
+    }
+  }
+
   async function handleSend(e: FormEvent) {
     e.preventDefault();
     const text = draft.trim();
-    if (!text || sending || isStreaming || !activeThreadId) return;
+    const files = pendingFiles;
+    if ((!text && files.length === 0) || sending || isStreaming || !activeThreadId) return;
 
     const threadId = activeThreadId;
     // Purely the sender's own setting — replaces the old @-mention trigger entirely.
@@ -973,6 +1144,7 @@ export default function RoomView({
     setError(null);
     setSending(true);
     setDraft("");
+    setPendingFiles([]);
     setMentionState(null);
 
     try {
@@ -983,12 +1155,17 @@ export default function RoomView({
           thread_id: threadId,
           sender_type: "user",
           sender_id: currentUserId,
+          // A message can be attachment-only (no caption typed) — /api/chat's
+          // "Nothing to respond to" guard only fires on truly empty history,
+          // and the vision prompt reads fine with just the attachment(s).
           content: text,
           status: "complete",
         })
         .select("id")
         .single();
       if (insertError) throw insertError;
+
+      if (files.length > 0) await uploadAttachments(inserted.id, files);
 
       if (!shouldInvokeAgent) return;
 
@@ -1433,14 +1610,18 @@ export default function RoomView({
                               {isAgent && m.modelTier && (() => {
                                 // Groq is the primary provider for chat/build; OpenRouter is its
                                 // fallback there, but is the sole (never "fallback") provider for
-                                // code — cohere/north-mini-code only lives on OpenRouter.
-                                const isFallback = m.modelTier !== "code" && m.modelProvider === "openrouter";
+                                // code and vision — neither cohere/north-mini-code nor the vision
+                                // model lives anywhere but OpenRouter.
+                                const isFallback =
+                                  m.modelTier !== "code" && m.modelTier !== "vision" && m.modelProvider === "openrouter";
                                 const style =
                                   m.modelTier === "build"
                                     ? { icon: Sparkles, label: "Powerful", className: "bg-accent/15 text-accent" }
                                     : m.modelTier === "code"
                                       ? { icon: Terminal, label: "Code", className: "bg-blue-500/15 text-blue-400" }
-                                      : { icon: Zap, label: "Efficient", className: "bg-surface text-muted" };
+                                      : m.modelTier === "vision"
+                                        ? { icon: ImageIcon, label: "Vision", className: "bg-violet-500/15 text-violet-400" }
+                                        : { icon: Zap, label: "Efficient", className: "bg-surface text-muted" };
                                 return (
                                   <span
                                     title={m.modelProvider && isFallback ? `Served via ${m.modelProvider} (fallback)` : undefined}
@@ -1471,6 +1652,14 @@ export default function RoomView({
                                 </span>
                               )}
                             </div>
+
+                            {attachmentsByMessage[m.id]?.length > 0 && (
+                              <div className="mb-1.5 mt-1 flex flex-wrap gap-1.5">
+                                {attachmentsByMessage[m.id].map((att) => (
+                                  <AttachmentChip key={att.id} attachment={att} />
+                                ))}
+                              </div>
+                            )}
 
                             {m.type === "tool_call" ? (
                               <div className="mt-1 overflow-hidden rounded-lg border border-border">
@@ -1727,7 +1916,55 @@ export default function RoomView({
                   </div>
                 )}
 
+                {pendingFiles.length > 0 && (
+                  <div className="mb-2 flex flex-wrap gap-1.5">
+                    {pendingFiles.map((file, i) => (
+                      <span
+                        key={`${file.name}-${i}`}
+                        className="flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-foreground"
+                      >
+                        {file.type.startsWith("image/") ? (
+                          <ImageIcon className="h-3 w-3 shrink-0 text-muted" strokeWidth={1.75} />
+                        ) : (
+                          <FileText className="h-3 w-3 shrink-0 text-muted" strokeWidth={1.75} />
+                        )}
+                        <span className="max-w-[160px] truncate">{file.name}</span>
+                        <button
+                          type="button"
+                          onClick={() => setPendingFiles((prev) => prev.filter((_, j) => j !== i))}
+                          aria-label={`Remove ${file.name}`}
+                          className="text-muted transition-colors hover:text-red-500"
+                        >
+                          <X className="h-3 w-3" strokeWidth={2} />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+
                 <form onSubmit={handleSend} className="relative flex items-end gap-2">
+                  <input
+                    ref={attachInputRef}
+                    type="file"
+                    multiple
+                    accept="image/png,image/jpeg,image/webp,application/pdf"
+                    onChange={(e) => {
+                      const picked = Array.from(e.target.files ?? []);
+                      if (picked.length) setPendingFiles((prev) => [...prev, ...picked]);
+                      e.target.value = ""; // allow re-picking the same file after removing it
+                    }}
+                    className="hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => attachInputRef.current?.click()}
+                    disabled={isStreaming}
+                    title="Attach a screenshot or PDF"
+                    aria-label="Attach a file"
+                    className="flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-lg border border-border text-muted transition-colors hover:text-foreground disabled:opacity-40"
+                  >
+                    <Paperclip className="h-4 w-4" strokeWidth={1.75} />
+                  </button>
                   {mentionState && mentionOptions.length > 0 && (
                     <ul className="absolute bottom-full left-0 mb-1.5 w-56 overflow-hidden rounded-lg border border-border bg-surface shadow-xl">
                       {mentionOptions.map((name, i) => (
@@ -1771,7 +2008,7 @@ export default function RoomView({
                   />
                   <button
                     type="submit"
-                    disabled={isStreaming || sending || !draft.trim()}
+                    disabled={isStreaming || sending || (!draft.trim() && pendingFiles.length === 0)}
                     aria-label="Send"
                     className="flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-lg bg-accent text-accent-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
                   >

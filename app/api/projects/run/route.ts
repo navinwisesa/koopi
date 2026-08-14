@@ -121,10 +121,14 @@ export async function POST(req: Request) {
   // Read-then-clear rather than a single UPDATE ... RETURNING — PostgREST's
   // RETURNING reflects the row AFTER the update, so selecting pending_stdin
   // in the same call would only ever hand back the null it was just set
-  // to. The two-step version is safe here without an explicit CAS on the
-  // clear: only this run's own ticker ever calls this for this project (the
-  // run_status CAS at claim time guarantees one active run per project), so
-  // there's no concurrent caller to race against.
+  // to. The two-step version relies on the ticker's own tickInFlight guard
+  // (above) to actually be single-caller — it used to claim that on the
+  // (false) assumption that setInterval's callback can't overlap itself;
+  // it can, and when it did, two overlapping ticks could both read the same
+  // unconsumed pending_stdin here before either cleared it, delivering one
+  // keystroke twice. Without that guard this read-then-clear would need its
+  // own CAS (e.g. `.eq("pending_stdin", text)` on the clearing update) to be
+  // safe on its own.
   //
   // The `pending_stdin_by = userId` condition is the actual enforcement
   // point for "only the run's owner can submit input" — a write from
@@ -167,7 +171,23 @@ export async function POST(req: Request) {
 
   let cancelled = false;
   let sawError: string | null = null;
+  // Guards against overlapping tick executions — setInterval fires strictly
+  // on its own clock and does NOT wait for an async callback to finish, so
+  // whenever one tick's chain of awaited Supabase/sandbox round trips runs
+  // longer than FLUSH_MS (entirely plausible under real network latency),
+  // the next tick's callback starts while the previous one is still
+  // in-flight. That overlap was the actual cause of the double-input bug:
+  // two concurrent ticks could both reach claimPendingStdin's SELECT before
+  // either had cleared pending_stdin, both read the same unconsumed text,
+  // and both go on to sendStdin + broadcast it — the same keystroke
+  // delivered twice to the running process. Skipping a tick outright when
+  // the previous one hasn't finished is lossless (unflushed output/pending
+  // stdin just wait for the next tick that actually runs) and removes the
+  // race at its root instead of only patching claimPendingStdin's read.
+  let tickInFlight = false;
   const ticker = setInterval(async () => {
+    if (tickInFlight) return;
+    tickInFlight = true;
     try {
       if (!(await isStillRunning())) {
         cancelled = true;
@@ -191,6 +211,8 @@ export async function POST(req: Request) {
       // A hiccup in the ticker itself (network blip on a poll) shouldn't
       // tear down an otherwise-healthy run — log and try again next tick.
       console.warn(`/api/projects/run: ticker error for project ${projectId}:`, err);
+    } finally {
+      tickInFlight = false;
     }
   }, FLUSH_MS);
 

@@ -5,6 +5,7 @@ import { createClient } from "@/lib/supabase/server";
 import { SandboxRun, type RunResult } from "@/lib/sandbox";
 import { runGuiSession } from "@/lib/desktopSandbox";
 import { classifyIntent } from "@/lib/intentClassifier";
+import { extractPdf } from "@/lib/pdfExtract";
 import type { Personality } from "@/components/PersonalitySelector";
 
 export const dynamic = "force-dynamic";
@@ -32,6 +33,19 @@ const OPENROUTER_MODEL: Record<"chat" | "build", string> = {
   chat: "openai/gpt-oss-20b:free",
   build: "nvidia/nemotron-3-super-120b-a12b:free",
 };
+// Multimodal input (Phase 1 of the debugging-tools build): confirmed via
+// audit that NONE of the three models above accept image input — Groq's
+// llama-3.1-8b-instant/llama-3.3-70b-versatile are text-only, as is
+// cohere/north-mini-code:free and the openai/gpt-oss-20b:free fallback.
+// A message with an image or a visually-heavy PDF (see lib/pdfExtract.ts)
+// always routes here instead, unconditionally, same "no primary leg to try
+// first" reasoning OPENROUTER_CODE_MODEL already uses — there's no vision
+// model on Groq to fail over from. Chosen from OpenRouter's free tier for
+// its context size and "reasoning" tuning (useful for actually analyzing an
+// error screenshot rather than just captioning it) — one reasonable pick
+// among a few comparable free vision options at the time this was wired in
+// (google/gemma-4-26b-a4b-it:free was the other strong candidate).
+const VISION_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
 
 const MAX_HISTORY = 40;
 const FLUSH_MS = 120;
@@ -70,6 +84,15 @@ This is a core behavior rule, not a style choice: it holds regardless of any ton
 brevity preference stated elsewhere in this prompt. A short reply is still expected to
 surface a real conflict or risk, not omit it for the sake of length.
 [END EVALUATIVE STANCE]
+
+When a message includes an attached image or PDF, this is explicitly a debugging aid —
+usually a screenshot of an error, a stack trace, or a spec/requirements doc — not
+decoration. Reference what's ACTUALLY visible in it specifically (the exact error text,
+the exact line/value shown, a specific diagram element) rather than a generic guess at
+what that kind of image "probably" shows. If a PDF's extracted text is included below a
+message, treat it exactly like text the person typed themselves. If an image genuinely
+isn't legible or the attachment failed to come through, say so plainly instead of
+inventing plausible-sounding content for it.
 
 You have a run_code tool that actually executes code in an isolated sandbox and
 returns its stdout, stderr, and exit code. Only call it when the task genuinely
@@ -255,23 +278,55 @@ function extractFileUpdateBlock(
 
 // Decides WHICH project_files row a piece of generated code targets — a
 // question extractFileUpdateBlock/classifyFileUpdate above never answered
-// at all, which was the actual bug: every file-worthy reply landed on the
+// at all, which was the original bug: every file-worthy reply landed on the
 // same hardcoded "koopi_scratch" path regardless of whether it was a new,
 // unrelated task or a continuation of what was already open, silently
 // overwriting whatever came before.
+//
+// The FIRST fix for that (chooseFileTarget below, trusting only the client's
+// "currently open file") overcorrected: the open-file selection is sticky
+// client state (see ProjectPanel's selectedId) that does NOT follow a file
+// Koopi itself just created, so a retry or rephrase of the exact same task —
+// with nothing new selected in the panel — had no "existing" signal to land
+// on and got its own new file every time. `FileContinuationCandidate` below
+// widens what counts as a candidate to continue: the explicit open file when
+// there is one, otherwise a same-thread fallback resolved server-side (see
+// resolveContinuationHint) that chooseFileTarget never used to see at all.
+type FileContinuationCandidate = {
+  path: string;
+  content: string;
+  // Shown to the classifier so it knows WHY this file was suggested —
+  // an explicit selection is trusted differently than an inferred one.
+  reason: string;
+  // Skip the classifier and target this file directly. Reserved for the one
+  // case narrow and unambiguous enough to not need an LLM's judgment call at
+  // all: the project's last run errored very recently and nothing has
+  // touched the project since — see resolveContinuationHint.
+  forceExisting: boolean;
+};
+
 const FILE_TARGET_PROMPT = `You decide where generated code belongs in a shared multi-file
 coding project.
 
-If a "Currently open file" is given below, decide whether the user's request is clearly about
-modifying, continuing, or fixing what's already in THAT file (target: "existing") — e.g. "add
-error handling to this", "make this support email login", "fix the bug above" — versus a
-distinct, unrelated task that deserves its own file (target: "new"). If no open file is given,
-always answer "new" — there's nothing to continue.
+You're given the user's current request, the code's language, the full list of paths already in
+the project, and — if one applies — a single candidate file plus a reason it was suggested.
 
-Whenever target is "new" (or no file is open), also suggest a short, descriptive filename for
-the code — lowercase, underscores instead of spaces, a sensible extension for the language
+Decide "existing" (the code belongs in the candidate file) vs "new" (it's a distinct, unrelated
+task that deserves its own file). Favor "existing" whenever the request is plausibly a
+continuation of the candidate — modifying, fixing, or adding to it ("add error handling to this",
+"make this support email login", "fix the bug above"), or a retry/rephrasing of the same ask that
+produced it in the first place, even if the wording doesn't match verbatim. Only answer "new" when
+the request is genuinely about a different task the candidate doesn't already cover. If the
+candidate's reason says its last run just failed with an error, weight that even more heavily
+toward "existing" — an error followed by essentially the same ask again is almost always a retry,
+not a new task. If no candidate is given at all, always answer "new" — there's nothing to
+continue.
+
+Whenever target is "new" (or no candidate is given), also suggest a short, descriptive filename
+for the code — lowercase, underscores instead of spaces, a sensible extension for the language
 (e.g. "palindrome_checker.py", "median_calculator.py"). Base it on what the code actually DOES,
-not the literal wording of the request.
+not the literal wording of the request, and avoid picking something that basically duplicates a
+name already in the existing-paths list.
 
 Respond with ONLY compact JSON: {"target": "existing"|"new", "filename": "short_name.ext"}
 (omit filename, or use null, when target is "existing")`;
@@ -470,15 +525,24 @@ function historyToTurns(
       turns.push({ role: "assistant", content: text });
     } else {
       const text = row.content?.trim();
-      if (!text) continue;
+      // The trigger row is never skipped for being textless, even though
+      // every other empty user row is — an attachment-only message (a
+      // screenshot sent with no caption typed) has nothing else to anchor
+      // a turn on, and skipping it here would mean the attachment-folding
+      // step in the POST handler below has no trigger turn left to attach
+      // to (in the worst case, an all-attachment thread with no other
+      // messages would hit "Nothing to respond to" despite having
+      // something very much worth responding to).
+      if (!text && row.id !== triggerMessageId) continue;
       const name = firstOf(row.profiles)?.username ?? "teammate";
+      const body = text || "[sent an attachment with no caption]";
       const content =
         row.id === triggerMessageId
-          ? `${name}: ${text}\n\n[Respond to this message only. Any earlier messages above ` +
+          ? `${name}: ${body}\n\n[Respond to this message only. Any earlier messages above ` +
             `that never got a reply are separate questions someone else asked — they're being ` +
             `answered independently, so don't address them here. Start your reply with ` +
             `"@${name} " to tag them.]`
-          : `${name}: ${text}`;
+          : `${name}: ${body}`;
       turns.push({ role: "user", content });
     }
   }
@@ -631,6 +695,69 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Nothing to respond to" }, { status: 400 });
   }
 
+  // Multimodal attachments (Phase 1 of the debugging-tools build) — images
+  // or PDFs the sender attached to THIS trigger message specifically.
+  // Deliberately scoped to just the trigger's own attachments, not the
+  // whole thread's history: an image attached three messages ago isn't
+  // re-sent to the model on every later reply, same "anchor to the
+  // trigger" scoping the rest of this function already applies to text.
+  const { data: attachmentRows } = await supabase
+    .from("message_attachments")
+    .select("storage_path, filename, mime_type, kind")
+    .eq("message_id", triggerMessageId);
+
+  const visionImageParts: OpenAI.Chat.ChatCompletionContentPartImage[] = [];
+  let attachmentTextBlock = "";
+  for (const att of attachmentRows ?? []) {
+    const { data: fileBlob, error: downloadErr } = await supabase.storage
+      .from("message-attachments")
+      .download(att.storage_path);
+    if (downloadErr || !fileBlob) {
+      console.warn(`/api/chat: failed to download attachment ${att.storage_path}:`, downloadErr);
+      continue;
+    }
+    const buffer = Buffer.from(await fileBlob.arrayBuffer());
+
+    if (att.kind === "image") {
+      visionImageParts.push({
+        type: "image_url",
+        image_url: { url: `data:${att.mime_type};base64,${buffer.toString("base64")}` },
+      });
+    } else if (att.kind === "pdf") {
+      // extractPdf always extracts text; it only ALSO renders page images
+      // when the text looks too sparse to be the real content (a scanned
+      // page, a screenshot pasted into a doc) — see its own comment for the
+      // heuristic. Either way this never throws: a malformed PDF just comes
+      // back empty rather than failing the whole turn.
+      const { text, pageImageDataUrls } = await extractPdf(buffer);
+      if (text) {
+        attachmentTextBlock += `\n\n--- Extracted text from attached PDF "${att.filename}" ---\n${text.slice(0, 8000)}`;
+      }
+      for (const url of pageImageDataUrls) {
+        visionImageParts.push({ type: "image_url", image_url: { url } });
+      }
+    }
+  }
+  // Only actual images (from an image attachment, or a rendered PDF page)
+  // require the vision model — a PDF that extracted cleanly as text needs
+  // nothing beyond what's already folded into attachmentTextBlock below.
+  const hasVisionAttachments = visionImageParts.length > 0;
+
+  // Fold attachments into the trigger's own turn. historyToTurns always
+  // builds the trigger row as the LAST entry (it has the max created_at in
+  // the history query, and turns preserves chronological order) and always
+  // as role "user" — the leading-turns trim below it only ever drops turns
+  // from the FRONT of the array to satisfy "must open on a user turn",
+  // never touches the last one.
+  if (hasVisionAttachments || attachmentTextBlock) {
+    const lastTurn = turns[turns.length - 1];
+    const existingText = typeof lastTurn.content === "string" ? lastTurn.content : "";
+    turns[turns.length - 1] = {
+      role: "user",
+      content: [{ type: "text", text: existingText + attachmentTextBlock }, ...visionImageParts],
+    };
+  }
+
   // Route on the raw trigger text, not the annotated turn — casual chatter
   // stays on the cheap model, anything build/code-shaped gets the real one.
   //
@@ -641,16 +768,21 @@ export async function POST(request: Request) {
   // it doesn't affect isCode. `tier` decides Efficient vs Powerful for
   // everything that ISN'T code, and there the manual override from the
   // composer's model switcher does win over the heuristic guess — the person
-  // sending the message knows better than a guess.
+  // sending the message knows better than a guess. Vision attachments win
+  // over both: they're not decided by text content at all, and there's only
+  // one model in the whole routing table that can actually read an image.
   const triggerText = (history ?? []).find((row) => row.id === triggerMessageId)?.content ?? "";
   const autoIntent = classifyIntent(triggerText);
   const tier: "chat" | "build" = modelOverride ?? autoIntent;
   const isCode = autoIntent === "build";
-  // What actually gets recorded on the reply and shown in the UI badge —
-  // "code" takes precedence over the Efficient/Powerful tier once it applies.
-  const displayTier: "chat" | "build" | "code" = isCode ? "code" : tier;
+  // What actually gets recorded on the reply and shown in the UI badge.
+  const displayTier: "chat" | "build" | "code" | "vision" = hasVisionAttachments
+    ? "vision"
+    : isCode
+      ? "code"
+      : tier;
   console.log(
-    `/api/chat: trigger=${triggerMessageId} tier=${tier} isCode=${isCode}` +
+    `/api/chat: trigger=${triggerMessageId} tier=${tier} isCode=${isCode} vision=${hasVisionAttachments}` +
       (modelOverride ? " (manual override)" : "")
   );
 
@@ -855,24 +987,34 @@ export async function POST(request: Request) {
   }
 
   // Decides which project_files path a piece of file-worthy code lands on.
-  // `openFile` is the sender's currently-selected Project-panel file (from
-  // the request body, see the POST handler's destructuring above) — the
-  // one reliable "is this a continuation" signal that doesn't require
-  // guessing purely from chat text. `existingPaths` is fetched fresh by
-  // each call site right before calling this, so a second file-worthy
-  // reply in the same turn (tool call + a final text block, say) sees
-  // whatever the first one just created and won't collide with it.
+  // `candidate` is the one file (if any) worth considering as a continuation
+  // — either the sender's explicit Project-panel selection, or a same-thread
+  // fallback from resolveContinuationHint below. `existingPaths` is fetched
+  // fresh by each call site right before calling this, so a second
+  // file-worthy reply in the same turn (tool call + a final text block, say)
+  // sees whatever the first one just created and won't collide with it.
   async function chooseFileTarget(
     triggerText: string,
     language: string,
-    openFile: { path: string; content: string } | null,
+    candidate: FileContinuationCandidate | null,
     existingPaths: string[]
   ): Promise<{ path: string; isNewFile: boolean }> {
     const fallbackToNewFile = () => ({
       path: uniquePath(slugFilename(triggerText, language), existingPaths),
       isNewFile: true,
     });
-    if (!groq) return fallbackToNewFile();
+    // The one case narrow enough to skip the classifier entirely — see
+    // resolveContinuationHint for exactly when this is set.
+    if (candidate?.forceExisting) {
+      return { path: candidate.path, isNewFile: false };
+    }
+    // No groq configured, or the classifier call below fails: a candidate
+    // (explicit or inferred) is a better default than always fragmenting
+    // into a new file — that silent-guess behavior is exactly the bug this
+    // function exists to avoid. Only truly candidate-less requests fall
+    // back to a fresh, uniquely-named file.
+    const fallback = () => (candidate ? { path: candidate.path, isNewFile: false } : fallbackToNewFile());
+    if (!groq) return fallback();
 
     try {
       const completion = await groq.chat.completions.create({
@@ -882,18 +1024,21 @@ export async function POST(request: Request) {
           { role: "system", content: FILE_TARGET_PROMPT },
           {
             role: "user",
-            content: openFile
-              ? `User's request:\n${triggerText}\n\nCurrently open file: ${openFile.path}\n` +
-                `--- its current content (may be empty or unrelated) ---\n${openFile.content.slice(0, 800)}\n\n` +
+            content: candidate
+              ? `User's request:\n${triggerText}\n\nCandidate file: ${candidate.path}\n` +
+                `Why it was suggested: ${candidate.reason}\n` +
+                `--- its current content (may be empty or unrelated) ---\n${candidate.content.slice(0, 800)}\n\n` +
+                `Other existing paths in the project: ${existingPaths.filter((p) => p !== candidate.path).join(", ") || "(none)"}\n\n` +
                 `Generated code language: ${language}`
-              : `User's request:\n${triggerText}\n\nNo file is currently open.\n\nGenerated code language: ${language}`,
+              : `User's request:\n${triggerText}\n\nNo candidate file — nothing open, nothing recent in this thread.\n\n` +
+                `Existing paths in the project: ${existingPaths.join(", ") || "(none)"}\n\nGenerated code language: ${language}`,
           },
         ],
       });
       const raw = completion.choices[0]?.message?.content?.trim() ?? "";
       const parsed = safeParse<{ target?: string; filename?: string }>(raw, {});
-      if (openFile && parsed.target === "existing") {
-        return { path: openFile.path, isNewFile: false };
+      if (candidate && parsed.target === "existing") {
+        return { path: candidate.path, isNewFile: false };
       }
       const suggested = parsed.filename?.trim();
       // Reject anything that doesn't look like a plausible bare filename
@@ -902,9 +1047,106 @@ export async function POST(request: Request) {
       const name = suggested && /^[\w.-]{1,80}$/.test(suggested) ? suggested : slugFilename(triggerText, language);
       return { path: uniquePath(name, existingPaths), isNewFile: true };
     } catch (err) {
-      console.warn(`/api/chat: file-target classification failed for trigger ${triggerMessageId}, defaulting to a new file:`, err);
-      return fallbackToNewFile();
+      console.warn(`/api/chat: file-target classification failed for trigger ${triggerMessageId}, defaulting:`, err);
+      return fallback();
     }
+  }
+
+  // Resolves the fallback "file being continued" candidate for when the
+  // sender doesn't have anything explicitly open — the actual gap behind the
+  // duplicate-file bug this fixes. Two signals, tried in order of how much
+  // they're worth trusting, both scoped to server-side state chooseFileTarget
+  // never had access to before:
+  //
+  //  1. The Project panel's Run button just failed on a specific file. That
+  //     result lives entirely in `projects.last_run_*` — a table/endpoint
+  //     (app/api/projects/run/route.ts) completely separate from this
+  //     thread's `messages` — so without this explicit lookup, this route
+  //     has no way to know a run even happened, let alone that it errored.
+  //     This is almost certainly the actual mechanism behind the reported
+  //     bug: an EOFError (or any other run failure) followed by "try
+  //     again"/a rephrase, arriving here with zero memory of the attempt
+  //     that just failed.
+  //  2. Otherwise, the most recent file Koopi itself wrote to IN THIS
+  //     THREAD, recovered from the already-fetched `history` — a tool
+  //     call's recorded path, or the "📄 Updated X" marker a prior text
+  //     reply left behind. Covers "just re-asking" with no error involved.
+  //
+  // Cached per-request: both syncProjectFile (tool-call path) and the
+  // isFileUpdate text path may call this in the same turn and should agree.
+  let cachedContinuationHint: FileContinuationCandidate | null | undefined;
+  async function resolveContinuationHint(projectId: string): Promise<FileContinuationCandidate | null> {
+    if (cachedContinuationHint !== undefined) return cachedContinuationHint;
+
+    // Recent enough that "try again" plausibly means the same file, short
+    // enough that a stale failure from an unrelated earlier task doesn't
+    // linger and wrongly capture a genuinely new request much later.
+    const RECENT_RUN_WINDOW_MS = 3 * 60 * 1000;
+    const { data: projectRow } = await supabase
+      .from("projects")
+      .select("run_entry_path, last_run_exit_code, last_run_at")
+      .eq("id", projectId)
+      .maybeSingle();
+
+    if (
+      projectRow?.run_entry_path &&
+      projectRow.last_run_exit_code !== null &&
+      projectRow.last_run_exit_code !== 0 &&
+      projectRow.last_run_at &&
+      Date.now() - new Date(projectRow.last_run_at).getTime() < RECENT_RUN_WINDOW_MS
+    ) {
+      cachedContinuationHint = {
+        path: projectRow.run_entry_path,
+        content: "",
+        reason: "its last run just failed with an error — almost certainly what's being retried",
+        forceExisting: true,
+      };
+      return cachedContinuationHint;
+    }
+
+    // Scan this thread's own history, newest-first (excluding the trigger
+    // row itself), for the most recent file Koopi touched here.
+    for (let i = (history ?? []).length - 2; i >= 0; i--) {
+      const row = (history as MessageRow[])[i];
+      if (row.sender_type !== "agent") continue;
+      let path: string | undefined;
+      if (row.type === "tool_call") {
+        path = safeParse<{ path?: string }>(row.content, {}).path;
+      } else if (row.type === "text") {
+        path = row.content?.match(/📄 Updated (\S+) —/)?.[1];
+      }
+      if (!path) continue;
+
+      const { data: fileRow } = await supabase
+        .from("project_files")
+        .select("content")
+        .eq("project_id", projectId)
+        .eq("path", path)
+        .maybeSingle();
+      cachedContinuationHint = {
+        path,
+        content: fileRow?.content ?? "",
+        reason: "the file Koopi most recently worked on in this conversation",
+        forceExisting: false,
+      };
+      return cachedContinuationHint;
+    }
+
+    cachedContinuationHint = null;
+    return null;
+  }
+
+  // Shared by both file-writing paths below: the sender's explicit
+  // Project-panel selection, when it's actually present in this project's
+  // file list. Kept separate from resolveContinuationHint so an explicit
+  // choice always wins over an inferred one.
+  function explicitOpenCandidate(
+    fileRows: { path: string; content: string | null }[]
+  ): FileContinuationCandidate | null {
+    const row = openFilePath ? fileRows.find((f) => f.path === openFilePath) : undefined;
+    return row
+      ? { path: row.path, content: row.content ?? "", reason: "currently open in your editor", forceExisting: false }
+      : null;
   }
 
   // A no-op update guarded on `status = 'streaming'` — 0 rows affected means
@@ -987,7 +1229,19 @@ export async function POST(request: Request) {
     // match reality once a fallback kicks in.
     let provider: "groq" | "openrouter";
 
-    if (isCode) {
+    if (hasVisionAttachments) {
+      // Same "no primary leg to try first" reasoning as the isCode branch
+      // below — confirmed in Phase 0's audit that neither Groq's models nor
+      // the code model accept image input at all, so there's nothing to
+      // fail over FROM, only the one model that can actually read one.
+      const result = await tryOpenrouter(VISION_MODEL);
+      if ("error" in result) {
+        await postFailureNotice(result.error);
+        return { kind: "text", messageId: null, text: "" };
+      }
+      stream = result.stream;
+      provider = "openrouter";
+    } else if (isCode) {
       // Code always goes straight to the code-specialized OpenRouter model —
       // Groq has no comparable free-tier code model, so there's no primary
       // leg to try before this one.
@@ -1188,21 +1442,24 @@ export async function POST(request: Request) {
   // overwritten by every unrelated task — chooseFileTarget (see its own
   // comment) is what fixes that: a new, unrelated request gets its own
   // sensibly-named file; a request that's clearly about the file the
-  // sender already has open updates that one instead.
-  async function syncProjectFile(code: string, language: string) {
-    if (!code.trim()) return;
+  // sender already has open, or one resolveContinuationHint infers from
+  // this same thread's recent activity, updates that one instead.
+  // Returns the path it wrote to (or null if it wrote nothing) so callers
+  // can record it — runToolCall stamps it onto the tool_call message so a
+  // LATER retry in this thread can find it via resolveContinuationHint.
+  async function syncProjectFile(code: string, language: string): Promise<string | null> {
+    if (!code.trim()) return null;
     const projectId = await ensureRoomProjectId();
-    if (!projectId) return;
+    if (!projectId) return null;
 
     const { data: fileRows } = await supabase
       .from("project_files")
       .select("path, content")
       .eq("project_id", projectId);
     const existingPaths = (fileRows ?? []).map((f) => f.path);
-    const openRow = openFilePath ? (fileRows ?? []).find((f) => f.path === openFilePath) : undefined;
-    const openFile = openRow ? { path: openRow.path, content: openRow.content ?? "" } : null;
+    const candidate = explicitOpenCandidate(fileRows ?? []) ?? (await resolveContinuationHint(projectId));
 
-    const { path } = await chooseFileTarget(triggerText, language, openFile, existingPaths);
+    const { path } = await chooseFileTarget(triggerText, language, candidate, existingPaths);
 
     const { error } = await supabase.from("project_files").upsert(
       {
@@ -1217,12 +1474,14 @@ export async function POST(request: Request) {
     );
     if (error) {
       console.warn(`/api/chat: failed to upsert project_files for room ${roomId}:`, error);
+      return null;
     }
+    return path;
   }
 
   async function runToolCall(call: PendingToolCall): Promise<"interrupted" | "done"> {
     const { code, language } = safeParse(call.arguments, { code: "", language: "bash" });
-    await syncProjectFile(code, language);
+    const path = await syncProjectFile(code, language);
 
     const { data: toolCallRow, error: toolCallErr } = await supabase
       .from("messages")
@@ -1232,7 +1491,7 @@ export async function POST(request: Request) {
         sender_type: "agent",
         sender_id: null,
         type: "tool_call",
-        content: JSON.stringify({ code, language }),
+        content: JSON.stringify({ code, language, path }),
         status: "streaming",
       })
       .select("id")
@@ -1331,7 +1590,7 @@ export async function POST(request: Request) {
   // as the stream URL is ready rather than waiting out a whole execution.
   async function runGuiToolCall(call: PendingToolCall): Promise<"done"> {
     const { code, language } = safeParse(call.arguments, { code: "", language: "python" });
-    await syncProjectFile(code, language);
+    const path = await syncProjectFile(code, language);
 
     await supabase.from("messages").insert({
       room_id: roomId,
@@ -1339,7 +1598,7 @@ export async function POST(request: Request) {
       sender_type: "agent",
       sender_id: null,
       type: "tool_call",
-      content: JSON.stringify({ code, language }),
+      content: JSON.stringify({ code, language, path }),
       status: "complete",
     });
 
@@ -1438,9 +1697,9 @@ export async function POST(request: Request) {
                   .select("path, content")
                   .eq("project_id", projectId);
                 const existingPaths = (fileRows ?? []).map((f) => f.path);
-                const openRow = openFilePath ? (fileRows ?? []).find((f) => f.path === openFilePath) : undefined;
-                const openFile = openRow ? { path: openRow.path, content: openRow.content ?? "" } : null;
-                const target = await chooseFileTarget(triggerText, block.language, openFile, existingPaths);
+                const candidate =
+                  explicitOpenCandidate(fileRows ?? []) ?? (await resolveContinuationHint(projectId));
+                const target = await chooseFileTarget(triggerText, block.language, candidate, existingPaths);
                 targetPath = target.path;
 
                 const { error } = await supabase.from("project_files").upsert(

@@ -10,6 +10,7 @@ import RoomView, {
   type Thread,
   type Project,
   type ProjectFile,
+  type MessageAttachment,
 } from "@/components/RoomView";
 import { type Personality } from "@/components/PersonalitySelector";
 
@@ -237,6 +238,23 @@ export default async function RoomPage({
     updatedAt: row.updated_at,
   }));
 
+  const messageIds = initialMessages.map((m) => m.id);
+  const { data: attachmentRows } = messageIds.length
+    ? await supabase
+        .from("message_attachments")
+        .select("id, message_id, storage_path, filename, mime_type, kind")
+        .in("message_id", messageIds)
+    : { data: [] };
+
+  const initialAttachments: MessageAttachment[] = (attachmentRows ?? []).map((a) => ({
+    id: a.id,
+    messageId: a.message_id,
+    storagePath: a.storage_path,
+    filename: a.filename,
+    mimeType: a.mime_type,
+    kind: a.kind as MessageAttachment["kind"],
+  }));
+
   const initialMembers: RoomMember[] = participants.map((p) => {
     const prof = firstOf(p.profiles);
     return {
@@ -266,6 +284,7 @@ export default async function RoomPage({
       initialProject={initialProject}
       initialProjectFiles={initialProjectFiles}
       initialPersonality={(room.personality as Personality | null) ?? "default"}
+      initialAttachments={initialAttachments}
     />
   );
 }

@@ -11,6 +11,7 @@ import {
   AlertTriangle,
   FilePlus,
   Trash2,
+  Pencil,
   FileCode,
   Bot,
   Code2,
@@ -116,13 +117,18 @@ export default function ProjectPanel({
 
   useEffect(() => {
     onActiveFileChange?.(selectedFile);
-    // Only re-fire when the SELECTION changes, not on every content edit
-    // (selectedFile is a fresh object each render since it's derived via
-    // .find()) — onActiveFileChange itself is intentionally excluded too,
-    // since RoomView passes a plain setState function whose identity is
-    // already stable.
+    // Re-fires on the SELECTION changing, and also on the selected file's
+    // own path changing (a rename — see renameFile below) since RoomView
+    // forwards this straight through to /api/chat as openFilePath, and a
+    // stale pre-rename path there would silently break chooseFileTarget's
+    // "currently open file" match. Deliberately NOT keyed on content edits
+    // beyond that — selectedFile is a fresh object each render via .find(),
+    // so re-running on every keystroke would defeat the point of scoping
+    // this to id/path. onActiveFileChange itself is intentionally excluded
+    // too, since RoomView passes a plain setState function whose identity
+    // is already stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedFile?.id]);
+  }, [selectedFile?.id, selectedFile?.path]);
 
   const [draft, setDraft] = useState(selectedFile?.content ?? "");
   const [dirty, setDirty] = useState(false);
@@ -132,6 +138,11 @@ export default function ProjectPanel({
   const [conflict, setConflict] = useState(false);
   const [newFileOpen, setNewFileOpen] = useState(false);
   const [newFilePath, setNewFilePath] = useState("");
+  // Inline rename — only one file can be mid-rename at a time, same
+  // single-active-editor-state pattern as newFileOpen/newFilePath above.
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renameError, setRenameError] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState<"editor" | "changes">("editor");
   // Docked assistant drawer within the Editor tab — replaces the old
   // standalone "Assistant" tab (usability review: two competing "talk to
@@ -285,6 +296,49 @@ export default function ProjectPanel({
     if (error) console.error("ProjectPanel: failed to delete project_files row", error);
   }
 
+  function startRename(file: ProjectFile) {
+    setRenameError(null);
+    setRenamingId(file.id);
+    setRenameDraft(file.path);
+  }
+
+  function cancelRename() {
+    setRenamingId(null);
+    setRenameDraft("");
+    setRenameError(null);
+  }
+
+  // Direct write, same as the language <select> above and unlike
+  // content edits (save()) — path/language are metadata, not the reviewable
+  // content itself, so they've never gone through the canWriteDirectly /
+  // onProposeChange approval path; project_files' own RLS UPDATE policy is
+  // still the real gate for who's allowed to, same "advisory client" pattern
+  // documented on canWriteDirectly above.
+  async function renameFile(file: ProjectFile) {
+    const path = renameDraft.trim();
+    if (!path || path === file.path) {
+      cancelRename();
+      return;
+    }
+    const supabase = createClient();
+    const { error } = await supabase
+      .from("project_files")
+      .update({ path })
+      .eq("id", file.id);
+    if (error) {
+      // 23505 = unique_violation — project_files has a (project_id, path)
+      // uniqueness constraint (the same one chooseFileTarget's uniquePath()
+      // avoids colliding with server-side), so renaming onto an existing
+      // filename lands here rather than silently overwriting that file.
+      console.error("ProjectPanel: failed to rename project_files row", error);
+      setRenameError(
+        error.code === "23505" ? "A file with that name already exists." : "Couldn't rename that file."
+      );
+      return;
+    }
+    cancelRename();
+  }
+
   const isRunning = runState.status === "running";
 
   async function runFile() {
@@ -417,32 +471,69 @@ export default function ProjectPanel({
             </form>
           )}
           <div className="min-h-0 flex-1 overflow-y-auto">
-            {sortedFiles.map((f) => (
-              <div
-                key={f.id}
-                className={`group flex items-center gap-1 px-2 py-1 text-[11px] ${
-                  f.id === selectedId ? "bg-accent/10 text-accent" : "text-muted hover:text-foreground"
-                }`}
-              >
-                <button
-                  type="button"
-                  onClick={() => setSelectedId(f.id)}
-                  className="flex min-w-0 flex-1 items-center gap-1 text-left"
-                  title={f.path}
+            {sortedFiles.map((f) =>
+              renamingId === f.id ? (
+                <div key={f.id} className="flex flex-col gap-0.5 px-2 py-1">
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void renameFile(f);
+                    }}
+                    className="flex items-center gap-1"
+                  >
+                    <FileCode className="h-3 w-3 shrink-0 text-muted" strokeWidth={1.75} />
+                    <input
+                      autoFocus
+                      value={renameDraft}
+                      onChange={(e) => setRenameDraft(e.target.value)}
+                      onFocus={(e) => e.target.select()}
+                      onBlur={() => void renameFile(f)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") {
+                          e.preventDefault();
+                          cancelRename();
+                        }
+                      }}
+                      className="w-full min-w-0 rounded border border-accent bg-background px-1 py-0.5 text-[11px] text-foreground focus:outline-none"
+                    />
+                  </form>
+                  {renameError && <p className="pl-4 text-[10px] text-red-500">{renameError}</p>}
+                </div>
+              ) : (
+                <div
+                  key={f.id}
+                  className={`group flex items-center gap-1 px-2 py-1 text-[11px] ${
+                    f.id === selectedId ? "bg-accent/10 text-accent" : "text-muted hover:text-foreground"
+                  }`}
                 >
-                  <FileCode className="h-3 w-3 shrink-0" strokeWidth={1.75} />
-                  <span className="truncate">{f.path}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void deleteFile(f)}
-                  title="Delete file"
-                  className="shrink-0 opacity-0 transition-opacity hover:text-red-500 group-hover:opacity-100"
-                >
-                  <Trash2 className="h-3 w-3" strokeWidth={1.75} />
-                </button>
-              </div>
-            ))}
+                  <button
+                    type="button"
+                    onClick={() => setSelectedId(f.id)}
+                    className="flex min-w-0 flex-1 items-center gap-1 text-left"
+                    title={f.path}
+                  >
+                    <FileCode className="h-3 w-3 shrink-0" strokeWidth={1.75} />
+                    <span className="truncate">{f.path}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => startRename(f)}
+                    title="Rename file"
+                    className="shrink-0 opacity-0 transition-opacity hover:text-accent group-hover:opacity-100"
+                  >
+                    <Pencil className="h-3 w-3" strokeWidth={1.75} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void deleteFile(f)}
+                    title="Delete file"
+                    className="shrink-0 opacity-0 transition-opacity hover:text-red-500 group-hover:opacity-100"
+                  >
+                    <Trash2 className="h-3 w-3" strokeWidth={1.75} />
+                  </button>
+                </div>
+              )
+            )}
             {sortedFiles.length === 0 && !newFileOpen && (
               <div className="px-2 py-3 text-center">
                 <p className="mb-2 text-[11px] text-muted">No files yet.</p>
