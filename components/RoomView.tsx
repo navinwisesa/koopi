@@ -445,6 +445,25 @@ export default function RoomView({
   // re-typing a message).
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const attachInputRef = useRef<HTMLInputElement>(null);
+  // Highlights the composer while a drag carrying files is over it — drop
+  // handling itself lives in addPendingFiles below, shared with the
+  // paperclip button's own file picker so both entry points land on
+  // identical accept/filter behavior.
+  const [composerDragOver, setComposerDragOver] = useState(false);
+
+  const ACCEPTED_ATTACHMENT_TYPES = ["image/png", "image/jpeg", "image/webp", "application/pdf"];
+
+  // Shared by the paperclip button's <input type="file"> (already filtered
+  // by its own `accept` attribute, but that's an OS-picker hint only, not
+  // an enforcement) and drag-and-drop (no such hint exists at all — a
+  // Finder/Explorer drag can carry anything). Silently drops anything
+  // outside the accepted types rather than erroring, same "just don't add
+  // it" shape the OS file picker already gives you for a type it filters
+  // out on its own.
+  function addPendingFiles(fileList: FileList | File[]) {
+    const accepted = Array.from(fileList).filter((f) => ACCEPTED_ATTACHMENT_TYPES.includes(f.type));
+    if (accepted.length) setPendingFiles((prev) => [...prev, ...accepted]);
+  }
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -1966,15 +1985,42 @@ export default function RoomView({
                   </div>
                 )}
 
-                <form onSubmit={handleSend} className="relative flex items-end gap-2">
+                <form
+                  onSubmit={handleSend}
+                  onDragOver={(e) => {
+                    // Files (not, say, a dragged mention chip or text
+                    // selection) is the one thing worth reacting to here —
+                    // dataTransfer.types is readable during dragover even
+                    // though the actual file list isn't until drop.
+                    if (!e.dataTransfer.types.includes("Files")) return;
+                    e.preventDefault(); // required for onDrop to fire at all
+                    setComposerDragOver(true);
+                  }}
+                  onDragLeave={(e) => {
+                    // Only clear once the pointer actually leaves the form,
+                    // not on every child-to-child move within it (each of
+                    // those fires its own leave+enter pair as the pointer
+                    // crosses element boundaries).
+                    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+                    setComposerDragOver(false);
+                  }}
+                  onDrop={(e) => {
+                    if (!e.dataTransfer.files.length) return;
+                    e.preventDefault();
+                    setComposerDragOver(false);
+                    addPendingFiles(e.dataTransfer.files);
+                  }}
+                  className={`relative flex items-end gap-2 rounded-lg transition-colors ${
+                    composerDragOver ? "outline outline-2 outline-offset-2 outline-accent" : ""
+                  }`}
+                >
                   <input
                     ref={attachInputRef}
                     type="file"
                     multiple
                     accept="image/png,image/jpeg,image/webp,application/pdf"
                     onChange={(e) => {
-                      const picked = Array.from(e.target.files ?? []);
-                      if (picked.length) setPendingFiles((prev) => [...prev, ...picked]);
+                      addPendingFiles(e.target.files ?? []);
                       e.target.value = ""; // allow re-picking the same file after removing it
                     }}
                     className="hidden"
