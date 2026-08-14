@@ -341,8 +341,38 @@ export default function ProjectPanel({
   }
   // Which folder (by path, "" for the root drop zone) a drag is currently
   // over — drives the highlight only, drop handling itself lives in
-  // importDroppedFiles below.
+  // importDroppedFiles/moveFile below.
   const [dragOverPath, setDragOverPath] = useState<string | null>(null);
+  // Set only while dragging an EXISTING project file within the tree (to
+  // move it into a folder) — distinguishes that from dragging real OS files
+  // in from outside, which land in the exact same onDrop handlers below.
+  // Component state rather than reading it back out of e.dataTransfer:
+  // this is a same-window drag, and dataTransfer's custom data isn't
+  // readable during dragover (only on drop), which is too late to tell the
+  // two cases apart before the drop actually happens.
+  const [draggingFileId, setDraggingFileId] = useState<string | null>(null);
+  // Right-click menu — null when closed. folderPath is "" for the root
+  // (right-clicked blank space or a file row) or a specific folder's path
+  // (right-clicked that folder's own row, via its own onContextMenu below).
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; folderPath: string } | null>(null);
+  useEffect(() => {
+    if (!contextMenu) return;
+    function close() {
+      setContextMenu(null);
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") close();
+    }
+    // Any click anywhere closes it — including the click that picks a menu
+    // item, which is fine: that click's own handler (below) runs first and
+    // does its own thing before this listener tears the menu down.
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [contextMenu]);
   const [rightTab, setRightTab] = useState<"editor" | "changes">("editor");
   // Docked assistant drawer within the Editor tab — replaces the old
   // standalone "Assistant" tab (usability review: two competing "talk to
@@ -517,6 +547,25 @@ export default function ProjectPanel({
     setNewFolderOpen(false);
   }
 
+  // Opens the new-file/new-folder input pre-filled with a folder prefix —
+  // shared by the toolbar buttons (always folderPath "") and the
+  // right-click menu (folderPath is whichever folder was right-clicked, ""
+  // for blank space/a file row). The prefix is just the input's starting
+  // value, not locked in any way — still a plain editable text field, same
+  // as before this existed.
+  function openNewFile(folderPath: string) {
+    setContextMenu(null);
+    setNewFolderOpen(false);
+    setNewFilePath(folderPath ? `${folderPath}/` : "");
+    setNewFileOpen(true);
+  }
+  function openNewFolder(folderPath: string) {
+    setContextMenu(null);
+    setNewFileOpen(false);
+    setNewFolderPath(folderPath ? `${folderPath}/` : "");
+    setNewFolderOpen(true);
+  }
+
   async function deleteFile(file: ProjectFile) {
     const supabase = createClient();
     const { error } = await supabase.from("project_files").delete().eq("id", file.id);
@@ -596,6 +645,29 @@ export default function ProjectPanel({
       });
       if (error) console.error(`ProjectPanel: failed to import dropped file ${raw.name}`, error);
     }
+  }
+
+  // Moving an EXISTING project file into a folder by dragging it (as
+  // opposed to importDroppedFiles above, which is for real OS files dragged
+  // in from outside) — both land in the same onDrop handlers below, told
+  // apart by whether draggingFileId is set. Just a path rewrite, same
+  // direct-write shape renameFile already uses (path is metadata, not
+  // reviewable content); collisions are avoided up front here rather than
+  // surfaced as an error afterward, since there's no input field for a
+  // drag-drop move to show one in.
+  async function moveFile(fileId: string, targetFolder: string) {
+    const file = files.find((f) => f.id === fileId);
+    if (!file) return;
+    const basename = file.path.split("/").pop() ?? file.path;
+    const desired = targetFolder ? `${targetFolder}/${basename}` : basename;
+    if (desired === file.path) return; // already there — dropped a file back into its own folder
+    const path = uniqueImportPath(
+      desired,
+      files.filter((f) => f.id !== fileId).map((f) => f.path)
+    );
+    const supabase = createClient();
+    const { error } = await supabase.from("project_files").update({ path }).eq("id", fileId);
+    if (error) console.error(`ProjectPanel: failed to move ${file.path} to ${path}`, error);
   }
 
   const isRunning = runState.status === "running";
@@ -729,10 +801,7 @@ export default function ProjectPanel({
             <div className="flex items-center gap-0.5">
               <button
                 type="button"
-                onClick={() => {
-                  setNewFolderOpen(false);
-                  setNewFileOpen((v) => !v);
-                }}
+                onClick={() => (newFileOpen ? setNewFileOpen(false) : openNewFile(""))}
                 title="New file"
                 className="rounded p-0.5 text-muted transition-colors hover:text-foreground"
               >
@@ -740,10 +809,7 @@ export default function ProjectPanel({
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setNewFileOpen(false);
-                  setNewFolderOpen((v) => !v);
-                }}
+                onClick={() => (newFolderOpen ? setNewFolderOpen(false) : openNewFolder(""))}
                 title="New folder"
                 className="rounded p-0.5 text-muted transition-colors hover:text-foreground"
               >
@@ -797,7 +863,13 @@ export default function ProjectPanel({
               e.preventDefault();
               e.stopPropagation();
               setDragOverPath(null);
-              if (e.dataTransfer.files.length) void importDroppedFiles(e.dataTransfer.files, "");
+              if (draggingFileId) void moveFile(draggingFileId, "");
+              else if (e.dataTransfer.files.length) void importDroppedFiles(e.dataTransfer.files, "");
+            }}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setContextMenu({ x: e.clientX, y: e.clientY, folderPath: "" });
             }}
           >
             {(() => {
@@ -844,10 +916,28 @@ export default function ProjectPanel({
                 return (
                   <div
                     key={f.id}
+                    draggable
+                    onDragStart={(e) => {
+                      setDraggingFileId(f.id);
+                      e.dataTransfer.effectAllowed = "move";
+                    }}
+                    onDragEnd={() => setDraggingFileId(null)}
+                    onContextMenu={(e) => {
+                      // Right-clicking a file offers the same menu as
+                      // right-clicking blank space in its folder — "new"
+                      // here means "next to this file", not "on this
+                      // file", so it targets the file's OWN containing
+                      // folder (everything up to its last "/"), not the
+                      // file itself.
+                      e.preventDefault();
+                      e.stopPropagation();
+                      const slash = f.path.lastIndexOf("/");
+                      setContextMenu({ x: e.clientX, y: e.clientY, folderPath: slash === -1 ? "" : f.path.slice(0, slash) });
+                    }}
                     style={{ paddingLeft: 8 + depth * 14 }}
                     className={`group flex items-center gap-1 py-1 pr-2 text-[11px] ${
-                      f.id === selectedId ? "bg-accent/10 text-accent" : "text-muted hover:text-foreground"
-                    }`}
+                      draggingFileId === f.id ? "opacity-40" : ""
+                    } ${f.id === selectedId ? "bg-accent/10 text-accent" : "text-muted hover:text-foreground"}`}
                   >
                     <button
                       type="button"
@@ -897,7 +987,13 @@ export default function ProjectPanel({
                         e.preventDefault();
                         e.stopPropagation();
                         setDragOverPath(null);
-                        if (e.dataTransfer.files.length) void importDroppedFiles(e.dataTransfer.files, folder.path);
+                        if (draggingFileId) void moveFile(draggingFileId, folder.path);
+                        else if (e.dataTransfer.files.length) void importDroppedFiles(e.dataTransfer.files, folder.path);
+                      }}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setContextMenu({ x: e.clientX, y: e.clientY, folderPath: folder.path });
                       }}
                       className={`flex cursor-pointer items-center gap-1 py-1 pr-2 text-[11px] font-medium text-muted transition-colors hover:text-foreground ${
                         dragOverPath === folder.path ? "bg-accent/10 text-accent" : ""
@@ -936,7 +1032,7 @@ export default function ProjectPanel({
                 </p>
                 <button
                   type="button"
-                  onClick={() => setNewFileOpen(true)}
+                  onClick={() => openNewFile("")}
                   className="inline-flex items-center gap-1 rounded-md bg-accent px-2 py-1 text-[11px] font-medium text-accent-foreground transition-opacity hover:opacity-90"
                 >
                   <FilePlus className="h-3 w-3" strokeWidth={2} />
@@ -1097,6 +1193,38 @@ export default function ProjectPanel({
           )}
         </div>
       </div>
+
+      {contextMenu && (
+        <div
+          // Fixed to the viewport, not this panel — the click coordinates
+          // that positioned it (clientX/clientY) are viewport-relative too.
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          className="fixed z-50 min-w-36 overflow-hidden rounded-md border border-border bg-surface py-1 shadow-xl"
+          // The window "click" listener that closes this menu (see the
+          // effect above) would otherwise also fire for THIS click and race
+          // with the item's own onClick — stopping it here means the
+          // item's action always runs before the menu closes, not the
+          // other way around.
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            onClick={() => openNewFile(contextMenu.folderPath)}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-foreground hover:bg-background"
+          >
+            <FilePlus className="h-3.5 w-3.5 text-muted" strokeWidth={1.75} />
+            New file
+          </button>
+          <button
+            type="button"
+            onClick={() => openNewFolder(contextMenu.folderPath)}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-foreground hover:bg-background"
+          >
+            <FolderPlus className="h-3.5 w-3.5 text-muted" strokeWidth={1.75} />
+            New folder
+          </button>
+        </div>
+      )}
     </div>
   );
 }
