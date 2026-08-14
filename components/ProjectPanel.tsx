@@ -505,9 +505,22 @@ export default function ProjectPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conflict, draft, selectedId, canWriteDirectly]);
 
+  // Prefixes name with newItemTargetFolder — the input itself only ever
+  // holds the bare name being typed (see openNewFile/openNewFolder below),
+  // not a "folder/" prefix baked into the editable text; the target
+  // folder is already conveyed by where the form is positioned in the
+  // tree (see renderFolder), so repeating it as literal text in the input
+  // was redundant clutter, not information the person actually needed to
+  // read or could usefully edit. Still supports typing further "/"s of
+  // their own, for nesting deeper than the target folder in one go.
+  function withTargetFolder(name: string): string {
+    return newItemTargetFolder ? `${newItemTargetFolder}/${name}` : name;
+  }
+
   async function createFile() {
-    const path = newFilePath.trim();
-    if (!path) return;
+    const name = newFilePath.trim();
+    if (!name) return;
+    const path = withTargetFolder(name);
     const supabase = createClient();
     const { data, error } = await supabase
       .from("project_files")
@@ -538,8 +551,9 @@ export default function ProjectPanel({
     // A trailing slash reads as "make the folder itself", which is exactly
     // what's happening — strip it so path + "/" + marker below doesn't
     // double up.
-    const path = raw.endsWith("/") ? raw.slice(0, -1) : raw;
-    if (!path) return;
+    const name = raw.endsWith("/") ? raw.slice(0, -1) : raw;
+    if (!name) return;
+    const path = withTargetFolder(name);
     const supabase = createClient();
     const { error } = await supabase.from("project_files").insert({
       project_id: projectId,
@@ -556,12 +570,14 @@ export default function ProjectPanel({
     setNewFolderOpen(false);
   }
 
-  // Opens the new-file/new-folder input pre-filled with a folder prefix —
-  // shared by the toolbar buttons (always folderPath "") and the
-  // right-click menu (folderPath is whichever folder was right-clicked, ""
-  // for blank space/a file row). The prefix is just the input's starting
-  // value, not locked in any way — still a plain editable text field, same
-  // as before this existed.
+  // Opens the new-file/new-folder input targeting folderPath — shared by
+  // the toolbar buttons (always folderPath "") and the right-click menu
+  // (folderPath is whichever folder was right-clicked, "" for blank
+  // space/a file row). Always starts empty: the target folder is conveyed
+  // by where the form renders (see renderFolder/newItemTargetFolder) and
+  // applied automatically at creation time (see withTargetFolder above),
+  // not by pre-filling it into text the person would otherwise have to
+  // read past or clear.
   // A collapsed folder's children (including the eventual new-item form
   // rendered as one of them, see renderFolder) never get rendered at all —
   // opening the form for a folder the person can't currently see into
@@ -574,7 +590,7 @@ export default function ProjectPanel({
   function openNewFile(folderPath: string) {
     setContextMenu(null);
     setNewFolderOpen(false);
-    setNewFilePath(folderPath ? `${folderPath}/` : "");
+    setNewFilePath("");
     setNewItemTargetFolder(folderPath);
     expandFolder(folderPath);
     setNewFileOpen(true);
@@ -582,7 +598,7 @@ export default function ProjectPanel({
   function openNewFolder(folderPath: string) {
     setContextMenu(null);
     setNewFileOpen(false);
-    setNewFolderPath(folderPath ? `${folderPath}/` : "");
+    setNewFolderPath("");
     setNewItemTargetFolder(folderPath);
     expandFolder(folderPath);
     setNewFolderOpen(true);
@@ -893,7 +909,7 @@ export default function ProjectPanel({
                         autoFocus
                         value={newFilePath}
                         onChange={(e) => setNewFilePath(e.target.value)}
-                        placeholder="path/to/file.py"
+                        placeholder={newItemTargetFolder ? "file.py" : "path/to/file.py"}
                         className="w-full rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground placeholder:text-muted focus:border-accent focus:outline-none"
                       />
                     </form>
@@ -914,7 +930,7 @@ export default function ProjectPanel({
                         autoFocus
                         value={newFolderPath}
                         onChange={(e) => setNewFolderPath(e.target.value)}
-                        placeholder="path/to/folder"
+                        placeholder={newItemTargetFolder ? "folder name" : "path/to/folder"}
                         className="w-full rounded border border-border bg-background px-1.5 py-1 text-[11px] text-foreground placeholder:text-muted focus:border-accent focus:outline-none"
                       />
                     </form>
