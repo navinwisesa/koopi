@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import dynamic from "next/dynamic";
 import { python } from "@codemirror/lang-python";
 import { javascript } from "@codemirror/lang-javascript";
@@ -13,6 +13,9 @@ import {
   Trash2,
   Pencil,
   FileCode,
+  Folder,
+  FolderOpen,
+  ChevronRight,
   Bot,
   Code2,
   GitPullRequest,
@@ -71,6 +74,65 @@ function languageFromPath(path: string): string {
       return "bash";
     default:
       return "python";
+  }
+}
+
+// Phase 2 (hierarchical folders): project_files.path has supported nested
+// segments since it was first created ("flat or nested path (e.g.
+// 'src/index.py')" — see 20260815_add_projects.sql's own comment on the
+// column) but nothing ever actually rendered that nesting — every file
+// landed in one flat, alphabetized list regardless of how many "/"s its
+// path had. No new table or column for this: the tree below is derived
+// entirely from splitting `path` on "/", same source of truth the flat
+// list already used, just organized differently.
+type FileTreeFolder = {
+  name: string;
+  path: string; // full path from the project root, e.g. "src/utils" — "" for the root
+  folders: FileTreeFolder[];
+  files: ProjectFile[];
+};
+
+function buildFileTree(files: ProjectFile[]): FileTreeFolder {
+  const root: FileTreeFolder = { name: "", path: "", folders: [], files: [] };
+  for (const file of files) {
+    const segments = file.path.split("/").filter(Boolean);
+    const fileName = segments.pop();
+    if (!fileName) continue; // defensive: a path that's only slashes has nothing to show
+    let node = root;
+    let currentPath = "";
+    for (const seg of segments) {
+      currentPath = currentPath ? `${currentPath}/${seg}` : seg;
+      let child = node.folders.find((f) => f.name === seg);
+      if (!child) {
+        child = { name: seg, path: currentPath, folders: [], files: [] };
+        node.folders.push(child);
+      }
+      node = child;
+    }
+    node.files.push(file);
+  }
+  (function sortNode(n: FileTreeFolder) {
+    n.folders.sort((a, b) => a.name.localeCompare(b.name));
+    n.files.sort((a, b) => a.path.localeCompare(b.path));
+    n.folders.forEach(sortNode);
+  })(root);
+  return root;
+}
+
+// Suffixes _2, _3, ... on a collision within the SAME folder — client-side
+// mirror of chooseFileTarget's uniquePath() in app/api/chat/route.ts, kept
+// separate since this one only ever needs to avoid other files already in
+// `existingPaths`, not ask an LLM anything.
+function uniqueImportPath(desired: string, existingPaths: string[]): string {
+  if (!existingPaths.includes(desired)) return desired;
+  const dot = desired.lastIndexOf(".");
+  const slash = desired.lastIndexOf("/");
+  const dir = slash === -1 ? "" : desired.slice(0, slash + 1);
+  const base = dot === -1 || dot < slash ? desired.slice(slash + 1) : desired.slice(slash + 1, dot);
+  const ext = dot === -1 || dot < slash ? "" : desired.slice(dot);
+  for (let i = 2; ; i++) {
+    const candidate = `${dir}${base}_${i}${ext}`;
+    if (!existingPaths.includes(candidate)) return candidate;
   }
 }
 
@@ -143,6 +205,24 @@ export default function ProjectPanel({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [renameError, setRenameError] = useState<string | null>(null);
+  // Tracks COLLAPSED folders rather than expanded ones, deliberately: a
+  // brand-new folder (created by a drag-drop import, or by Koopi writing
+  // its first file into one) then defaults to expanded with no extra
+  // bookkeeping to backfill — it's just absent from this set, same as
+  // every other folder nobody's touched yet.
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => new Set());
+  function toggleFolder(path: string) {
+    setCollapsedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }
+  // Which folder (by path, "" for the root drop zone) a drag is currently
+  // over — drives the highlight only, drop handling itself lives in
+  // importDroppedFiles below.
+  const [dragOverPath, setDragOverPath] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState<"editor" | "changes">("editor");
   // Docked assistant drawer within the Editor tab — replaces the old
   // standalone "Assistant" tab (usability review: two competing "talk to
@@ -339,6 +419,38 @@ export default function ProjectPanel({
     cancelRename();
   }
 
+  // Drag-and-drop import (Phase 2): reads each dropped OS file as text and
+  // creates a project_files row for it at targetFolder + its own name.
+  // Text-only by construction — project_files.content is a text column
+  // (same as every file Koopi or a person creates by hand already is), so
+  // dropping an actual binary (an image, say) isn't a supported case here;
+  // that's what Phase 1's message attachments are for, a deliberately
+  // separate feature with its own storage.
+  async function importDroppedFiles(fileList: FileList, targetFolder: string) {
+    const existingPaths = files.map((f) => f.path);
+    const supabase = createClient();
+    for (const raw of Array.from(fileList)) {
+      let content: string;
+      try {
+        content = await raw.text();
+      } catch (err) {
+        console.error(`ProjectPanel: failed to read dropped file ${raw.name}`, err);
+        continue;
+      }
+      const desired = targetFolder ? `${targetFolder}/${raw.name}` : raw.name;
+      const path = uniqueImportPath(desired, existingPaths);
+      existingPaths.push(path); // so two files dropped in the same batch don't collide with each other
+      const { error } = await supabase.from("project_files").insert({
+        project_id: projectId,
+        path,
+        content,
+        language: languageFromPath(path),
+        last_edited_by: currentUserId,
+      });
+      if (error) console.error(`ProjectPanel: failed to import dropped file ${raw.name}`, error);
+    }
+  }
+
   const isRunning = runState.status === "running";
 
   async function runFile() {
@@ -470,73 +582,149 @@ export default function ProjectPanel({
               />
             </form>
           )}
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            {sortedFiles.map((f) =>
-              renamingId === f.id ? (
-                <div key={f.id} className="flex flex-col gap-0.5 px-2 py-1">
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      void renameFile(f);
-                    }}
-                    className="flex items-center gap-1"
-                  >
-                    <FileCode className="h-3 w-3 shrink-0 text-muted" strokeWidth={1.75} />
-                    <input
-                      autoFocus
-                      value={renameDraft}
-                      onChange={(e) => setRenameDraft(e.target.value)}
-                      onFocus={(e) => e.target.select()}
-                      onBlur={() => void renameFile(f)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Escape") {
+          <div
+            className={`min-h-0 flex-1 overflow-y-auto ${dragOverPath === "" ? "bg-accent/5" : ""}`}
+            onDragOver={(e) => {
+              e.preventDefault(); // required for onDrop to fire at all
+              e.stopPropagation();
+              setDragOverPath("");
+            }}
+            onDragLeave={() => setDragOverPath((p) => (p === "" ? null : p))}
+            onDrop={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setDragOverPath(null);
+              if (e.dataTransfer.files.length) void importDroppedFiles(e.dataTransfer.files, "");
+            }}
+          >
+            {(() => {
+              // renderFileRow/renderFolder are plain functions called during
+              // render (never used as a JSX tag) — a nested COMPONENT
+              // declared inside this render body would get a fresh identity
+              // every render and force React to remount the whole tree each
+              // time, which is exactly what breaks the rename input's focus
+              // mid-edit. Calling a function and returning the elements it
+              // produces has no such issue: React still reconciles by the
+              // keys on those elements, same as the flat .map() this
+              // replaced.
+              function renderFileRow(f: ProjectFile, depth: number) {
+                if (renamingId === f.id) {
+                  return (
+                    <div key={f.id} className="flex flex-col gap-0.5 px-2 py-1" style={{ paddingLeft: 8 + depth * 14 }}>
+                      <form
+                        onSubmit={(e) => {
                           e.preventDefault();
-                          cancelRename();
-                        }
+                          void renameFile(f);
+                        }}
+                        className="flex items-center gap-1"
+                      >
+                        <FileCode className="h-3 w-3 shrink-0 text-muted" strokeWidth={1.75} />
+                        <input
+                          autoFocus
+                          value={renameDraft}
+                          onChange={(e) => setRenameDraft(e.target.value)}
+                          onFocus={(e) => e.target.select()}
+                          onBlur={() => void renameFile(f)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Escape") {
+                              e.preventDefault();
+                              cancelRename();
+                            }
+                          }}
+                          className="w-full min-w-0 rounded border border-accent bg-background px-1 py-0.5 text-[11px] text-foreground focus:outline-none"
+                        />
+                      </form>
+                      {renameError && <p className="pl-4 text-[10px] text-red-500">{renameError}</p>}
+                    </div>
+                  );
+                }
+                return (
+                  <div
+                    key={f.id}
+                    style={{ paddingLeft: 8 + depth * 14 }}
+                    className={`group flex items-center gap-1 py-1 pr-2 text-[11px] ${
+                      f.id === selectedId ? "bg-accent/10 text-accent" : "text-muted hover:text-foreground"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setSelectedId(f.id)}
+                      className="flex min-w-0 flex-1 items-center gap-1 text-left"
+                      title={f.path}
+                    >
+                      <FileCode className="h-3 w-3 shrink-0" strokeWidth={1.75} />
+                      <span className="truncate">{f.path.split("/").pop()}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => startRename(f)}
+                      title="Rename file"
+                      className="shrink-0 opacity-0 transition-opacity hover:text-accent group-hover:opacity-100"
+                    >
+                      <Pencil className="h-3 w-3" strokeWidth={1.75} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void deleteFile(f)}
+                      title="Delete file"
+                      className="shrink-0 opacity-0 transition-opacity hover:text-red-500 group-hover:opacity-100"
+                    >
+                      <Trash2 className="h-3 w-3" strokeWidth={1.75} />
+                    </button>
+                  </div>
+                );
+              }
+
+              function renderFolder(node: FileTreeFolder, depth: number): ReactNode[] {
+                const rows: ReactNode[] = [];
+                for (const folder of node.folders) {
+                  const collapsed = collapsedFolders.has(folder.path);
+                  rows.push(
+                    <div
+                      key={`dir:${folder.path}`}
+                      style={{ paddingLeft: 8 + depth * 14 }}
+                      onClick={() => toggleFolder(folder.path)}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setDragOverPath(folder.path);
                       }}
-                      className="w-full min-w-0 rounded border border-accent bg-background px-1 py-0.5 text-[11px] text-foreground focus:outline-none"
-                    />
-                  </form>
-                  {renameError && <p className="pl-4 text-[10px] text-red-500">{renameError}</p>}
-                </div>
-              ) : (
-                <div
-                  key={f.id}
-                  className={`group flex items-center gap-1 px-2 py-1 text-[11px] ${
-                    f.id === selectedId ? "bg-accent/10 text-accent" : "text-muted hover:text-foreground"
-                  }`}
-                >
-                  <button
-                    type="button"
-                    onClick={() => setSelectedId(f.id)}
-                    className="flex min-w-0 flex-1 items-center gap-1 text-left"
-                    title={f.path}
-                  >
-                    <FileCode className="h-3 w-3 shrink-0" strokeWidth={1.75} />
-                    <span className="truncate">{f.path}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => startRename(f)}
-                    title="Rename file"
-                    className="shrink-0 opacity-0 transition-opacity hover:text-accent group-hover:opacity-100"
-                  >
-                    <Pencil className="h-3 w-3" strokeWidth={1.75} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void deleteFile(f)}
-                    title="Delete file"
-                    className="shrink-0 opacity-0 transition-opacity hover:text-red-500 group-hover:opacity-100"
-                  >
-                    <Trash2 className="h-3 w-3" strokeWidth={1.75} />
-                  </button>
-                </div>
-              )
-            )}
+                      onDragLeave={() => setDragOverPath((p) => (p === folder.path ? null : p))}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setDragOverPath(null);
+                        if (e.dataTransfer.files.length) void importDroppedFiles(e.dataTransfer.files, folder.path);
+                      }}
+                      className={`flex cursor-pointer items-center gap-1 py-1 pr-2 text-[11px] font-medium text-muted transition-colors hover:text-foreground ${
+                        dragOverPath === folder.path ? "bg-accent/10 text-accent" : ""
+                      }`}
+                    >
+                      <ChevronRight
+                        className={`h-3 w-3 shrink-0 transition-transform ${collapsed ? "" : "rotate-90"}`}
+                        strokeWidth={2}
+                      />
+                      {collapsed ? (
+                        <Folder className="h-3 w-3 shrink-0" strokeWidth={1.75} />
+                      ) : (
+                        <FolderOpen className="h-3 w-3 shrink-0" strokeWidth={1.75} />
+                      )}
+                      <span className="truncate">{folder.name}</span>
+                    </div>
+                  );
+                  if (!collapsed) rows.push(...renderFolder(folder, depth + 1));
+                }
+                for (const file of node.files) rows.push(renderFileRow(file, depth));
+                return rows;
+              }
+
+              return renderFolder(buildFileTree(sortedFiles), 0);
+            })()}
             {sortedFiles.length === 0 && !newFileOpen && (
               <div className="px-2 py-3 text-center">
-                <p className="mb-2 text-[11px] text-muted">No files yet.</p>
+                <p className="mb-2 text-[11px] text-muted">
+                  No files yet — create one, or drag files from your computer here.
+                </p>
                 <button
                   type="button"
                   onClick={() => setNewFileOpen(true)}

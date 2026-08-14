@@ -328,6 +328,14 @@ for the code — lowercase, underscores instead of spaces, a sensible extension 
 not the literal wording of the request, and avoid picking something that basically duplicates a
 name already in the existing-paths list.
 
+Paths in this project can be nested ("utils/helpers.py", "src/api/routes.py") — the existing-paths
+list reflects the project's real folder structure, not just flat filenames. If the new file's
+purpose clearly fits an existing folder shown in that list (a small helper when a "utils/" or
+"helpers/" folder already exists, an API route when "src/api/" already has other routes in it),
+prefix your suggested filename with that same folder path so it lands alongside its siblings,
+instead of defaulting to the project root. Don't invent a NEW folder that doesn't already appear
+in existing-paths — only place a file into a folder that's already there.
+
 Respond with ONLY compact JSON: {"target": "existing"|"new", "filename": "short_name.ext"}
 (omit filename, or use null, when target is "existing")`;
 
@@ -360,6 +368,22 @@ function slugFilename(text: string, language: string): string {
     .slice(0, 4);
   const base = words.join("_") || "snippet";
   return `${base}${extensionFor(language)}`;
+}
+
+// Guards an LLM-suggested filename before it becomes a DB row's key. A bare
+// filename ("calculator.py") is a one-segment relative path and always
+// passes; "/" is only ever a folder separator between clean segments — no
+// leading slash (not project-root-relative already, by construction), no
+// ".."/empty segment (no escaping the project via a relative traversal),
+// no segment containing anything outside [\w.-]. This is what actually
+// keeps FILE_TARGET_PROMPT's new folder-nesting suggestions ("utils/x.py")
+// working instead of silently defeating them — the old bare-filename-only
+// regex here would have stripped every suggested "/" right back out.
+function isPlausibleRelativePath(p: string): boolean {
+  if (p.length === 0 || p.length > 120) return false;
+  if (p.startsWith("/") || p.endsWith("/")) return false;
+  const segments = p.split("/");
+  return segments.every((seg) => seg.length > 0 && seg !== "." && seg !== ".." && /^[\w.-]+$/.test(seg));
 }
 
 // Appends _2, _3, ... until the name doesn't collide with an existing file
@@ -1041,10 +1065,14 @@ export async function POST(request: Request) {
         return { path: candidate.path, isNewFile: false };
       }
       const suggested = parsed.filename?.trim();
-      // Reject anything that doesn't look like a plausible bare filename
-      // (no path separators, no wild characters) rather than trust the
-      // model's output verbatim for something that becomes a DB row's key.
-      const name = suggested && /^[\w.-]{1,80}$/.test(suggested) ? suggested : slugFilename(triggerText, language);
+      // Reject anything that doesn't look like a plausible relative path
+      // (see isPlausibleRelativePath) rather than trust the model's output
+      // verbatim for something that becomes a DB row's key. A bare
+      // filename still passes (it's a one-segment path); "/"s are only
+      // allowed as folder separators now that the prompt above can suggest
+      // nesting into an existing folder — never a leading slash, "..", or
+      // an empty segment.
+      const name = suggested && isPlausibleRelativePath(suggested) ? suggested : slugFilename(triggerText, language);
       return { path: uniquePath(name, existingPaths), isNewFile: true };
     } catch (err) {
       console.warn(`/api/chat: file-target classification failed for trigger ${triggerMessageId}, defaulting:`, err);
