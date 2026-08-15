@@ -5,6 +5,7 @@ import { Check, ChevronDown } from "lucide-react";
 import Avatar from "@/components/Avatar";
 import { createClient } from "@/lib/supabase/client";
 import type { RoomMember, Thread } from "@/components/RoomView";
+import type { Personality } from "@/components/PersonalitySelector";
 
 function rowToThread(row: Record<string, unknown>): Thread {
   return {
@@ -13,6 +14,11 @@ function rowToThread(row: Record<string, unknown>): Thread {
     title: (row.title as string | null) ?? null,
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
+    // create_thread_with_invites' RPC return reflects whatever the row
+    // actually has — undefined (not an error) until the migration adding
+    // this column is applied, same fallback every other reader of this
+    // column uses.
+    personality: (row.personality as Personality | null | undefined) ?? "default",
   };
 }
 

@@ -12,24 +12,41 @@ import {
   type ReactNode,
 } from "react";
 import Link from "next/link";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import {
   Link2,
   Check,
   Square,
   ArrowUp,
   PanelLeft,
+  PanelRight,
   MessageSquarePlus,
   Terminal,
   Wand2,
   Zap,
   Sparkles,
+  Brain,
+  AlertTriangle,
+  MonitorPlay,
+  ExternalLink,
+  Users,
+  Paperclip,
+  FileText,
+  Image as ImageIcon,
+  X,
 } from "lucide-react";
 import Avatar from "@/components/Avatar";
+import ProjectPanel from "@/components/ProjectPanel";
+import RoomMembersModal from "@/components/RoomMembersModal";
 import NewChatModal from "@/components/NewChatModal";
+import ResizeHandle from "@/components/ResizeHandle";
+import PersonalitySelector, { type Personality } from "@/components/PersonalitySelector";
 import ProfileMenu from "@/components/ProfileMenu";
 import RoomSidebar from "@/components/RoomSidebar";
-import { presenceOf } from "@/lib/presence";
+import { presenceOf, PRESENCE_DOT } from "@/lib/presence";
 import { createClient } from "@/lib/supabase/client";
+import { useResizableWidth } from "@/lib/useResizableWidth";
+import { requestChangeSummary } from "@/lib/requestChangeSummary";
 
 export type ChatMessage = {
   id: string;
@@ -41,7 +58,31 @@ export type ChatMessage = {
   type: "text" | "tool_call" | "tool_result";
   interruptedBy: string | null;
   createdAt: string;
+  modelTier: "chat" | "build" | "code" | "vision" | null;
+  modelProvider: string | null;
+  // Set by /api/chat's post-reply classification pass — never inferred client-side,
+  // since "was room memory available" is true on nearly every message once a room has
+  // any history, and would make the badge meaningless.
+  usedRoomMemory: boolean;
+  flagged: boolean;
 };
+
+// An image or PDF attached to a message (Phase 1 of the debugging-tools
+// build) — see 20260823_add_message_attachments.sql. Stored in the private
+// "message-attachments" Storage bucket; storagePath is the object path
+// there, never a directly-usable URL (every read goes through a signed URL,
+// see AttachmentChip below), matching the private-bucket-plus-RLS pattern
+// every other read in this app already goes through.
+export type MessageAttachment = {
+  id: string;
+  messageId: string;
+  storagePath: string;
+  filename: string;
+  mimeType: string;
+  kind: "image" | "pdf";
+};
+
+export type RoomRole = "owner" | "admin" | "member";
 
 export type RoomMember = {
   userId: string;
@@ -49,6 +90,7 @@ export type RoomMember = {
   avatarUrl: string | null;
   lastSeenAt: string | null;
   joinedAt: string | null;
+  role: RoomRole;
 };
 
 export type Thread = {
@@ -57,7 +99,48 @@ export type Thread = {
   title: string | null;
   createdAt: string;
   updatedAt: string;
+  // Koopi's response style for THIS thread specifically — moved off
+  // rooms.personality (room-wide) so different threads in the same room
+  // can run different active styles independently. See
+  // 20260825_thread_scoped_personality.sql.
+  personality: Personality;
 };
+
+// Room-scoped (not thread-scoped) — one project per room, keyed by fileId
+// client-side. Replaces the old ThreadFile / single-file-per-thread model.
+export type ProjectFile = {
+  id: string;
+  projectId: string;
+  path: string;
+  content: string;
+  language: string;
+  // null = Koopi-authored — the agent has no profiles row, same convention as
+  // ChatMessage.senderId being null for agent messages.
+  lastEditedBy: string | null;
+  updatedAt: string;
+};
+
+export type ProjectRunState = {
+  status: "idle" | "running";
+  entryPath: string | null;
+  // Who the CURRENTLY running process (if any) belongs to — the one person
+  // allowed to submit stdin to it. null once idle. Distinct from
+  // lastRunBy, which is the historical record of who ran it last and
+  // persists after the run ends.
+  runOwnerId: string | null;
+  lastRunStdout: string | null;
+  lastRunStderr: string | null;
+  lastRunExitCode: number | null;
+  lastRunAt: string | null;
+  lastRunBy: string | null;
+};
+
+export type Project = {
+  id: string;
+  roomId: string;
+  name: string;
+  createdBy: string | null;
+} & ProjectRunState;
 
 const HEARTBEAT_MS = 30_000;
 // Tailwind's `lg` breakpoint — below this the sidebar is a drawer that
@@ -76,7 +159,14 @@ function timeLabel(iso: string) {
 }
 
 type ToolCallPayload = { code: string; language: string };
-type ToolResultPayload = { stdout: string; stderr: string; exit_code: number };
+type ToolResultPayload = {
+  stdout: string;
+  stderr: string;
+  exit_code: number;
+  // Only present for open_gui_session results — a live, watchable view of a
+  // GUI app running in a virtual desktop, in place of stdout/stderr.
+  streamUrl?: string | null;
+};
 
 function parseJson<T>(raw: string, fallback: T): T {
   try {
@@ -86,10 +176,11 @@ function parseJson<T>(raw: string, fallback: T): T {
   }
 }
 
-const KOOPI_MENTION = "Koopi";
-
 // Finds the "@partial" fragment the cursor is currently sitting inside, if any —
 // an "@" preceded by start-of-string or whitespace, with no whitespace since.
+// Purely a text-composition affordance now — tagging someone here never triggers
+// Koopi (that's governed entirely by the per-user toggle below the transcript), so
+// this only ever offers/highlights human teammates.
 function detectMention(
   text: string,
   cursor: number
@@ -106,10 +197,6 @@ function detectMention(
     }
   }
   return null;
-}
-
-function mentionsKoopi(text: string) {
-  return new RegExp(`(^|\\s)@${KOOPI_MENTION}\\b`, "i").test(text);
 }
 
 function renderWithMentions(text: string, knownNames: string[]): ReactNode {
@@ -134,7 +221,109 @@ function rowToThread(row: Record<string, unknown>): Thread {
     title: (row.title as string | null) ?? null,
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
+    // postgres_changes streams the full row via replication regardless of
+    // any .select() elsewhere — undefined here (not an error) just means
+    // the migration adding this column hasn't landed yet.
+    personality: (row.personality as Personality | null | undefined) ?? "default",
   };
+}
+
+function rowToProject(row: Record<string, unknown>): Project {
+  return {
+    id: row.id as string,
+    roomId: row.room_id as string,
+    name: (row.name as string | null) ?? "Project",
+    createdBy: (row.created_by as string | null) ?? null,
+    status: ((row.run_status as string) ?? "idle") as "idle" | "running",
+    entryPath: (row.run_entry_path as string | null) ?? null,
+    runOwnerId: (row.run_owner_id as string | null) ?? null,
+    lastRunStdout: (row.last_run_stdout as string | null) ?? null,
+    lastRunStderr: (row.last_run_stderr as string | null) ?? null,
+    lastRunExitCode: (row.last_run_exit_code as number | null) ?? null,
+    lastRunAt: (row.last_run_at as string | null) ?? null,
+    lastRunBy: (row.last_run_by as string | null) ?? null,
+  };
+}
+
+function rowToProjectFile(row: Record<string, unknown>): ProjectFile {
+  return {
+    id: row.id as string,
+    projectId: row.project_id as string,
+    path: row.path as string,
+    content: (row.content as string) ?? "",
+    language: (row.language as string) ?? "python",
+    lastEditedBy: (row.last_edited_by as string | null) ?? null,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+function rowToAttachment(row: Record<string, unknown>): MessageAttachment {
+  return {
+    id: row.id as string,
+    messageId: row.message_id as string,
+    storagePath: row.storage_path as string,
+    filename: row.filename as string,
+    mimeType: row.mime_type as string,
+    kind: row.kind as MessageAttachment["kind"],
+  };
+}
+
+// One attached image or PDF, rendered in the transcript. The bucket is
+// private (see 20260823_add_message_attachments.sql) — there's no directly
+// usable URL on the row itself, so every render fetches its own short-lived
+// signed URL, same "the client only ever gets a scoped, temporary
+// credential" shape the rest of this app already applies to writes via RLS.
+function AttachmentChip({ attachment }: { attachment: MessageAttachment }) {
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const supabase = createClient();
+    void supabase.storage
+      .from("message-attachments")
+      .createSignedUrl(attachment.storagePath, 3600)
+      .then(({ data }) => {
+        if (!cancelled && data?.signedUrl) setUrl(data.signedUrl);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [attachment.storagePath]);
+
+  if (attachment.kind === "image") {
+    return (
+      <a
+        href={url ?? undefined}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={attachment.filename}
+        className="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border bg-surface"
+      >
+        {url ? (
+          // A signed Storage URL, not a static asset — next/image's remote-pattern
+          // allowlist would need reconfiguring per-project for a URL host that's
+          // otherwise the same on every deploy; a plain <img> avoids that entirely.
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={url} alt={attachment.filename} className="h-full w-full object-cover" />
+        ) : (
+          <ImageIcon className="h-5 w-5 text-muted" strokeWidth={1.5} />
+        )}
+      </a>
+    );
+  }
+
+  return (
+    <a
+      href={url ?? undefined}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={attachment.filename}
+      className="flex items-center gap-1.5 rounded-lg border border-border bg-surface px-2.5 py-1.5 text-xs text-foreground transition-colors hover:border-accent"
+    >
+      <FileText className="h-3.5 w-3.5 shrink-0 text-muted" strokeWidth={1.75} />
+      <span className="max-w-[160px] truncate">{attachment.filename}</span>
+    </a>
+  );
 }
 
 export default function RoomView({
@@ -147,6 +336,12 @@ export default function RoomView({
   initialMembers,
   initialThreads,
   initialThreadParticipants,
+  initialLastReadAt,
+  initialKoopiActive,
+  initialParticipantKoopiActive,
+  initialProject,
+  initialProjectFiles,
+  initialAttachments,
 }: {
   roomId: string;
   initialName: string;
@@ -157,23 +352,118 @@ export default function RoomView({
   initialMembers: RoomMember[];
   initialThreads: Thread[];
   initialThreadParticipants: Record<string, string[]>;
+  initialLastReadAt: Record<string, string | null>;
+  initialKoopiActive: Record<string, boolean>;
+  initialParticipantKoopiActive: Record<string, Record<string, boolean>>;
+  initialProject: Project | null;
+  initialProjectFiles: ProjectFile[];
+  initialAttachments: MessageAttachment[];
 }) {
   const supabase = useMemo(() => createClient(), []);
 
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
+  // Keyed by messageId — mirrors projectFiles' "keyed map, built from a
+  // realtime INSERT stream" shape below. Attachments are immutable once
+  // sent (no UPDATE/DELETE policy — see the migration), so this only ever
+  // grows, never needs the update-in-place branch projectFiles' handler has.
+  const [attachmentsByMessage, setAttachmentsByMessage] = useState<Record<string, MessageAttachment[]>>(() => {
+    const map: Record<string, MessageAttachment[]> = {};
+    for (const a of initialAttachments) (map[a.messageId] ??= []).push(a);
+    return map;
+  });
   const [members, setMembers] = useState<RoomMember[]>(initialMembers);
   const [threads, setThreads] = useState<Thread[]>(initialThreads);
   const [threadParticipants, setThreadParticipants] = useState<
     Record<string, string[]>
   >(initialThreadParticipants);
+  // Current user's own last-viewed timestamp per thread — per-viewer state, never
+  // shared with or derived from other participants' read status.
+  const [lastReadAt, setLastReadAt] = useState<Record<string, string | null>>(
+    initialLastReadAt
+  );
+  // Current user's own "Ask Koopi" setting per thread — the sole gate on whether
+  // THEIR OWN messages trigger a reply. Never affected by anyone else's setting.
+  const [koopiActive, setKoopiActiveState] = useState<Record<string, boolean>>(
+    initialKoopiActive
+  );
+  // Every participant's setting per thread, so the composer can show "Koopi also
+  // answers: ..." — each person's setting is independent, so this is purely informational.
+  const [participantKoopiActive, setParticipantKoopiActive] = useState<
+    Record<string, Record<string, boolean>>
+  >(initialParticipantKoopiActive);
+  // Threads with a Koopi reply currently in flight (broadcast, not persisted — purely
+  // ephemeral UI state, same as any chat app's typing indicator).
+  const [typingThreads, setTypingThreads] = useState<Set<string>>(new Set());
+  // Room-scoped project (one per room) and its files — replaces the old
+  // per-thread threadFiles map. `project` is null until someone opens the
+  // panel for the first time, which lazily creates it (see ensureProject).
+  const [project, setProject] = useState<Project | null>(initialProject);
+  const [projectFiles, setProjectFiles] = useState<Record<string, ProjectFile>>(
+    () => Object.fromEntries(initialProjectFiles.map((f) => [f.id, f]))
+  );
+  // Whichever project file is currently selected in ProjectPanel, reported
+  // up via its onActiveFileChange prop — sent along with chat messages so
+  // /api/chat's chooseFileTarget knows whether a reply's code is "about
+  // the file already open" vs. an unrelated task that wants its own file.
+  // Only the path is actually used (see handleSend); the object itself can
+  // go briefly stale on a content edit, which doesn't matter since the
+  // server re-fetches live content by path when it needs it.
+  const [activeProjectFile, setActiveProjectFile] = useState<ProjectFile | null>(null);
+  // Whether the project panel is visible at all — defaults closed.
+  const [projectPanelOpen, setProjectPanelOpen] = useState(false);
+  // The most recent project_files.updatedAt this viewer has actually had the
+  // panel open for — not persisted, purely "have I looked since this
+  // changed" for the toggle button's unseen-update dot. Room-scoped now
+  // (single value), not per-thread.
+  const [projectSeenAt, setProjectSeenAt] = useState<string | null>(null);
+  const {
+    width: codePanelWidth,
+    onHandleMouseDown: onCodePanelHandleMouseDown,
+    onHandleDoubleClick: onCodePanelHandleDoubleClick,
+  } = useResizableWidth({
+    storageKey: "koopi:code-panel-width",
+    defaultWidth: 480,
+    min: 360,
+    max: 720,
+    // Anchored to the right edge of the screen — dragging the handle left
+    // (toward the chat column) grows it.
+    direction: "left",
+  });
   const [activeThreadId, setActiveThreadId] = useState<string | null>(
     // Threads arrive newest-first, so the most recent conversation opens.
     initialThreads[0]?.id ?? null
   );
   const [newChatOpen, setNewChatOpen] = useState(false);
+  const [membersModalOpen, setMembersModalOpen] = useState(false);
 
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  // Files picked via the composer's paperclip button, waiting to go out with
+  // the next send — cleared on a successful send (or left in place on
+  // failure, same "the person can just hit send again" recovery the text
+  // draft itself doesn't get here, since re-picking files is unlike
+  // re-typing a message).
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const attachInputRef = useRef<HTMLInputElement>(null);
+  // Highlights the composer while a drag carrying files is over it — drop
+  // handling itself lives in addPendingFiles below, shared with the
+  // paperclip button's own file picker so both entry points land on
+  // identical accept/filter behavior.
+  const [composerDragOver, setComposerDragOver] = useState(false);
+
+  const ACCEPTED_ATTACHMENT_TYPES = ["image/png", "image/jpeg", "image/webp", "application/pdf"];
+
+  // Shared by the paperclip button's <input type="file"> (already filtered
+  // by its own `accept` attribute, but that's an OS-picker hint only, not
+  // an enforcement) and drag-and-drop (no such hint exists at all — a
+  // Finder/Explorer drag can carry anything). Silently drops anything
+  // outside the accepted types rather than erroring, same "just don't add
+  // it" shape the OS file picker already gives you for a type it filters
+  // out on its own.
+  function addPendingFiles(fileList: FileList | File[]) {
+    const accepted = Array.from(fileList).filter((f) => ACCEPTED_ATTACHMENT_TYPES.includes(f.type));
+    if (accepted.length) setPendingFiles((prev) => [...prev, ...accepted]);
+  }
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -195,6 +485,9 @@ export default function RoomView({
   const [now, setNow] = useState(() => Date.now());
 
   const bottomRef = useRef<HTMLDivElement>(null);
+  // The messages channel also carries the "typing" broadcast (see the realtime effect
+  // below) — stashed in a ref so handleSend can send() on it without re-subscribing.
+  const messagesChannelRef = useRef<RealtimeChannel | null>(null);
 
   const threadMessages = useMemo(
     () =>
@@ -204,8 +497,92 @@ export default function RoomView({
     [messages, activeThreadId]
   );
 
+  const activeThread = useMemo(
+    () => (activeThreadId ? (threads.find((t) => t.id === activeThreadId) ?? null) : null),
+    [threads, activeThreadId]
+  );
+
+  // Optimistic local update on top of whatever PersonalitySelector's RPC
+  // call does server-side — same "flip it locally, RPC confirms/reverts"
+  // shape the selector's own onChanged already assumes (see its prop type),
+  // just applied to one entry in `threads` now instead of a single
+  // top-level state variable.
+  function handleThreadPersonalityChanged(next: Personality) {
+    if (!activeThreadId) return;
+    setThreads((prev) => prev.map((t) => (t.id === activeThreadId ? { ...t, personality: next } : t)));
+  }
+
   const streamingMessage = threadMessages.find((m) => m.status === "streaming");
   const isStreaming = Boolean(streamingMessage);
+
+  // The role RLS/the DB triggers actually enforce — this is only ever used
+  // to decide what the UI offers; the real gate is server-side (see
+  // 20260817_add_room_roles_and_approval.sql), so a stale/wrong value here
+  // can make a control appear that a write would still be rejected for.
+  const currentUserRole = members.find((m) => m.userId === currentUserId)?.role ?? "member";
+  const canEditProjectDirectly = currentUserRole === "owner" || currentUserRole === "admin";
+
+  async function proposeProjectFileChange(file: ProjectFile, proposedContent: string) {
+    const { data, error } = await supabase
+      .from("project_file_changes")
+      .insert({
+        project_file_id: file.id,
+        proposed_by: currentUserId,
+        proposed_content: proposedContent,
+        source: "manual",
+      })
+      .select("id")
+      .single();
+    if (error) {
+      console.error("RoomView: failed to propose project_files change", error);
+      return;
+    }
+    void requestChangeSummary(data.id);
+  }
+
+  const sortedProjectFiles = useMemo(
+    () =>
+      Object.values(projectFiles)
+        .filter((f) => f.projectId === project?.id)
+        .sort((a, b) => a.path.localeCompare(b.path)),
+    [projectFiles, project]
+  );
+  const latestProjectFileUpdate = useMemo(
+    () => sortedProjectFiles.reduce<string | null>((max, f) => (!max || f.updatedAt > max ? f.updatedAt : max), null),
+    [sortedProjectFiles]
+  );
+  const hasUnseenCodeUpdate = Boolean(latestProjectFileUpdate && latestProjectFileUpdate !== projectSeenAt);
+
+  // Marks the project as "seen" the moment its panel is actually open and on
+  // screen — covers both opening the panel on an already-updated project and
+  // a fresh update arriving while it's already open.
+  useEffect(() => {
+    if (!projectPanelOpen || !latestProjectFileUpdate) return;
+    setProjectSeenAt((prev) => (prev === latestProjectFileUpdate ? prev : latestProjectFileUpdate));
+  }, [projectPanelOpen, latestProjectFileUpdate]);
+
+  // Lazily creates the room's single project on first panel open. A unique
+  // constraint on projects.room_id makes a simultaneous double-create by two
+  // participants harmless — the loser's insert 23505s and just re-fetches
+  // what the winner created.
+  async function ensureProject(): Promise<void> {
+    if (project) return;
+    const { data: inserted, error: insertErr } = await supabase
+      .from("projects")
+      .insert({ room_id: roomId, created_by: currentUserId })
+      .select("*")
+      .single();
+    if (!insertErr && inserted) {
+      setProject(rowToProject(inserted as Record<string, unknown>));
+      return;
+    }
+    const { data: existing } = await supabase
+      .from("projects")
+      .select("*")
+      .eq("room_id", roomId)
+      .maybeSingle();
+    if (existing) setProject(rowToProject(existing as Record<string, unknown>));
+  }
 
   const memberById = useMemo(() => {
     const map = new Map<string, RoomMember>();
@@ -218,8 +595,9 @@ export default function RoomView({
     [activeThreadId, threadParticipants]
   );
 
-  // Everyone the @ dropdown can offer, excluding yourself — tagging yourself
-  // doesn't do anything useful.
+  // Everyone the @ dropdown can offer, excluding yourself — tagging yourself doesn't
+  // do anything useful. Human teammates only — Koopi isn't a taggable target anymore,
+  // since tagging never triggered it in the first place (the toggle does that).
   const mentionMembers = useMemo(
     () =>
       activeThreadParticipantIds
@@ -236,18 +614,19 @@ export default function RoomView({
   }, [mentionMembers]);
 
   const mentionCandidates = useMemo(
-    () => [KOOPI_MENTION, ...mentionMembers.map((m) => m.username)],
+    () => mentionMembers.map((m) => m.username),
     [mentionMembers]
   );
 
-  // Everyone a message could legitimately mention, including yourself — used
-  // to decide what to highlight when rendering someone else's message.
-  const allMentionNames = useMemo(() => {
-    const names = activeThreadParticipantIds
-      .map((id) => memberById.get(id)?.username)
-      .filter((n): n is string => Boolean(n));
-    return [KOOPI_MENTION, ...names];
-  }, [activeThreadParticipantIds, memberById]);
+  // Everyone a message could legitimately mention, including yourself — used to
+  // decide what to highlight when rendering someone else's message.
+  const allMentionNames = useMemo(
+    () =>
+      activeThreadParticipantIds
+        .map((id) => memberById.get(id)?.username)
+        .filter((n): n is string => Boolean(n)),
+    [activeThreadParticipantIds, memberById]
+  );
 
   const mentionOptions = useMemo(() => {
     if (!mentionState) return [];
@@ -255,15 +634,34 @@ export default function RoomView({
     return mentionCandidates.filter((name) => name.toLowerCase().startsWith(q)).slice(0, 6);
   }, [mentionState, mentionCandidates]);
 
-  // A thread with 2+ people is a group conversation — Koopi only jumps in
-  // when explicitly tagged there, so humans can talk without waking it up.
-  // Solo threads (just you) keep the old always-respond behavior.
-  const requiresMention = activeThreadParticipantIds.length >= 2;
+  // My own setting for the open thread — the sole gate on whether my messages
+  // trigger Koopi. Defaults true to match the column default for a thread whose
+  // participant row hasn't round-tripped through state yet.
+  const myKoopiActive = activeThreadId ? (koopiActive[activeThreadId] ?? true) : true;
 
-  // --- realtime: messages -------------------------------------------------
+  // Other participants in the open thread who currently have Koopi answering them —
+  // purely informational, since each person's setting only ever affects their own
+  // messages. Explains why Koopi might reply to one person's messages but not another's
+  // in the same live conversation.
+  const othersKoopiActive = useMemo(() => {
+    if (!activeThreadId) return [];
+    const settings = participantKoopiActive[activeThreadId] ?? {};
+    return activeThreadParticipantIds
+      .filter((id) => id !== currentUserId)
+      .filter((id) => settings[id] ?? true)
+      .map((id) => memberById.get(id)?.username)
+      .filter((n): n is string => Boolean(n));
+  }, [activeThreadId, participantKoopiActive, activeThreadParticipantIds, currentUserId, memberById]);
+
+  const isActiveThreadTyping = Boolean(activeThreadId && typingThreads.has(activeThreadId));
+
+  // --- realtime: messages (+ typing broadcast, same channel) --------------
   useEffect(() => {
+    // { self: true } so the sender's own client also sees its own typing broadcasts —
+    // "Koopi is typing" should look identical for the sender and everyone else, not
+    // need separate local-optimistic-state just for the one person who sent it.
     const channel = supabase
-      .channel(`room:${roomId}:messages`)
+      .channel(`room:${roomId}:messages`, { config: { broadcast: { self: true } } })
       .on(
         "postgres_changes",
         {
@@ -286,6 +684,10 @@ export default function RoomView({
             type: (row.type as ChatMessage["type"]) ?? "text",
             interruptedBy: (row.interrupted_by as string | null) ?? null,
             createdAt: row.created_at as string,
+            modelTier: (row.model_tier as ChatMessage["modelTier"]) ?? null,
+            modelProvider: (row.model_provider as string | null) ?? null,
+            usedRoomMemory: Boolean(row.used_room_memory),
+            flagged: Boolean(row.flagged),
           };
 
           setMessages((prev) => {
@@ -299,14 +701,74 @@ export default function RoomView({
             copy[at] = next;
             return copy;
           });
+
+          // The first row for a reply is inserted the moment the first token arrives
+          // server-side (or, on failure, the failure-notice row) — either way, a real
+          // agent row showing up is exactly the "stop showing typing" moment, precise
+          // down to the same event that puts the real content on screen.
+          if (next.senderType === "agent") {
+            setTypingThreads((prev) => {
+              if (!prev.has(next.threadId)) return prev;
+              const copy = new Set(prev);
+              copy.delete(next.threadId);
+              return copy;
+            });
+          }
         }
       )
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "message_attachments",
+          filter: `room_id=eq.${roomId}`,
+        },
+        (payload) => {
+          const row = payload.new as Record<string, unknown> | null;
+          if (!row?.id) return;
+          const next = rowToAttachment(row);
+          setAttachmentsByMessage((prev) => {
+            const existing = prev[next.messageId] ?? [];
+            if (existing.some((a) => a.id === next.id)) return prev;
+            return { ...prev, [next.messageId]: [...existing, next] };
+          });
+        }
+      )
+      .on("broadcast", { event: "typing" }, (payload) => {
+        const { threadId, active } = payload.payload as {
+          threadId: string;
+          active: boolean;
+        };
+        setTypingThreads((prev) => {
+          const alreadySet = prev.has(threadId);
+          if (active === alreadySet) return prev;
+          const copy = new Set(prev);
+          if (active) copy.add(threadId);
+          else copy.delete(threadId);
+          return copy;
+        });
+      })
       .subscribe();
 
+    messagesChannelRef.current = channel;
+
     return () => {
+      messagesChannelRef.current = null;
       supabase.removeChannel(channel);
     };
   }, [supabase, roomId]);
+
+  // Broadcasts on the shared messages channel — a no-op (not an error) if the channel
+  // hasn't finished subscribing yet, which only matters for a request fired in the
+  // first instant after mount.
+  const broadcastTyping = useCallback((threadId: string, active: boolean) => {
+    void messagesChannelRef.current?.send({
+      type: "broadcast",
+      event: "typing",
+      payload: { threadId, active },
+    });
+  }, []);
 
   // --- realtime: threads --------------------------------------------------
   useEffect(() => {
@@ -386,6 +848,85 @@ export default function RoomView({
             if (list.includes(userId)) return prev;
             return { ...prev, [threadId]: [...list, userId] };
           });
+
+          // Only our own read-state is meaningful to track — this is what keeps
+          // "opened on another tab/device" reflected here without a page reload.
+          if (userId === currentUserId) {
+            const lastRead = (row?.last_read_at as string | null) ?? null;
+            setLastReadAt((prev) => ({ ...prev, [threadId]: lastRead }));
+          }
+
+          // koopi_active, unlike last_read_at, matters for EVERY participant — it's
+          // what powers the "Koopi also answers: ..." hint, so every row's value gets
+          // tracked, not just our own.
+          const active = (row?.koopi_active as boolean | null) ?? true;
+          setParticipantKoopiActive((prev) => ({
+            ...prev,
+            [threadId]: { ...(prev[threadId] ?? {}), [userId]: active },
+          }));
+          if (userId === currentUserId) {
+            setKoopiActiveState((prev) => ({ ...prev, [threadId]: active }));
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [supabase, roomId, currentUserId]);
+
+  // --- realtime: projects + project_files (project panel) -----------------
+  useEffect(() => {
+    // Neither table carries a filterable room_id column client-side query
+    // params can key on directly in the postgres_changes filter — same
+    // unfiltered-subscription, RLS-does-the-filtering shape thread_files used.
+    const channel = supabase
+      .channel(`room:${roomId}:projects`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "projects" },
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            setProject(null);
+            return;
+          }
+          const row = payload.new as Record<string, unknown> | null;
+          if (!row || row.room_id !== roomId) return;
+          setProject(rowToProject(row));
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "project_files" },
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            const old = payload.old as Record<string, unknown> | null;
+            const id = old?.id as string | undefined;
+            if (!id) return;
+            setProjectFiles((prev) => {
+              const next = { ...prev };
+              delete next[id];
+              return next;
+            });
+            return;
+          }
+
+          const row = payload.new as Record<string, unknown> | null;
+          const id = row?.id as string | undefined;
+          // project_files has no room_id column, and this effect intentionally
+          // doesn't depend on `project` (avoids resubscribing the channel
+          // every time the project row changes) — so a stale/cross-room
+          // entry could in principle land in this dict. That's safe: it's
+          // scoped out at read time by sortedProjectFiles filtering on
+          // f.projectId === project?.id below, the same
+          // "store everything, filter at read time" shape threadFiles used.
+          if (!id) return;
+
+          setProjectFiles((prev) => ({
+            ...prev,
+            [id]: rowToProjectFile(row!),
+          }));
         }
       )
       .subscribe();
@@ -395,12 +936,19 @@ export default function RoomView({
     };
   }, [supabase, roomId]);
 
+  // Personality used to be room-wide and live here as its own realtime
+  // subscription against `rooms`. Now thread-scoped (see the Thread type's
+  // own comment) — the existing "realtime: threads" subscription above
+  // already streams the full row on every UPDATE, personality included, so
+  // a second dedicated channel would just be redundant plumbing for a value
+  // that's already kept current as part of each thread's own row.
+
   // --- realtime: participants --------------------------------------------
   const refreshMembers = useCallback(async () => {
     const { data } = await supabase
       .from("participants")
       .select(
-        "user_id, display_name, last_seen_at, joined_at, profiles(username, avatar_url)"
+        "user_id, display_name, last_seen_at, joined_at, role, profiles(username, avatar_url)"
       )
       .eq("room_id", roomId);
 
@@ -413,6 +961,7 @@ export default function RoomView({
           display_name: string | null;
           last_seen_at: string | null;
           joined_at: string | null;
+          role: RoomRole;
           profiles:
             | { username: string | null; avatar_url: string | null }
             | { username: string | null; avatar_url: string | null }[]
@@ -425,6 +974,7 @@ export default function RoomView({
           avatarUrl: prof?.avatar_url ?? null,
           lastSeenAt: raw.last_seen_at,
           joinedAt: raw.joined_at,
+          role: raw.role ?? "member",
         };
       })
     );
@@ -478,6 +1028,75 @@ export default function RoomView({
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [threadMessages]);
 
+  // --- read tracking --------------------------------------------------------
+  // Persists to thread_participants.last_read_at; local state updates optimistically
+  // so the sidebar dot clears the instant you open a thread, not after the round trip.
+  const markThreadRead = useCallback(
+    (threadId: string) => {
+      const nowIso = new Date().toISOString();
+      setLastReadAt((prev) => ({ ...prev, [threadId]: nowIso }));
+      void supabase
+        .from("thread_participants")
+        .update({ last_read_at: nowIso })
+        .eq("thread_id", threadId)
+        .eq("user_id", currentUserId);
+    },
+    [supabase, currentUserId]
+  );
+
+  useEffect(() => {
+    if (activeThreadId) markThreadRead(activeThreadId);
+    // Only re-fires on an actual thread switch, deliberately — bumping this on every
+    // incoming message would spam writes. The currently-open thread is instead just
+    // excluded from the unread computation below, which handles "already looking at
+    // it" without needing last_read_at to track live.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeThreadId]);
+
+  // --- "Ask Koopi" toggle --------------------------------------------------
+  // Purely a per-user, per-thread setting — writing it never touches anyone else's
+  // row, and reading it (via participantKoopiActive) never lets one person's toggle
+  // change what another person's messages do.
+  const setMyKoopiActive = useCallback(
+    (threadId: string, active: boolean) => {
+      setKoopiActiveState((prev) => ({ ...prev, [threadId]: active }));
+      setParticipantKoopiActive((prev) => ({
+        ...prev,
+        [threadId]: { ...(prev[threadId] ?? {}), [currentUserId]: active },
+      }));
+      void supabase
+        .from("thread_participants")
+        .update({ koopi_active: active })
+        .eq("thread_id", threadId)
+        .eq("user_id", currentUserId)
+        .then(({ error: updateError }) => {
+          // The optimistic update above already changed what THIS user sees, so a
+          // write failure here is invisible unless logged — and everyone else's view
+          // depends on this write actually landing, since they only find out via the
+          // thread_participants realtime subscription.
+          if (updateError) {
+            console.error("Failed to persist Koopi toggle:", updateError);
+          }
+        });
+    },
+    [supabase, currentUserId]
+  );
+
+  // A thread counts as unread if it has a message newer than our last visit that we
+  // didn't send ourselves — our own messages don't need to notify us of themselves.
+  // The active thread is excluded outright: it's on screen, so by definition read.
+  const unreadThreadIds = useMemo(() => {
+    const unread = new Set<string>();
+    for (const m of messages) {
+      if (m.threadId === activeThreadId) continue;
+      if (m.senderType === "user" && m.senderId === currentUserId) continue;
+      const readAt = lastReadAt[m.threadId];
+      if (readAt && m.createdAt <= readAt) continue;
+      unread.add(m.threadId);
+    }
+    return unread;
+  }, [messages, lastReadAt, activeThreadId, currentUserId]);
+
   // --- actions ------------------------------------------------------------
   function handleThreadCreated(created: Thread, participantIds: string[]) {
     setThreads((prev) =>
@@ -486,25 +1105,77 @@ export default function RoomView({
         : [created, ...prev].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     );
     // Seed participants immediately so the directory groups it correctly
-    // right away, instead of waiting on the realtime round trip.
+    // right away, instead of waiting on the realtime round trip. Matches the
+    // koopi_active column default — nobody has touched the toggle yet.
     setThreadParticipants((prev) => ({ ...prev, [created.id]: participantIds }));
+    setKoopiActiveState((prev) => ({ ...prev, [created.id]: true }));
+    setParticipantKoopiActive((prev) => ({
+      ...prev,
+      [created.id]: Object.fromEntries(participantIds.map((id) => [id, true])),
+    }));
     setActiveThreadId(created.id);
     setNewChatOpen(false);
     if (isNarrowViewport()) setSidebarOpen(false);
   }
 
+  // Storage object names only tolerate a limited charset reliably across
+  // providers/CDNs — the ORIGINAL filename is preserved separately in
+  // message_attachments.filename for display, this is only ever used to
+  // build the storage_path.
+  function sanitizeFilename(name: string): string {
+    return name.trim().replace(/[^\w.-]+/g, "_").slice(-120) || "file";
+  }
+
+  function mimeToAttachmentKind(mimeType: string): "image" | "pdf" | null {
+    if (mimeType.startsWith("image/")) return "image";
+    if (mimeType === "application/pdf") return "pdf";
+    return null;
+  }
+
+  async function uploadAttachments(messageId: string, files: File[]) {
+    for (const file of files) {
+      const kind = mimeToAttachmentKind(file.type);
+      if (!kind) {
+        console.warn(`RoomView: skipping attachment with unsupported type: ${file.type}`);
+        continue;
+      }
+      const storagePath = `${roomId}/${messageId}/${sanitizeFilename(file.name)}`;
+      const { error: uploadError } = await supabase.storage
+        .from("message-attachments")
+        .upload(storagePath, file, { contentType: file.type, upsert: false });
+      if (uploadError) {
+        // Best-effort per file — one bad upload (name collision, a transient
+        // network blip) shouldn't take the rest of the batch or the
+        // already-sent message text down with it.
+        console.error(`RoomView: failed to upload attachment ${file.name}`, uploadError);
+        continue;
+      }
+      const { error: rowError } = await supabase.from("message_attachments").insert({
+        message_id: messageId,
+        room_id: roomId,
+        storage_path: storagePath,
+        filename: file.name,
+        mime_type: file.type,
+        kind,
+        byte_size: file.size,
+      });
+      if (rowError) console.error(`RoomView: failed to record attachment row for ${file.name}`, rowError);
+    }
+  }
+
   async function handleSend(e: FormEvent) {
     e.preventDefault();
     const text = draft.trim();
-    if (!text || sending || isStreaming || !activeThreadId) return;
+    const files = pendingFiles;
+    if ((!text && files.length === 0) || sending || isStreaming || !activeThreadId) return;
 
     const threadId = activeThreadId;
-    // A group thread only wakes Koopi up when it's actually tagged — humans
-    // can otherwise talk amongst themselves without an uninvited reply.
-    const shouldInvokeAgent = !requiresMention || mentionsKoopi(text);
+    // Purely the sender's own setting — replaces the old @-mention trigger entirely.
+    const shouldInvokeAgent = koopiActive[threadId] ?? true;
     setError(null);
     setSending(true);
     setDraft("");
+    setPendingFiles([]);
     setMentionState(null);
 
     try {
@@ -515,6 +1186,9 @@ export default function RoomView({
           thread_id: threadId,
           sender_type: "user",
           sender_id: currentUserId,
+          // A message can be attachment-only (no caption typed) — /api/chat's
+          // "Nothing to respond to" guard only fires on truly empty history,
+          // and the vision prompt reads fine with just the attachment(s).
           content: text,
           status: "complete",
         })
@@ -522,25 +1196,40 @@ export default function RoomView({
         .single();
       if (insertError) throw insertError;
 
+      if (files.length > 0) await uploadAttachments(inserted.id, files);
+
       if (!shouldInvokeAgent) return;
 
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          threadId,
-          triggerMessageId: inserted.id,
-          modelOverride: modelMode === "auto" ? undefined : modelMode,
-        }),
-      });
+      broadcastTyping(threadId, true);
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            threadId,
+            triggerMessageId: inserted.id,
+            modelOverride: modelMode === "auto" ? undefined : modelMode,
+            // Which project file (if any) is open in THIS sender's Project
+            // panel right now — not the room's shared state, a per-sender
+            // snapshot at send time. See chooseFileTarget server-side.
+            openFilePath: activeProjectFile?.path ?? null,
+          }),
+        });
 
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.error ?? "The agent could not respond.");
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}));
+          throw new Error(detail.error ?? "The agent could not respond.");
+        }
+
+        // Content lands via realtime; draining keeps the connection open.
+        await res.text();
+      } finally {
+        // Tied to the request actually settling — success or failure — not a fixed
+        // timer, so the indicator can never get stuck. The row-insert-based clear in
+        // the messages effect above is what handles the normal "first token arrived"
+        // case; this is the backstop for the rare case where no row ever lands at all.
+        broadcastTyping(threadId, false);
       }
-
-      // Content lands via realtime; draining keeps the connection open.
-      await res.text();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong.");
     } finally {
@@ -549,16 +1238,42 @@ export default function RoomView({
   }
 
   async function handleStop() {
-    if (!streamingMessage) return;
+    if (!isStreaming || !activeThreadId) return;
     setError(null);
 
-    const { error: stopError } = await supabase
-      .from("messages")
-      .update({ status: "interrupted", interrupted_by: currentUserId })
-      .eq("id", streamingMessage.id)
-      .eq("status", "streaming");
+    // Clears every streaming row in this thread, not just the one
+    // `streamingMessage` happened to point at — a thread can end up with more
+    // than one row stuck at status='streaming' (e.g. a dev-server crash mid
+    // tool_call leaves that row orphaned forever, same as the text-flush
+    // ticker dying does), and stopping only the first one left Stop looking
+    // like it did nothing: the UI would immediately re-lock onto the next
+    // stuck row and show "responding…" again.
+    //
+    // Also sets threads.stop_requested_at unconditionally — a multi-round
+    // tool loop (run_code, look at the result, call it again...) can spend
+    // several seconds between rounds with NO row streaming at all (waiting
+    // on the next model call, which can itself fail over through multiple
+    // providers). During one of those gaps the update above touches zero
+    // rows, so it alone can't stop a reply that's mid-loop; the server polls
+    // this column once per round to catch exactly that case.
+    const [{ error: stopError }, { error: signalError }] = await Promise.all([
+      supabase
+        .from("messages")
+        .update({ status: "interrupted", interrupted_by: currentUserId })
+        .eq("thread_id", activeThreadId)
+        .eq("status", "streaming"),
+      supabase
+        .from("threads")
+        .update({ stop_requested_at: new Date().toISOString() })
+        .eq("id", activeThreadId),
+    ]);
 
     if (stopError) setError(stopError.message);
+    // Best-effort, logged not surfaced — the row-flip above already covers
+    // the common case (something visibly streaming right now), so a failure
+    // here (e.g. the stop_requested_at migration not applied yet) shouldn't
+    // block the user with an error banner over what's still a working Stop.
+    if (signalError) console.warn("handleStop: failed to set stop_requested_at", signalError);
   }
 
   async function saveName() {
@@ -661,6 +1376,7 @@ export default function RoomView({
       <RoomSidebar
         threads={threads}
         threadParticipants={threadParticipants}
+        unreadThreadIds={unreadThreadIds}
         members={members}
         activeThreadId={activeThreadId}
         currentUserId={currentUserId}
@@ -728,6 +1444,43 @@ export default function RoomView({
             <div className="ml-auto flex shrink-0 items-center gap-3">
               <button
                 type="button"
+                onClick={() => {
+                  setProjectPanelOpen((v) => !v);
+                  void ensureProject();
+                }}
+                aria-pressed={projectPanelOpen}
+                title={
+                  hasUnseenCodeUpdate && !projectPanelOpen
+                    ? "Project — updated since you last looked"
+                    : projectPanelOpen
+                      ? "Hide project panel"
+                      : "Show project panel"
+                }
+                className={`relative flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs transition-colors ${
+                  projectPanelOpen
+                    ? "border-accent text-accent"
+                    : "border-border text-muted hover:text-foreground"
+                }`}
+              >
+                <PanelRight className="h-3.5 w-3.5" strokeWidth={1.75} />
+                <span className="hidden sm:inline">Project</span>
+                {hasUnseenCodeUpdate && !projectPanelOpen && (
+                  <span className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-accent" />
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setMembersModalOpen(true)}
+                title="Room members and roles"
+                className="flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-muted transition-colors hover:text-foreground"
+              >
+                <Users className="h-3.5 w-3.5" strokeWidth={1.75} />
+                <span className="hidden sm:inline">Members</span>
+              </button>
+
+              <button
+                type="button"
                 onClick={copyInvite}
                 className="flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-muted transition-colors hover:text-foreground"
               >
@@ -750,11 +1503,11 @@ export default function RoomView({
                   .filter((m) => m.userId !== currentUserId)
                   .slice(0, 4)
                   .map((m) => {
-                    const isOnline = presenceOf(m.lastSeenAt, now) === "online";
+                    const presence = presenceOf(m.lastSeenAt, now);
                     return (
                       <span
                         key={m.userId}
-                        title={`${m.username}${isOnline ? " — online" : ""}`}
+                        title={`${m.username} — ${presence}`}
                         className="relative"
                       >
                         <Avatar
@@ -763,9 +1516,9 @@ export default function RoomView({
                           size="sm"
                           className="ring-2 ring-background"
                         />
-                        {isOnline && (
-                          <span className="absolute -bottom-0.5 -right-0.5 h-2 w-2 rounded-full bg-accent ring-2 ring-background" />
-                        )}
+                        <span
+                          className={`absolute -bottom-0.5 -right-0.5 h-2 w-2 rounded-full ring-2 ring-background ${PRESENCE_DOT[presence]}`}
+                        />
                       </span>
                     );
                   })}
@@ -803,11 +1556,30 @@ export default function RoomView({
             )}
           </div>
         ) : (
-          <>
+          <div className="flex min-h-0 flex-1">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+            {/* ---------- thread header: personality is scoped to the ACTIVE
+                thread, not the room (see the Thread type's own comment) —
+                lives here rather than the room-wide header above so its
+                placement itself makes that scope obvious, not just its
+                label text. ---------- */}
+            {activeThread && (
+              <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border px-6 py-2">
+                <span className="min-w-0 truncate text-sm font-medium text-foreground">
+                  {activeThread.title || "Untitled thread"}
+                </span>
+                <PersonalitySelector
+                  threadId={activeThread.id}
+                  personality={activeThread.personality}
+                  onChanged={handleThreadPersonalityChanged}
+                />
+              </div>
+            )}
+
             {/* ---------- transcript ---------- */}
             <div className="min-h-0 flex-1 overflow-y-auto">
               <div className="mx-auto max-w-3xl px-6 py-8">
-                {threadMessages.length === 0 ? (
+                {threadMessages.length === 0 && !isActiveThreadTyping ? (
                   <div className="flex h-full min-h-[40vh] items-center justify-center">
                     <p className="text-sm text-muted">
                       Send a message to get started
@@ -827,13 +1599,38 @@ export default function RoomView({
                       return (
                         <li key={m.id} className="flex gap-3">
                           {isAgent ? (
-                            <span
-                              aria-hidden="true"
-                              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent/15 text-base"
-                              title="Koopi Kapi"
-                            >
-                              🦫
-                            </span>
+                            (() => {
+                              const runningCode =
+                                m.type === "tool_call" && m.status === "streaming";
+                              const generating = m.type === "text" && m.status === "streaming";
+                              return (
+                                <span
+                                  aria-hidden="true"
+                                  title={
+                                    runningCode
+                                      ? "Koopi Kapi — running code"
+                                      : generating
+                                        ? "Koopi Kapi — responding"
+                                        : "Koopi Kapi"
+                                  }
+                                  className={`relative flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-base ${
+                                    runningCode
+                                      ? "animate-pulse bg-amber-500/15 ring-2 ring-amber-500/50"
+                                      : generating
+                                        ? "animate-pulse bg-accent/15 ring-2 ring-accent/50"
+                                        : "bg-accent/15"
+                                  }`}
+                                >
+                                  🦫
+                                  {runningCode && (
+                                    <Terminal
+                                      className="absolute -bottom-0.5 -right-0.5 h-3.5 w-3.5 rounded-full bg-amber-500 p-0.5 text-white"
+                                      strokeWidth={2.5}
+                                    />
+                                  )}
+                                </span>
+                              );
+                            })()
                           ) : (
                             <Avatar
                               name={author?.username ?? "Someone"}
@@ -853,7 +1650,59 @@ export default function RoomView({
                               <span className="text-xs text-muted">
                                 {timeLabel(m.createdAt)}
                               </span>
+                              {isAgent && m.modelTier && (() => {
+                                // Groq is the primary provider for chat/build; OpenRouter is its
+                                // fallback there, but is the sole (never "fallback") provider for
+                                // code and vision — neither cohere/north-mini-code nor the vision
+                                // model lives anywhere but OpenRouter.
+                                const isFallback =
+                                  m.modelTier !== "code" && m.modelTier !== "vision" && m.modelProvider === "openrouter";
+                                const style =
+                                  m.modelTier === "build"
+                                    ? { icon: Sparkles, label: "Powerful", className: "bg-accent/15 text-accent" }
+                                    : m.modelTier === "code"
+                                      ? { icon: Terminal, label: "Code", className: "bg-blue-500/15 text-blue-400" }
+                                      : m.modelTier === "vision"
+                                        ? { icon: ImageIcon, label: "Vision", className: "bg-violet-500/15 text-violet-400" }
+                                        : { icon: Zap, label: "Efficient", className: "bg-surface text-muted" };
+                                return (
+                                  <span
+                                    title={m.modelProvider && isFallback ? `Served via ${m.modelProvider} (fallback)` : undefined}
+                                    className={`flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${style.className}`}
+                                  >
+                                    <style.icon className="h-2.5 w-2.5" strokeWidth={2.5} />
+                                    {style.label}
+                                    {isFallback ? ` · ${m.modelProvider}` : ""}
+                                  </span>
+                                );
+                              })()}
+                              {isAgent && m.usedRoomMemory && (
+                                <span
+                                  title="This reply drew on room memory — context from other threads in this room"
+                                  className="flex items-center gap-1 rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-medium text-violet-400"
+                                >
+                                  <Brain className="h-2.5 w-2.5" strokeWidth={2.5} />
+                                  Room memory
+                                </span>
+                              )}
+                              {isAgent && m.flagged && (
+                                <span
+                                  title="Koopi flagged a conflict, disagreement, or risk in this reply"
+                                  className="flex items-center gap-1 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-400"
+                                >
+                                  <AlertTriangle className="h-2.5 w-2.5" strokeWidth={2.5} />
+                                  Flagged
+                                </span>
+                              )}
                             </div>
+
+                            {attachmentsByMessage[m.id]?.length > 0 && (
+                              <div className="mb-1.5 mt-1 flex flex-wrap gap-1.5">
+                                {attachmentsByMessage[m.id].map((att) => (
+                                  <AttachmentChip key={att.id} attachment={att} />
+                                ))}
+                              </div>
+                            )}
 
                             {m.type === "tool_call" ? (
                               <div className="mt-1 overflow-hidden rounded-lg border border-border">
@@ -887,12 +1736,33 @@ export default function RoomView({
                               </div>
                             ) : m.type === "tool_result" ? (
                               (() => {
-                                const { stdout, stderr, exit_code } =
+                                const { stdout, stderr, exit_code, streamUrl } =
                                   parseJson<ToolResultPayload>(m.content, {
                                     stdout: "",
                                     stderr: "",
                                     exit_code: 0,
                                   });
+
+                                if (streamUrl) {
+                                  return (
+                                    <div className="mt-1 overflow-hidden rounded-lg border border-accent/40 bg-accent/5">
+                                      <a
+                                        href={streamUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="flex items-center gap-2 px-3 py-2.5 text-sm font-medium text-accent hover:underline"
+                                      >
+                                        <MonitorPlay className="h-4 w-4 shrink-0" strokeWidth={2} />
+                                        Open live view
+                                        <ExternalLink className="h-3.5 w-3.5 shrink-0" strokeWidth={2} />
+                                      </a>
+                                      <p className="border-t border-accent/20 px-3 py-1.5 text-xs text-muted">
+                                        Opens in a new tab — live for about 5 minutes.
+                                      </p>
+                                    </div>
+                                  );
+                                }
+
                                 return (
                                   <div className="mt-1 overflow-hidden rounded-lg border border-border">
                                     <div className="flex items-center justify-between border-b border-border bg-surface px-3 py-1.5 text-xs font-medium text-muted">
@@ -953,6 +1823,24 @@ export default function RoomView({
                         </li>
                       );
                     })}
+                    {isActiveThreadTyping && !isStreaming && (
+                      <li className="flex gap-3">
+                        <span
+                          aria-hidden="true"
+                          title="Koopi Kapi — responding"
+                          className="flex h-8 w-8 shrink-0 animate-pulse items-center justify-center rounded-full bg-accent/15 text-base ring-2 ring-accent/50"
+                        >
+                          🦫
+                        </span>
+                        <div className="flex items-center">
+                          <div className="mt-1 flex items-center gap-1 rounded-lg bg-surface px-4 py-3.5">
+                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.3s]" />
+                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.15s]" />
+                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted" />
+                          </div>
+                        </div>
+                      </li>
+                    )}
                   </ul>
                 )}
                 <div ref={bottomRef} />
@@ -962,14 +1850,72 @@ export default function RoomView({
             {/* ---------- composer ---------- */}
             <div className="shrink-0 border-t border-border bg-background">
               <div className="mx-auto max-w-3xl px-6 py-4">
+                {/* Deliberately the most prominent thing above the composer — this
+                    replaced @-mention tagging entirely, so it has to be impossible to
+                    miss, not a tucked-away setting. */}
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5 rounded-lg border border-border bg-surface px-3 py-2">
+                  <div className="flex items-center gap-2">
+                    <span className="font-display text-sm font-semibold text-foreground">
+                      Should Koopi answer you?
+                    </span>
+                    <div className="flex items-center gap-0.5 rounded-full border border-border bg-background p-0.5">
+                      <button
+                        type="button"
+                        onClick={() => activeThreadId && setMyKoopiActive(activeThreadId, true)}
+                        aria-pressed={myKoopiActive}
+                        className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                          myKoopiActive
+                            ? "bg-accent text-accent-foreground"
+                            : "text-muted hover:bg-surface hover:text-foreground"
+                        }`}
+                      >
+                        Yes
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => activeThreadId && setMyKoopiActive(activeThreadId, false)}
+                        aria-pressed={!myKoopiActive}
+                        className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                          !myKoopiActive
+                            ? "bg-accent text-accent-foreground"
+                            : "text-muted hover:bg-surface hover:text-foreground"
+                        }`}
+                      >
+                        No
+                      </button>
+                    </div>
+                  </div>
+                  {othersKoopiActive.length > 0 && (
+                    <span className="text-xs text-muted">
+                      Koopi also answers: {othersKoopiActive.join(", ")}
+                    </span>
+                  )}
+                </div>
+
                 <div className="mb-2 flex items-center justify-end gap-1.5">
                   <span className="text-xs text-muted">Model</span>
                   <div className="flex items-center gap-0.5 rounded-full border border-border bg-surface p-0.5">
                     {(
                       [
-                        { key: "auto", label: "Auto", icon: Wand2, title: "Auto — picks the right model per message" },
-                        { key: "chat", label: "Efficient", icon: Zap, title: "Efficient — always use the fast, cheaper model" },
-                        { key: "build", label: "Powerful", icon: Sparkles, title: "Powerful — always use the stronger model" },
+                        {
+                          key: "auto",
+                          label: "Auto",
+                          icon: Wand2,
+                          title:
+                            "Auto — automatically picks based on your message: Powerful for code/build tasks, Efficient for quick questions.",
+                        },
+                        {
+                          key: "chat",
+                          label: "Efficient",
+                          icon: Zap,
+                          title: "Efficient — fast, lightweight model for casual questions and quick replies.",
+                        },
+                        {
+                          key: "build",
+                          label: "Powerful",
+                          icon: Sparkles,
+                          title: "Powerful — more capable model for code generation and complex tasks.",
+                        },
                       ] as const
                     ).map(({ key, label, icon: Icon, title }) => (
                       <button
@@ -1013,7 +1959,82 @@ export default function RoomView({
                   </div>
                 )}
 
-                <form onSubmit={handleSend} className="relative flex items-end gap-2">
+                {pendingFiles.length > 0 && (
+                  <div className="mb-2 flex flex-wrap gap-1.5">
+                    {pendingFiles.map((file, i) => (
+                      <span
+                        key={`${file.name}-${i}`}
+                        className="flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-foreground"
+                      >
+                        {file.type.startsWith("image/") ? (
+                          <ImageIcon className="h-3 w-3 shrink-0 text-muted" strokeWidth={1.75} />
+                        ) : (
+                          <FileText className="h-3 w-3 shrink-0 text-muted" strokeWidth={1.75} />
+                        )}
+                        <span className="max-w-[160px] truncate">{file.name}</span>
+                        <button
+                          type="button"
+                          onClick={() => setPendingFiles((prev) => prev.filter((_, j) => j !== i))}
+                          aria-label={`Remove ${file.name}`}
+                          className="text-muted transition-colors hover:text-red-500"
+                        >
+                          <X className="h-3 w-3" strokeWidth={2} />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                <form
+                  onSubmit={handleSend}
+                  onDragOver={(e) => {
+                    // Files (not, say, a dragged mention chip or text
+                    // selection) is the one thing worth reacting to here —
+                    // dataTransfer.types is readable during dragover even
+                    // though the actual file list isn't until drop.
+                    if (!e.dataTransfer.types.includes("Files")) return;
+                    e.preventDefault(); // required for onDrop to fire at all
+                    setComposerDragOver(true);
+                  }}
+                  onDragLeave={(e) => {
+                    // Only clear once the pointer actually leaves the form,
+                    // not on every child-to-child move within it (each of
+                    // those fires its own leave+enter pair as the pointer
+                    // crosses element boundaries).
+                    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+                    setComposerDragOver(false);
+                  }}
+                  onDrop={(e) => {
+                    if (!e.dataTransfer.files.length) return;
+                    e.preventDefault();
+                    setComposerDragOver(false);
+                    addPendingFiles(e.dataTransfer.files);
+                  }}
+                  className={`relative flex items-end gap-2 rounded-lg transition-colors ${
+                    composerDragOver ? "outline outline-2 outline-offset-2 outline-accent" : ""
+                  }`}
+                >
+                  <input
+                    ref={attachInputRef}
+                    type="file"
+                    multiple
+                    accept="image/png,image/jpeg,image/webp,application/pdf"
+                    onChange={(e) => {
+                      addPendingFiles(e.target.files ?? []);
+                      e.target.value = ""; // allow re-picking the same file after removing it
+                    }}
+                    className="hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => attachInputRef.current?.click()}
+                    disabled={isStreaming}
+                    title="Attach a screenshot or PDF"
+                    aria-label="Attach a file"
+                    className="flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-lg border border-border text-muted transition-colors hover:text-foreground disabled:opacity-40"
+                  >
+                    <Paperclip className="h-4 w-4" strokeWidth={1.75} />
+                  </button>
                   {mentionState && mentionOptions.length > 0 && (
                     <ul className="absolute bottom-full left-0 mb-1.5 w-56 overflow-hidden rounded-lg border border-border bg-surface shadow-xl">
                       {mentionOptions.map((name, i) => (
@@ -1028,20 +2049,11 @@ export default function RoomView({
                                 : "text-foreground hover:bg-background"
                             }`}
                           >
-                            {name === KOOPI_MENTION ? (
-                              <span
-                                aria-hidden="true"
-                                className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent/15 text-xs"
-                              >
-                                🦫
-                              </span>
-                            ) : (
-                              <Avatar
-                                name={name}
-                                src={mentionMemberByName.get(name)?.avatarUrl ?? null}
-                                size="sm"
-                              />
-                            )}
+                            <Avatar
+                              name={name}
+                              src={mentionMemberByName.get(name)?.avatarUrl ?? null}
+                              size="sm"
+                            />
                             {name}
                           </button>
                         </li>
@@ -1061,18 +2073,12 @@ export default function RoomView({
                     onChange={handleComposerChange}
                     onKeyDown={onInputKeyDown}
                     onBlur={() => setMentionState(null)}
-                    placeholder={
-                      isStreaming
-                        ? "Koopi is responding…"
-                        : requiresMention
-                          ? "Message the room… (tag @Koopi for a response)"
-                          : "Message the room…"
-                    }
+                    placeholder={isStreaming ? "Koopi is responding…" : "Message the room…"}
                     className="max-h-40 min-h-[46px] flex-1 resize-y rounded-lg border border-border bg-surface px-4 py-3 text-sm text-foreground placeholder:text-muted focus:border-accent focus:outline-none disabled:opacity-60"
                   />
                   <button
                     type="submit"
-                    disabled={isStreaming || sending || !draft.trim()}
+                    disabled={isStreaming || sending || (!draft.trim() && pendingFiles.length === 0)}
                     aria-label="Send"
                     className="flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-lg bg-accent text-accent-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
                   >
@@ -1081,7 +2087,39 @@ export default function RoomView({
                 </form>
               </div>
             </div>
-          </>
+          </div>
+
+          {projectPanelOpen && project && (
+            <>
+              <div className="hidden md:block">
+                <ResizeHandle
+                  onMouseDown={onCodePanelHandleMouseDown}
+                  onDoubleClick={onCodePanelHandleDoubleClick}
+                />
+              </div>
+              <div
+                style={{ width: codePanelWidth }}
+                // Deliberate elevation/border break from the chat column,
+                // same "distinct pane" language RoomSidebar's border-r
+                // already uses on the opposite edge — the two modes
+                // shouldn't blend together at a glance.
+                className="hidden shrink-0 border-l border-border bg-surface md:flex md:flex-col"
+              >
+                <ProjectPanel
+                  projectId={project.id}
+                  files={sortedProjectFiles}
+                  runState={project}
+                  currentUserId={currentUserId}
+                  currentUserRole={currentUserRole}
+                  memberById={memberById}
+                  canWriteDirectly={canEditProjectDirectly}
+                  onProposeChange={proposeProjectFileChange}
+                  onActiveFileChange={setActiveProjectFile}
+                />
+              </div>
+            </>
+          )}
+          </div>
         )}
       </div>
 
@@ -1092,6 +2130,16 @@ export default function RoomView({
           invitable={members.filter((m) => m.userId !== currentUserId)}
           onCreated={handleThreadCreated}
           onClose={() => setNewChatOpen(false)}
+        />
+      )}
+
+      {membersModalOpen && (
+        <RoomMembersModal
+          roomId={roomId}
+          members={members}
+          currentUserId={currentUserId}
+          isOwner={isOwner}
+          onClose={() => setMembersModalOpen(false)}
         />
       )}
     </div>

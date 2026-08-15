@@ -1,0 +1,22 @@
+-- Durable "stop this reply" signal, independent of whichever message row
+-- happens to have status='streaming' at the moment someone clicks Stop.
+--
+-- The chat loop in app/api/chat/route.ts can run several rounds (run_code /
+-- open_gui_session, then another model call, then another tool call...) and
+-- between rounds there are real gaps — sometimes several seconds long, once
+-- a model call has to fail over through two or three providers — where no
+-- message row is status='streaming' at all. The old interrupt mechanism was
+-- purely "flip the currently-streaming row to interrupted and let its own
+-- ticker notice" — during one of these gaps there's nothing to flip, so
+-- clicking Stop was a silent no-op, and the loop had no way to know a stop
+-- had been requested by the time its next round started.
+--
+-- stop_requested_at is set unconditionally by Stop (regardless of whether a
+-- row is currently streaming) and polled once at the top of every round —
+-- a signal that survives the gaps the old per-row trick couldn't see across.
+--
+-- No new RLS policy needed: the existing "participants can update room
+-- threads" UPDATE policy already covers any column on this row (RLS is
+-- row-level, not column-level) — same reasoning as sandbox_id before it.
+ALTER TABLE public.threads
+  ADD COLUMN IF NOT EXISTS stop_requested_at timestamptz;

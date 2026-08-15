@@ -4,7 +4,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, MoreVertical, PanelLeft, Pencil, Plus, Trash2 } from "lucide-react";
 import { presenceOf, PRESENCE_DOT, type Presence } from "@/lib/presence";
 import { createClient } from "@/lib/supabase/client";
+import { useResizableWidth } from "@/lib/useResizableWidth";
+import ResizeHandle from "@/components/ResizeHandle";
 import type { RoomMember, Thread } from "@/components/RoomView";
+
+const SIDEBAR_DEFAULT_WIDTH = 288; // matches the old fixed w-72
+const SIDEBAR_MIN_WIDTH = 220;
+const SIDEBAR_MAX_WIDTH = 420;
 
 const LABEL_MAX_LENGTH = 30;
 const PRESENCE_RANK: Record<Presence, number> = { online: 0, idle: 1, away: 2 };
@@ -49,6 +55,7 @@ type Section = {
 export default function RoomSidebar({
   threads,
   threadParticipants,
+  unreadThreadIds,
   members,
   activeThreadId,
   currentUserId,
@@ -60,6 +67,7 @@ export default function RoomSidebar({
 }: {
   threads: Thread[];
   threadParticipants: Record<string, string[]>;
+  unreadThreadIds: Set<string>;
   members: RoomMember[];
   activeThreadId: string | null;
   currentUserId: string;
@@ -75,6 +83,14 @@ export default function RoomSidebar({
   const [renameDraft, setRenameDraft] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
   const menuRefs = useRef(new Map<string, HTMLDivElement>());
+
+  const { width, onHandleMouseDown, onHandleDoubleClick } = useResizableWidth({
+    storageKey: "koopi:sidebar-width",
+    defaultWidth: SIDEBAR_DEFAULT_WIDTH,
+    min: SIDEBAR_MIN_WIDTH,
+    max: SIDEBAR_MAX_WIDTH,
+    direction: "right",
+  });
 
   useEffect(() => {
     if (!menuOpenId) return;
@@ -175,7 +191,8 @@ export default function RoomSidebar({
       )}
 
       <aside
-        className={`fixed inset-y-0 left-0 z-40 flex w-72 shrink-0 flex-col border-r border-border bg-surface transition-transform duration-200 lg:static lg:z-auto lg:translate-x-0 ${
+        style={{ width }}
+        className={`fixed inset-y-0 left-0 z-40 flex shrink-0 flex-col border-r border-border bg-surface transition-transform duration-200 lg:static lg:z-auto lg:translate-x-0 ${
           open ? "translate-x-0" : "-translate-x-full lg:hidden"
         }`}
       >
@@ -250,6 +267,7 @@ export default function RoomSidebar({
                         const isRenaming = renamingId === t.id;
                         const isBusy = busyId === t.id;
                         const canDelete = t.createdBy === currentUserId;
+                        const unread = unreadThreadIds.has(t.id);
 
                         return (
                           <li key={t.id}>
@@ -280,9 +298,20 @@ export default function RoomSidebar({
                                   aria-current={active ? "true" : undefined}
                                   className="flex min-w-0 flex-1 items-start gap-2 text-left disabled:opacity-50"
                                 >
+                                  {unread && (
+                                    <span
+                                      aria-hidden="true"
+                                      title="Unread"
+                                      className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
+                                    />
+                                  )}
                                   <span
                                     className={`min-w-0 flex-1 truncate font-sans text-sm ${
-                                      active ? "text-foreground" : "text-foreground/85"
+                                      unread
+                                        ? "font-semibold text-foreground"
+                                        : active
+                                          ? "text-foreground"
+                                          : "text-foreground/85"
                                     }`}
                                   >
                                     {t.title?.trim() || "New chat"}
@@ -355,6 +384,13 @@ export default function RoomSidebar({
           )}
         </div>
       </aside>
+
+      {/* Resizing only makes sense against the static desktop layout (the
+          sidebar is always visible there, regardless of `open`) — on the
+          mobile drawer this would just be dragging inside an overlay. */}
+      <div className="hidden lg:block">
+        <ResizeHandle onMouseDown={onHandleMouseDown} onDoubleClick={onHandleDoubleClick} />
+      </div>
     </>
   );
 }

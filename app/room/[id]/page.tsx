@@ -8,7 +8,11 @@ import RoomView, {
   type ChatMessage,
   type RoomMember,
   type Thread,
+  type Project,
+  type ProjectFile,
+  type MessageAttachment,
 } from "@/components/RoomView";
+import { type Personality } from "@/components/PersonalitySelector";
 
 function firstOf<T>(value: T | T[] | null): T | null {
   return Array.isArray(value) ? (value[0] ?? null) : (value ?? null);
@@ -19,6 +23,7 @@ type ParticipantRow = {
   display_name: string | null;
   last_seen_at: string | null;
   joined_at: string | null;
+  role: "owner" | "admin" | "member";
   profiles:
     | { username: string | null; avatar_url: string | null }
     | { username: string | null; avatar_url: string | null }[]
@@ -78,7 +83,7 @@ export default async function RoomPage({
   const { data: participantRows } = await supabase
     .from("participants")
     .select(
-      "user_id, display_name, last_seen_at, joined_at, profiles(username, avatar_url)"
+      "user_id, display_name, last_seen_at, joined_at, role, profiles(username, avatar_url)"
     )
     .eq("room_id", id);
 
@@ -117,9 +122,18 @@ export default async function RoomPage({
     );
   }
 
+  // select("*") deliberately, not an explicit column list — confirmed live
+  // against this project (a direct REST probe, not assumed) that naming a
+  // column PostgREST doesn't have yet HARD-FAILS THE WHOLE QUERY (42703),
+  // not just that one field: `select=id,personality` on a threads table
+  // without the column errors outright, while `select=*` succeeds and
+  // simply omits it. Naming `personality` explicitly here — before this
+  // migration is applied — would have taken down the entire thread list
+  // (threadRows -> null -> initialThreads -> [] -> no sidebar, no active
+  // thread, nothing), not just degraded the personality feature alone.
   const { data: threadRows } = await supabase
     .from("threads")
-    .select("id, created_by, title, created_at, updated_at")
+    .select("*")
     .eq("room_id", id)
     .order("updated_at", { ascending: false });
 
@@ -129,6 +143,9 @@ export default async function RoomPage({
     title: t.title,
     createdAt: t.created_at,
     updatedAt: t.updated_at,
+    // Undefined (not present in the row at all) until the migration above
+    // is applied — falls back to "default" the same as a genuine NULL.
+    personality: (t.personality as Personality | null | undefined) ?? "default",
   }));
 
   const threadIds = initialThreads.map((t) => t.id);
@@ -137,14 +154,28 @@ export default async function RoomPage({
   const { data: threadParticipantRows } = threadIds.length
     ? await supabase
         .from("thread_participants")
-        .select("thread_id, user_id, seq")
+        .select("thread_id, user_id, seq, last_read_at, koopi_active")
         .in("thread_id", threadIds)
         .order("seq", { ascending: true })
     : { data: [] };
 
   const initialThreadParticipants: Record<string, string[]> = {};
+  // Only the current user's own last_read_at is meaningful client-side — unread state
+  // is per-viewer, not a shared property of the thread.
+  const initialLastReadAt: Record<string, string | null> = {};
+  // The current user's own "Ask Koopi" setting per thread — what actually gates whether
+  // their own messages trigger a reply.
+  const initialKoopiActive: Record<string, boolean> = {};
+  // Every participant's setting, per thread — powers the "who else Koopi answers" hint
+  // next to the toggle, since each person's setting is independent.
+  const initialParticipantKoopiActive: Record<string, Record<string, boolean>> = {};
   for (const row of threadParticipantRows ?? []) {
     (initialThreadParticipants[row.thread_id] ??= []).push(row.user_id);
+    if (row.user_id === user.id) {
+      initialLastReadAt[row.thread_id] = row.last_read_at;
+      initialKoopiActive[row.thread_id] = row.koopi_active;
+    }
+    (initialParticipantKoopiActive[row.thread_id] ??= {})[row.user_id] = row.koopi_active;
   }
 
   // Every thread in the room loads at once — switching threads is then a local
@@ -152,7 +183,7 @@ export default async function RoomPage({
   const { data: messageRows } = await supabase
     .from("messages")
     .select(
-      "id, thread_id, sender_type, sender_id, content, status, type, interrupted_by, created_at"
+      "id, thread_id, sender_type, sender_id, content, status, type, interrupted_by, created_at, model_tier, model_provider, used_room_memory, flagged"
     )
     .eq("room_id", id)
     .order("created_at", { ascending: true });
@@ -167,6 +198,80 @@ export default async function RoomPage({
     type: m.type ?? "text",
     interruptedBy: m.interrupted_by ?? null,
     createdAt: m.created_at,
+    modelTier: m.model_tier ?? null,
+    modelProvider: m.model_provider ?? null,
+    usedRoomMemory: m.used_room_memory ?? false,
+    flagged: m.flagged ?? false,
+  }));
+
+  // Project mode: one project per room (not per thread) — replaces the old
+  // thread_files single-file-per-thread model. Not lazily created here;
+  // RoomView creates it client-side the first time anyone opens the panel,
+  // so a room nobody has opened Project on yet simply has no project row.
+  const { data: projectRow } = await supabase
+    .from("projects")
+    .select(
+      "id, room_id, name, created_by, run_status, run_entry_path, run_owner_id, last_run_stdout, last_run_stderr, last_run_exit_code, last_run_at, last_run_by"
+    )
+    .eq("room_id", id)
+    .maybeSingle();
+
+  const initialProject: Project | null = projectRow
+    ? {
+        id: projectRow.id,
+        roomId: projectRow.room_id,
+        name: projectRow.name ?? "Project",
+        createdBy: projectRow.created_by,
+        status: (projectRow.run_status as "idle" | "running") ?? "idle",
+        entryPath: projectRow.run_entry_path,
+        runOwnerId: projectRow.run_owner_id,
+        lastRunStdout: projectRow.last_run_stdout,
+        lastRunStderr: projectRow.last_run_stderr,
+        lastRunExitCode: projectRow.last_run_exit_code,
+        lastRunAt: projectRow.last_run_at,
+        lastRunBy: projectRow.last_run_by,
+      }
+    : null;
+
+  const { data: projectFileRows } = projectRow
+    ? await supabase
+        .from("project_files")
+        .select("id, project_id, path, content, language, last_edited_by, updated_at")
+        .eq("project_id", projectRow.id)
+    : { data: [] };
+
+  const initialProjectFiles: ProjectFile[] = (projectFileRows ?? []).map((row) => ({
+    id: row.id,
+    projectId: row.project_id,
+    path: row.path,
+    content: row.content ?? "",
+    language: row.language ?? "python",
+    lastEditedBy: row.last_edited_by,
+    updatedAt: row.updated_at,
+  }));
+
+  const messageIds = initialMessages.map((m) => m.id);
+  const { data: attachmentRows, error: attachmentRowsError } = messageIds.length
+    ? await supabase
+        .from("message_attachments")
+        .select("id, message_id, storage_path, filename, mime_type, kind")
+        .in("message_id", messageIds)
+    : { data: [], error: null };
+  // Was silently discarded before — same "migration not applied yet" gap
+  // confirmed live this session via a direct probe against this project's
+  // Supabase REST API. Still degrades to an empty attachment list either
+  // way (nothing here depends on this succeeding), just not silently.
+  if (attachmentRowsError) {
+    console.warn("RoomPage: message_attachments query failed (migration not applied?):", attachmentRowsError);
+  }
+
+  const initialAttachments: MessageAttachment[] = (attachmentRows ?? []).map((a) => ({
+    id: a.id,
+    messageId: a.message_id,
+    storagePath: a.storage_path,
+    filename: a.filename,
+    mimeType: a.mime_type,
+    kind: a.kind as MessageAttachment["kind"],
   }));
 
   const initialMembers: RoomMember[] = participants.map((p) => {
@@ -177,6 +282,7 @@ export default async function RoomPage({
       avatarUrl: prof?.avatar_url ?? null,
       lastSeenAt: p.last_seen_at,
       joinedAt: p.joined_at,
+      role: p.role ?? "member",
     };
   });
 
@@ -191,6 +297,12 @@ export default async function RoomPage({
       initialMembers={initialMembers}
       initialThreads={initialThreads}
       initialThreadParticipants={initialThreadParticipants}
+      initialLastReadAt={initialLastReadAt}
+      initialKoopiActive={initialKoopiActive}
+      initialParticipantKoopiActive={initialParticipantKoopiActive}
+      initialProject={initialProject}
+      initialProjectFiles={initialProjectFiles}
+      initialAttachments={initialAttachments}
     />
   );
 }
