@@ -134,6 +134,51 @@ function isFolderMarker(path: string): boolean {
   return path === FOLDER_MARKER || path.endsWith(`/${FOLDER_MARKER}`);
 }
 
+// Recognizes a run_code call that's pure filesystem reconnaissance — ls, find,
+// cat, head, grep, echo, and the like, with nothing actually created — as
+// opposed to real code someone asked to run. Confirmed live as the actual
+// mechanism behind a pile of disconnected, numbered "project files"
+// (restyle_the_app_with.sh, restyle_the_app_with_2.sh, _3.sh, ...): before
+// Koopi had any live view of the project's current files (see
+// projectFilesContextBlock), its only way to answer "does this already have
+// Tailwind" was to run a shell command and look — and syncProjectFile saves
+// EVERY run_code call as its own reviewable file unconditionally, so each
+// one-off "let me check" command became its own pending change, with
+// chooseFileTarget's classifier reasonably treating each new inspection
+// command as a distinct little task and numbering it. A pure lookaround
+// command was never a deliverable anyone asked for or would ever want to
+// approve as real project history — it shouldn't become a file at all.
+// Deliberately conservative (whitelist, not blacklist, and bash/shell/sh
+// only — Python or JS "exploration" isn't covered): only skips saving when
+// EVERY command segment is unambiguously read-only with nothing written
+// anywhere, so a real script that happens to start with `ls` is never
+// silently dropped — this only ever makes syncProjectFile skip a save it
+// would otherwise have made, never the reverse.
+const READONLY_SHELL_VERBS = new Set([
+  "ls", "cat", "find", "head", "tail", "grep", "pwd", "echo", "wc", "file", "tree", "which",
+]);
+function looksLikePureDiagnosticShell(code: string, language: string): boolean {
+  if (!["bash", "shell", "sh"].includes(language.trim().toLowerCase())) return false;
+  const segments = code
+    .split(/\r?\n|;|&&|\|\|/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!segments.length) return false;
+  return segments.every((segment) => {
+    // 2>/dev/null, >/dev/null, and 2>&1 are the standard "don't clutter the
+    // output with noise" idioms every one of the confirmed-live examples
+    // used — real, harmless redirects that shouldn't trip the "did this
+    // write something" check below.
+    const sanitized = segment
+      .replace(/2>&1/g, "")
+      .replace(/\d*>\s*\/dev\/null/g, "");
+    if (/[><]/.test(sanitized)) return false;
+    if (/\b(mkdir|touch|rm|cp|mv|npm|pip|git|python|node|npx)\b/.test(segment)) return false;
+    const verb = segment.split(/\s+/)[0];
+    return READONLY_SHELL_VERBS.has(verb);
+  });
+}
+
 const SYSTEM_PROMPT = `You are Koopi, a coding agent in a shared multiplayer session.
 
 Several teammates may be in the room at once. Each human turn is prefixed with the
@@ -206,6 +251,18 @@ window (Tkinter, Pygame, or any other GUI toolkit), it will crash there with a
 to fake a display by opening a browser, generating a URL yourself, writing an
 image to disk, or any other trick — none of that makes a GUI visible to the
 person.
+
+Do NOT use run_code to look around this room's Project — an "ls", "find", or
+"cat" just to check what files already exist or what they contain. The
+[PROJECT FILES] listing later in this prompt (when this room has one) already
+shows you every current file and its actual live content on every single
+turn; check that first. Every run_code call becomes its own saved, reviewable
+project file — a one-off lookaround command isn't a deliverable anyone asked
+for, and several of them back-to-back for the same underlying question
+becomes a pile of disconnected, numbered files nobody will ever approve as
+real change history. Only reach for run_code to genuinely inspect something
+the file listing can't show you (e.g. what's actually installed in the
+sandbox's runtime environment).
 
 You also have a web_search tool that performs a REAL web search and returns
 actual results (title, url, a short snippet of the page) plus a short
@@ -2203,6 +2260,10 @@ export async function POST(request: Request) {
   // LATER retry in this thread can find it via resolveContinuationHint.
   async function syncProjectFile(code: string, language: string): Promise<string | null> {
     if (!code.trim()) return null;
+    // See looksLikePureDiagnosticShell's own comment — a run_code call that's
+    // just Koopi looking around (ls, find, cat, ...) isn't a deliverable and
+    // shouldn't become its own reviewable project file.
+    if (looksLikePureDiagnosticShell(code, language)) return null;
 
     // A "Discuss this file" thread (contextProjectFileId set) never lets
     // Koopi pick a target file at all — chooseFileTarget's whole job is
