@@ -68,7 +68,15 @@ export default function PersonalitySelector({
     });
 
     setSaving(false);
-    if (error) onChanged(prev);
+    if (error) {
+      // The optimistic onChanged(next) above already visibly reverts here —
+      // this is just for debuggability, not a new user-facing surface: a
+      // low-stakes, one-click-to-retry preference toggle doesn't carry the
+      // same "did my approval actually land" stakes the other fixes this
+      // session addressed.
+      console.error(`PersonalitySelector: failed to save personality for thread ${threadId}`, error);
+      onChanged(prev);
+    }
   }
 
   const current = PERSONALITIES.find((p) => p.key === personality) ?? PERSONALITIES[0];

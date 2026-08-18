@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Crown, Shield, User as UserIcon, X } from "lucide-react";
 import Avatar from "@/components/Avatar";
 import { createClient } from "@/lib/supabase/client";
@@ -40,14 +40,26 @@ export default function RoomMembersModal({
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
 
+  // Same silent-failure gap this session already fixed twice elsewhere
+  // (ProjectChanges.tsx's approve/reject, RoomMembersModal's own dropdown
+  // was still console-only) — a real failure here (network blip, a stale
+  // `isOwner` prop letting a click through that the RPC itself then
+  // correctly rejects) left the dropdown just silently not changing, with
+  // nothing telling the person who clicked it why.
+  const [error, setError] = useState<string | null>(null);
+
   async function changeRole(userId: string, role: "admin" | "member") {
+    setError(null);
     const supabase = createClient();
-    const { error } = await supabase.rpc("set_participant_role", {
+    const { error: rpcError } = await supabase.rpc("set_participant_role", {
       p_room_id: roomId,
       p_user_id: userId,
       p_role: role,
     });
-    if (error) console.error("RoomMembersModal: failed to set role", error);
+    if (rpcError) {
+      console.error("RoomMembersModal: failed to set role", rpcError);
+      setError(rpcError.message || "Couldn't change that member's role — try again.");
+    }
   }
 
   return (
@@ -69,6 +81,10 @@ export default function RoomMembersModal({
             <X className="h-4 w-4" strokeWidth={1.75} />
           </button>
         </div>
+
+        {error && (
+          <p className="mb-3 rounded-md bg-red-500/10 px-2.5 py-2 text-xs text-red-500">{error}</p>
+        )}
 
         <div className="max-h-96 space-y-1 overflow-y-auto">
           {members.map((m) => {

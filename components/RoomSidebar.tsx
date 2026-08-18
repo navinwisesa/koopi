@@ -82,6 +82,25 @@ export default function RoomSidebar({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
+  // saveRename/handleDelete never checked `.error` at all (not even a
+  // console.error) — a failure there, whether from RLS quietly rejecting a
+  // non-creator's rename or a genuine network blip, looked identical to
+  // success: the input just closed and reverted to the old title with
+  // nothing telling the person why it didn't stick. Same self-clearing
+  // banner shape used elsewhere in this app for exactly this class of gap.
+  const [actionError, setActionError] = useState<string | null>(null);
+  const actionErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function showActionError(message: string) {
+    setActionError(message);
+    if (actionErrorTimerRef.current) clearTimeout(actionErrorTimerRef.current);
+    actionErrorTimerRef.current = setTimeout(() => setActionError(null), 6000);
+  }
+  useEffect(
+    () => () => {
+      if (actionErrorTimerRef.current) clearTimeout(actionErrorTimerRef.current);
+    },
+    []
+  );
   const menuRefs = useRef(new Map<string, HTMLDivElement>());
 
   const { width, onHandleMouseDown, onHandleDoubleClick } = useResizableWidth({
@@ -165,8 +184,12 @@ export default function RoomSidebar({
     if (!trimmed) return;
 
     setBusyId(threadId);
-    await createClient().from("threads").update({ title: trimmed }).eq("id", threadId);
+    const { error } = await createClient().from("threads").update({ title: trimmed }).eq("id", threadId);
     setBusyId(null);
+    if (error) {
+      console.error(`RoomSidebar: failed to rename thread ${threadId}`, error);
+      showActionError(`Couldn't rename that chat — ${error.message || "try again"}.`);
+    }
   }
 
   async function handleDelete(t: Thread) {
@@ -175,8 +198,12 @@ export default function RoomSidebar({
     if (!window.confirm(`Delete "${label}"? This can't be undone.`)) return;
 
     setBusyId(t.id);
-    await createClient().from("threads").delete().eq("id", t.id);
+    const { error } = await createClient().from("threads").delete().eq("id", t.id);
     setBusyId(null);
+    if (error) {
+      console.error(`RoomSidebar: failed to delete thread ${t.id}`, error);
+      showActionError(`Couldn't delete "${label}" — ${error.message || "try again"}.`);
+    }
   }
 
   return (
@@ -217,6 +244,12 @@ export default function RoomSidebar({
             <PanelLeft className="h-4 w-4" strokeWidth={1.75} />
           </button>
         </div>
+
+        {actionError && (
+          <p className="mx-3 mt-3 rounded-md bg-red-500/10 px-2.5 py-2 text-xs text-red-500">
+            {actionError}
+          </p>
+        )}
 
         {/* ---------- chat directory ---------- */}
         <div className="px-5 pb-2 pt-4">
