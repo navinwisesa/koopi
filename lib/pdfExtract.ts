@@ -1,4 +1,5 @@
 import { PDFParse } from "pdf-parse";
+import { createWorker } from "tesseract.js";
 
 // Below this many extracted characters per page, a PDF reads as
 // image-heavy/scanned rather than real body text — e.g. a screenshot of an
@@ -25,6 +26,38 @@ export type PdfExtraction = {
   // model's image_url content part.
   pageImageDataUrls: string[];
 };
+
+/**
+ * Real OCR (Tesseract, WASM, runs locally — no external API/key needed) on
+ * the same rendered page images the vision-model fallback already uses.
+ * Previously those images were ONLY ever handed to a vision model — no
+ * actual text ever came out of a scanned/image-heavy PDF, so nothing here
+ * was searchable, quotable, or usable if a request ever skipped the vision
+ * path. This gives the sparse-text case real extracted text on top of (not
+ * instead of) the images, best-effort: an OCR failure degrades to
+ * text-and-images-only, exactly like a screenshot-rendering failure already
+ * degrades to text-only above.
+ */
+async function runOcr(pageImageDataUrls: string[]): Promise<string> {
+  if (!pageImageDataUrls.length) return "";
+  const worker = await createWorker("eng");
+  try {
+    const pages: string[] = [];
+    for (let i = 0; i < pageImageDataUrls.length; i++) {
+      const {
+        data: { text: pageText },
+      } = await worker.recognize(pageImageDataUrls[i]);
+      const trimmed = pageText.trim();
+      if (trimmed) pages.push(`[page ${i + 1}]\n${trimmed}`);
+    }
+    return pages.join("\n\n");
+  } catch (err) {
+    console.warn("extractPdf: OCR pass failed:", err);
+    return "";
+  } finally {
+    await worker.terminate().catch(() => {});
+  }
+}
 
 /**
  * Extracts text from a PDF, and — only when the extracted text looks too
@@ -57,7 +90,15 @@ export async function extractPdf(data: Buffer): Promise<PdfExtraction> {
       const pageImageDataUrls = shots.pages
         .map((p) => p.dataUrl)
         .filter((u): u is string => Boolean(u));
-      return { text, pageCount, pageImageDataUrls };
+
+      const ocrText = await runOcr(pageImageDataUrls);
+      const combinedText = ocrText
+        ? text
+          ? `${text}\n\n--- OCR text from image-heavy pages ---\n\n${ocrText}`
+          : ocrText
+        : text;
+
+      return { text: combinedText, pageCount, pageImageDataUrls };
     } catch (err) {
       // Rendering is the riskier half (real rasterization work) — losing it
       // still leaves whatever text (if any) was extracted.
