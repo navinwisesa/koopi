@@ -1385,6 +1385,66 @@ export async function POST(request: Request) {
     );
   }
 
+  // Every regular room thread (i.e. NOT a "Discuss this file" thread —
+  // fileContextBlock above already covers that one) is where Koopi's actual
+  // project editing happens: restyle the CSS, then come back later in the
+  // same thread and just ask for the slogan to change. Before this, that
+  // second turn had zero live visibility into what was actually approved
+  // for the first — only its own memory of the tool call from earlier in
+  // the conversation (capped at MAX_HISTORY messages, and never reflecting
+  // an approval that landed after the model's own last mention of the
+  // file). Since scaffold_web_app and the plain-fenced-file path both
+  // regenerate "the complete current file" from scratch every time (see
+  // [PROJECT FILES] above), any drift between what the model *remembers*
+  // writing and what's actually live in project_files.content came back as
+  // a silent regression on the very next unrelated edit — confirmed live:
+  // approve a Member's CSS restyle, then ask for an unrelated slogan
+  // change, and the CSS reverts because the model regenerated it from a
+  // stale/half-remembered version instead of copying the approved bytes
+  // forward untouched. Deliberately a read-only lookup (not
+  // ensureRoomProjectId, which lazily CREATES a project and is defined
+  // later in this handler — calling it this early would touch its
+  // `let cachedProjectId` before that declaration runs) — if no project
+  // exists yet there's nothing to show anyway.
+  const PROJECT_CONTEXT_MAX_CHARS = 20000;
+  async function projectFilesContextBlock(): Promise<string> {
+    const { data: project } = await supabase
+      .from("projects")
+      .select("id")
+      .eq("room_id", roomId)
+      .maybeSingle();
+    if (!project) return "";
+    const { data: files } = await supabase
+      .from("project_files")
+      .select("path, content, language")
+      .eq("project_id", project.id)
+      .order("path");
+    const real = (files ?? []).filter((f) => !isFolderMarker(f.path) && f.content);
+    if (!real.length) return "";
+
+    let used = 0;
+    const blocks = real.map((f) => {
+      const block = `### ${f.path}\n\`\`\`${f.language}\n${f.content}\n\`\`\`\n`;
+      if (used + block.length > PROJECT_CONTEXT_MAX_CHARS) {
+        return `### ${f.path}\n(too large to include here — ${f.content.length} chars; open "Discuss this file" to see it)\n`;
+      }
+      used += block.length;
+      return block;
+    });
+
+    return (
+      `\n\nThis room's Project currently contains these files. This is their exact, ` +
+      `live, currently-approved content — not necessarily what you wrote or proposed ` +
+      `earlier in this conversation, since an owner/admin's approval, a direct edit, ` +
+      `or another thread's change can all land here without appearing in this ` +
+      `thread's own history. When scaffold_web_app or a fenced-file edit rewrites ` +
+      `"the complete current file" (see [PROJECT FILES] above), copy every file you ` +
+      `are NOT intentionally changing forward exactly as shown here — never ` +
+      `regenerate an untouched file from memory:\n\n` +
+      blocks.join("\n")
+    );
+  }
+
   const [roomMemory, threadContext] = await Promise.all([getRoomMemory(), getThreadContext()]);
   const { personality, contextProjectFileId } = threadContext;
 
@@ -1393,7 +1453,9 @@ export async function POST(request: Request) {
       ? `${SYSTEM_PROMPT}\n\nRoom memory (prior activity in this room, across other threads):\n${roomMemory}`
       : SYSTEM_PROMPT) +
     personalityBlock(personality) +
-    (await fileContextBlock(contextProjectFileId));
+    (contextProjectFileId
+      ? await fileContextBlock(contextProjectFileId)
+      : await projectFilesContextBlock());
 
   const isRateLimited = (err: unknown) =>
     err instanceof Groq.RateLimitError || err instanceof OpenAI.RateLimitError;
