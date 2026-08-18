@@ -761,6 +761,33 @@ function isPlausibleRelativePath(p: string): boolean {
   return segments.every((seg) => seg.length > 0 && seg !== "." && seg !== ".." && /^[\w.-]+$/.test(seg));
 }
 
+// Confirmed live as the actual mechanism behind a working index.html
+// silently getting replaced with plain CSS text: a reply that writes out
+// TWO files (a labeled "here's index.html" block, then a separate "here's
+// style.css" block) only ever has ONE of them survive — extractFileUpdateBlock
+// keeps just the single largest fenced block per reply, and chooseFileTarget
+// still has to pick ONE target for it. Nothing anywhere checked that the
+// content being saved actually belonged in a file with that extension, so
+// the CSS block landed under the index.html path and nobody — Koopi
+// included — noticed until the page rendered as a wall of raw text.
+// Deliberately narrow (checks the one specific mismatch that's actually
+// been confirmed to happen, not a general "is this valid X" validator) to
+// keep false positives near zero: empty/placeholder content is never
+// judged, and anything not html/css passes through untouched.
+function looksLikeExtensionMismatch(path: string, content: string): boolean {
+  if (!content.trim()) return false;
+  const ext = path.split(".").pop()?.toLowerCase();
+  if (ext === "html" || ext === "htm") {
+    // Real HTML, complete or partial, always has at least one "<" — plain
+    // CSS (or anything else that isn't markup) never does.
+    return !content.includes("<");
+  }
+  if (ext === "css") {
+    return /<!doctype|<html[\s>]/i.test(content);
+  }
+  return false;
+}
+
 // Appends _2, _3, ... until the name doesn't collide with an existing file
 // in the project — two unrelated "calculator" tasks land as calculator.py
 // and calculator_2.py, never one silently replacing the other.
@@ -2377,6 +2404,13 @@ export async function POST(request: Request) {
     const senderRole = await getSenderRole(triggerSenderId);
     const canWriteDirectly = senderRole === "owner" || senderRole === "admin";
 
+    // See looksLikeExtensionMismatch's own comment — blocks this exact
+    // write rather than silently corrupting whatever's already at `path`.
+    if (looksLikeExtensionMismatch(path, code)) {
+      console.warn(`/api/chat: refused to save ${path} for room ${roomId} — content doesn't match its extension`);
+      return null;
+    }
+
     // `language` (the model's self-reported run_code/open_gui_session
     // argument) still decided WHICH sandbox runner just executed this code
     // — that's a real, separate need (SandboxRun genuinely has to know
@@ -2688,6 +2722,15 @@ export async function POST(request: Request) {
       const existingIdByPath = new Map((existingRows ?? []).map((r) => [r.path, r.id as string]));
 
       for (const f of files) {
+        // See looksLikeExtensionMismatch's own comment — skips just this
+        // one file rather than corrupting whatever's already at its path;
+        // the rest of the batch still lands normally.
+        if (looksLikeExtensionMismatch(f.path, f.content)) {
+          console.warn(
+            `/api/chat: refused to write scaffolded file ${f.path} for room ${roomId} — content doesn't match its extension`
+          );
+          continue;
+        }
         if (canWriteDirectly) {
           const { error } = await supabase.from("project_files").upsert(
             {
@@ -3047,7 +3090,15 @@ export async function POST(request: Request) {
                 // "python" if untagged) is never trusted for the persisted
                 // column, same reasoning syncProjectFile's own comment gives
                 // — always derived from the chosen path instead.
-                if (canWriteDirectly) {
+                // See looksLikeExtensionMismatch's own comment — this is the
+                // actual site the confirmed-live bug happened at: a reply
+                // that wrote out two labeled files (index.html, then
+                // style.css) only ever keeps the larger fenced block, and
+                // that CSS landed under the index.html path with nothing
+                // catching the mismatch before it overwrote a working file.
+                if (looksLikeExtensionMismatch(target.path, block.code)) {
+                  fileErr = new Error(`content doesn't match ${target.path}'s extension`);
+                } else if (canWriteDirectly) {
                   const { error } = await supabase.from("project_files").upsert(
                     {
                       project_id: projectId,
