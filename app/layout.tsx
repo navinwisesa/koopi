@@ -26,7 +26,16 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className="dark">
+    // suppressHydrationWarning is scoped to this element's own attributes
+    // only (not children/content) — needed because at least one browser
+    // extension (seen live: a "crosspilot-bridged" attribute, not anything
+    // this app renders) injects attributes onto <html> before React
+    // hydrates. Next.js's own hydration-mismatch docs name this exact
+    // pattern (Grammarly, password managers, etc. cause the identical
+    // warning) as the sanctioned fix — a real mismatch in actual page
+    // content would still surface normally, this only quiets the false
+    // positive from something outside the app's control.
+    <html lang="en" className="dark" suppressHydrationWarning>
       <body
         className={`${nunitoSans.variable} ${leagueSpartan.variable} antialiased bg-background text-foreground`}
       >

@@ -19,6 +19,10 @@ function rowToThread(row: Record<string, unknown>): Thread {
     // this column is applied, same fallback every other reader of this
     // column uses.
     personality: (row.personality as Personality | null | undefined) ?? "default",
+    // A thread created via this modal always invites teammates, so it's
+    // never file-scoped — RoomView's own handleDiscussFile is the only path
+    // that ever sets this, via a separate set_thread_context_file call.
+    contextProjectFileId: (row.context_project_file_id as string | null | undefined) ?? null,
   };
 }
 

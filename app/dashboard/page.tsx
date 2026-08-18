@@ -88,7 +88,7 @@ export default async function DashboardPage() {
     ? await supabase
         .from("rooms")
         .select(
-          "id, name, visibility, created_at, participants(user_id, last_seen_at, profiles(username, avatar_url))"
+          "id, name, visibility, created_at, created_by, participants(user_id, last_seen_at, profiles(username, avatar_url))"
         )
         .in("id", roomIds)
         .order("created_at", { ascending: false })
@@ -107,6 +107,7 @@ export default async function DashboardPage() {
       id: room.id,
       name: room.name || "Untitled room",
       visibility: (room.visibility ?? "private") as RoomView["visibility"],
+      createdBy: room.created_by ?? null,
       members: participants.map((p) => {
         const prof = firstOf(p.profiles);
         return {

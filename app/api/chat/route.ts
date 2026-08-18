@@ -2,10 +2,15 @@ import Groq from "groq-sdk";
 import OpenAI from "openai";
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { randomUUID } from "crypto";
 import { SandboxRun, type RunResult } from "@/lib/sandbox";
 import { runGuiSession } from "@/lib/desktopSandbox";
+import { runWebSearch } from "@/lib/webSearch";
 import { classifyIntent } from "@/lib/intentClassifier";
 import { extractPdf } from "@/lib/pdfExtract";
+import { languageFromPath } from "@/lib/languageFromPath";
+import { applyScaffoldGuards } from "@/lib/webAppScaffoldGuards";
+import { summarizeProjectFileChange } from "@/lib/summarizeProjectFileChange";
 import type { Personality } from "@/components/PersonalitySelector";
 
 export const dynamic = "force-dynamic";
@@ -14,29 +19,72 @@ export const maxDuration = 300;
 // No single primary provider anymore — Cerebras is gone (not worth the extra
 // hop once free-tier Groq/OpenRouter models cover the same ground). Routing
 // is a straight three-way split:
-//   code request        → cohere/north-mini-code:free on OpenRouter (Groq has
+//   code request        → poolside/laguna-s-2.1:free on OpenRouter (Groq has
 //                          no comparable free code model, so there's no
-//                          primary leg to try before this one)
-//   non-code, Powerful   → Groq llama-3.3-70b-versatile, falling back to
+//                          primary leg to try before this one; switched off
+//                          cohere/north-mini-code:free 2026-08-17 after
+//                          repeated unexplained 400s from that provider)
+//   non-code, Powerful   → Groq openai/gpt-oss-120b, falling back to
 //                          nvidia/nemotron-3-super-120b-a12b:free on OpenRouter
-//   non-code, Efficient  → Groq llama-3.1-8b-instant, falling back to
+//   non-code, Efficient  → Groq openai/gpt-oss-20b, falling back to
 //                          openai/gpt-oss-20b:free on OpenRouter
 // "code" is decided purely from the message content (see isCode below) and
 // wins regardless of the Efficient/Powerful tier — once it's code, the tier
 // selector stops mattering.
-const OPENROUTER_CODE_MODEL = "cohere/north-mini-code:free";
+//
+// Switched off Groq's llama-3.3-70b-versatile/llama-3.1-8b-instant to these
+// gpt-oss models 2026-08-16 (the llama models were being deprecated). The
+// vendor prefix is NOT optional here — confirmed live that Groq's API 404s
+// bare "gpt-oss-20b"/"gpt-oss-120b" with model_not_found; the real IDs are
+// "openai/gpt-oss-20b" and "openai/gpt-oss-120b". gpt-oss also introduces a
+// real behavior change plain Llama never had: it's a reasoning model, and
+// its reasoning tokens count against max_completion_tokens same as visible
+// output — confirmed live that a 20-token budget (this file's small
+// classifier calls, sized for Llama's no-reasoning output) got entirely
+// consumed by reasoning alone, returning empty content every time. See
+// REASONING_EFFORT and each classifier's now-larger budget below; every
+// Groq call in this file must pass reasoning_effort or risk silently
+// starving on its old budget again next time a model changes under it.
+const REASONING_EFFORT: Record<"chat" | "build", "low" | "medium"> = {
+  chat: "low",
+  build: "medium",
+};
+const OPENROUTER_CODE_MODEL = "poolside/laguna-s-2.1:free";
 const GROQ_MODEL: Record<"chat" | "build", string> = {
-  chat: "llama-3.1-8b-instant",
-  build: "llama-3.3-70b-versatile",
+  chat: "openai/gpt-oss-20b",
+  build: "openai/gpt-oss-120b",
 };
 const OPENROUTER_MODEL: Record<"chat" | "build", string> = {
   chat: "openai/gpt-oss-20b:free",
   build: "nvidia/nemotron-3-super-120b-a12b:free",
 };
+
+// Confirmed empirically against Groq's live API (a request with a
+// ~2-token prompt and max_completion_tokens: 7000 alone was rejected as
+// "Requested 7036" against a 6000 TPM cap): Groq's TPM check is a preflight
+// reservation of prompt_tokens + max_completion_tokens, not metered actual
+// usage after the fact. llama-3.1-8b-instant (GROQ_MODEL.chat) only has a
+// 6000 TPM budget — half of llama-3.3-70b-versatile's 12000 — so reserving
+// the same 4096-token completion budget for both tiers meant a normal
+// request (system prompt + room memory + history, regularly ~3400+ prompt
+// tokens on its own) blew the chat tier's ENTIRE budget on reservation
+// alone, near-guaranteed, regardless of how long the actual reply turned
+// out to be. Confirmed live in this app's own logs: repeated 413
+// rate_limit_exceeded errors on GROQ_MODEL.chat forcing an OpenRouter
+// failover on nearly every Efficient-tier reply. Capping the chat tier's
+// reservation instead — it's meant to be quick answers, not a budget it
+// can never fit under — leaves real headroom (see the two call sites this
+// feeds, both Groq and its OpenRouter fallback) without touching prompt
+// content/history/room-memory at all. "build" keeps the original budget:
+// its 12000 TPM ceiling was never the problem.
+const MAX_COMPLETION_TOKENS: Record<"chat" | "build", number> = {
+  chat: 1536,
+  build: 4096,
+};
 // Multimodal input (Phase 1 of the debugging-tools build): confirmed via
 // audit that NONE of the three models above accept image input — Groq's
 // llama-3.1-8b-instant/llama-3.3-70b-versatile are text-only, as is
-// cohere/north-mini-code:free and the openai/gpt-oss-20b:free fallback.
+// poolside/laguna-s-2.1:free and the openai/gpt-oss-20b:free fallback.
 // A message with an image or a visually-heavy PDF (see lib/pdfExtract.ts)
 // always routes here instead, unconditionally, same "no primary leg to try
 // first" reasoning OPENROUTER_CODE_MODEL already uses — there's no vision
@@ -120,6 +168,15 @@ brevity preference stated elsewhere in this prompt. A short reply is still expec
 surface a real conflict or risk, not omit it for the sake of length.
 [END EVALUATIVE STANCE]
 
+You have no way to check usage limits, quotas, rate limits, or remaining capacity
+for yourself, any tool, or any model — nothing available to you exposes that.
+Never tell someone you've "hit a quota," "hit a rate limit," "run out of usage
+for today," or anything similar, and never use that as a reason to decline or
+pause a task — you would have no way to know it was true. If a call genuinely
+fails, you'll see the actual failure (an error, a missing tool result, a system
+message reporting it) — respond to that specific, real failure, not an invented
+explanation for it.
+
 When a message includes an attached image or PDF, this is explicitly a debugging aid —
 usually a screenshot of an error, a stack trace, or a spec/requirements doc — not
 decoration. Reference what's ACTUALLY visible in it specifically (the exact error text,
@@ -150,20 +207,65 @@ to fake a display by opening a browser, generating a URL yourself, writing an
 image to disk, or any other trick — none of that makes a GUI visible to the
 person.
 
+You also have a web_search tool that performs a REAL web search and returns
+actual results (title, url, a short snippet of the page) plus a short
+synthesized answer when one's available. Use it whenever a question needs
+current information (news, prices, versions, recent events, anything that
+could plausibly have changed since your training), something you're not
+confident about, or something explicitly asked to be looked up — don't
+guess or answer from stale memory when a real check is one call away. When
+you use what a search turned up, name the source (site or page title) so
+the person can verify it themselves, and never invent a url, title, or fact
+that wasn't actually in the tool result — only ever report what it really
+returned. If it failed or came back empty, say so plainly instead of
+answering as if the search had succeeded.
+
 Before reaching for a native GUI toolkit at all, consider whether what's being
-asked for can just be a webpage instead — a single self-contained HTML file
-with inline <style> and <script>, no build step, no dependencies. Default to
-that for anything that's fundamentally a UI (a calculator, a form, a simple
-game, a small dashboard, etc.): write it as one HTML file the normal way (a
-fenced code block — it's saved to the project automatically, same as any
-other file). Project mode doesn't render a live preview of it, so tell them
-to open that file in their own browser once it's saved — never tell them to
-save or copy the code themselves, it's already been saved for them by the
-time you're describing it. That's instant, costs no infrastructure, and
-needs nothing from you beyond the code. Only reach for a native toolkit
-(Tkinter, PyQt, etc.) — and therefore open_gui_session, since that's the
-only way anyone can actually SEE a native window — when the person
-explicitly asks for a native/desktop app, or the task genuinely needs
+asked for can just be a webpage or web app instead. You have a
+scaffold_web_app tool for exactly this: give it every file the app needs
+(path + content for each) and a framework — "static" for a self-contained
+HTML/CSS/JS site (use a Tailwind CDN <script> tag if styling is wanted; no
+build step, no dependencies) or "next" for a real React/Next.js app, only
+when the request genuinely needs client-side routing, component state
+shared across pages, or something a static page can't do. Default to
+"static" for anything that's fundamentally a single page or a handful of
+pages (a calculator, a form, a landing page, a small dashboard, etc.) — it
+starts almost instantly, unlike installing a whole framework for something
+that doesn't need one. When you do use "next", the sandbox always installs
+the latest Next.js (currently 15.x), where the App Router (the app/
+directory) is the stable default — it needs no opt-in. Do NOT write a
+next.config.js containing experimental: { appDir: true } or any other
+appDir flag; that was only ever valid on Next 13.0–13.3 and current Next
+rejects it outright as an unrecognized config option, crashing the dev
+server before it ever serves a single page. Most scaffolds don't need a
+next.config.js at all — only include one if the app genuinely needs to
+configure something real (e.g. image domains), and if you do, keep it to
+options that are valid on the latest Next.js. Call scaffold_web_app as an actual tool call, the
+same way you'd call run_code — never as a fenced code block containing
+its own {"files": [...], "framework": ...} arguments; writing the call out
+as text instead of making it is not a shortcut, it does nothing at all —
+no file is created, nobody sees anything, and the whole reply is wasted
+describing a call that never happened. scaffold_web_app writes every file
+for real — it does NOT start a live preview itself and its tool result
+never contains a url. The Project panel's own Run button is the one and
+only way anyone
+sees it live (clicking Run installs/serves it and shows the link right
+there) — after scaffold_web_app succeeds, tell them to open the Project
+panel and click Run, nothing more. This applies to every tool, not only
+scaffold_web_app: never write literal angle-bracket tags like
+function=NAME wrapped around text into a reply, including when summarizing
+a tool result you already received — that's not how a real call is made,
+and echoing a result back inside fake tags only adds visual noise around a
+sentence that was already fine on its own. Just say what happened, in plain
+text. Never tell someone to open a file
+themselves, run npm install, start a dev server by hand, or follow any
+other manual setup step — that instruction is never correct here either;
+"click Run in the panel" is the complete instruction, not a step toward a
+longer one. Never invent, guess, or claim a live url exists — this tool
+never returns one, so one is never yours to share. Only reach for a
+native toolkit (Tkinter, PyQt, etc.) — and therefore open_gui_session, since
+that's the only way anyone can actually SEE a native window — when the
+person explicitly asks for a native/desktop app, or the task genuinely needs
 something a browser can't do.
 
 When open_gui_session is genuinely the right call, call it with the actual,
@@ -182,6 +284,10 @@ many files, not one. Whenever you write real, runnable code for a coding
 task — a script, an algorithm, a small app, anything more than a single
 line used to illustrate a concept in passing conversation — it is saved to
 a real file in that project automatically, the instant your reply finishes.
+(A multi-file web app is the one exception to "write it as a fenced code
+block" below — that's what scaffold_web_app is for, see above. It saves
+every file directly; don't also paste those same files into your reply as
+code blocks.)
 You do not need to ask, name a file, or do anything else to make that
 happen, and you must NEVER tell someone to copy your code and save it
 themselves, name a file for them to create by hand, or say something like
@@ -311,6 +417,136 @@ function extractFileUpdateBlock(
   return best;
 }
 
+// Every top-level {...} object in text, found by tracking brace depth and
+// string literals (so a brace inside a quoted JSON string, e.g. inside a
+// scaffolded file's own HTML content, never miscounts) — not a regex, since
+// no regex reliably balances nested braces. Needed because a leaked
+// scaffold payload (see extractLeakedScaffoldPayload below) isn't always
+// fenced; confirmed live in a second, even rawer variant: `@scaffold_web_app
+// {"files": [...], ...}` with no code fence around it at all.
+function findTopLevelJsonObjects(text: string): string[] {
+  const results: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}") {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0 && start !== -1) {
+          results.push(text.slice(start, i + 1));
+          start = -1;
+        }
+      }
+    }
+  }
+  return results;
+}
+
+// Moved to lib/webAppScaffoldGuards.ts (ensurePackageJson, ensureTsConfigPathAlias,
+// sanitizeNextConfig, applyScaffoldGuards) so app/api/projects/run-webapp/route.ts
+// can apply the same guards at run time, not just when a scaffold is first written —
+// see that file's header comment for why.
+
+function parseScaffoldShape(
+  raw: string
+): { files: { path: string; content: string }[]; framework: "static" | "next" } | null {
+  const parsed = safeParse<{ files?: unknown; framework?: unknown }>(raw, {});
+  if (parsed.framework !== "static" && parsed.framework !== "next") return null;
+  if (!Array.isArray(parsed.files)) return null;
+  const files = parsed.files.filter(
+    (f): f is { path: string; content: string } =>
+      Boolean(
+        f &&
+          typeof f === "object" &&
+          typeof (f as { path?: unknown }).path === "string" &&
+          (f as { path: string }).path &&
+          typeof (f as { content?: unknown }).content === "string"
+      )
+  );
+  if (!files.length) return null;
+  return { files, framework: parsed.framework };
+}
+
+// A third raw shape, confirmed live 2026-08-16: after a REAL tool call
+// already executed, the model's own wrap-up reply echoed the tool result
+// back as `<function=scaffold_web_app>{...}</function>` — the literal
+// syntax some open function-calling fine-tunes use internally for a call,
+// imitated here in plain content instead of going through the API's actual
+// function-calling field. Sometimes the tag wraps genuine unexecuted args
+// (same failure as the fenced/bare-JSON shapes below — nothing was ever
+// written); other times, per this session's live case, it wraps prose that
+// was already the correct, already-executed outcome message, just spuriously
+// tagged. LEAKED_FUNCTION_TAG_RE only isolates the wrapper; which of those
+// two cases it is gets decided where it's used (extractLeakedScaffoldPayload
+// tries to parse the inside as real args first; stripHallucinatedFunctionTags
+// below is the fallback for when it isn't).
+const LEAKED_FUNCTION_TAG_RE = /<function=([\w.-]+)>([\s\S]*?)<\/function>/gi;
+
+// Safety net for a confirmed-live failure mode: a smaller/free model (seen
+// with OpenRouter's free Efficient-tier fallback specifically) can narrate
+// scaffold_web_app's JSON arguments as plain reply text instead of actually
+// invoking the tool via the API's real function-calling mechanism.
+// Confirmed by direct testing in THREE different shapes: once as a whole
+// {"files": [...], "framework": ...} blob dressed up as a fenced ```json
+// code block, once as a bare `@scaffold_web_app {...}` mention with no
+// fence at all, once wrapped in a `<function=scaffold_web_app>...</function>`
+// pseudo-tag. Either way, if the tag/fence/bare object actually contains
+// unexecuted scaffold args, zero files ever reached project_files — the
+// reply just streamed the tool's own parameter shape as prose,
+// indistinguishable from success at a glance. Checks fenced blocks first
+// (the common case), then tag-wrapped content, then falls back to scanning
+// for any bare top-level JSON object in the whole reply — and if found,
+// treats it as the tool call it was clearly meant to be (actually writing
+// the files) rather than silently losing the whole request to a model that
+// got the calling convention wrong.
+function extractLeakedScaffoldPayload(
+  text: string
+): { files: { path: string; content: string }[]; framework: "static" | "next"; fullMatch: string } | null {
+  for (const match of text.matchAll(FENCE_RE)) {
+    const parsed = parseScaffoldShape(match[2] ?? "");
+    if (parsed) return { ...parsed, fullMatch: match[0] };
+  }
+  for (const match of text.matchAll(LEAKED_FUNCTION_TAG_RE)) {
+    if (match[1]?.toLowerCase() !== "scaffold_web_app") continue;
+    const parsed = parseScaffoldShape(match[2] ?? "");
+    if (parsed) return { ...parsed, fullMatch: match[0] };
+  }
+  for (const candidate of findTopLevelJsonObjects(text)) {
+    const parsed = parseScaffoldShape(candidate);
+    if (parsed) return { ...parsed, fullMatch: candidate };
+  }
+  return null;
+}
+
+// Fallback for the same <function=NAME>...</function> imitation when what's
+// inside ISN'T executable args (extractLeakedScaffoldPayload above already
+// had first crack at that case) — just a tool name/result the model echoed
+// into its own reply with fake tags around it. Not scaffold_web_app-specific:
+// the same imitation can happen after run_code, open_gui, or web_search just
+// as easily, so this unwraps any tool name, keeping whatever text was inside
+// (normally the exact outcome sentence Koopi already produced) and dropping
+// only the fake tags around it.
+function stripHallucinatedFunctionTags(text: string): string {
+  return text
+    .replace(LEAKED_FUNCTION_TAG_RE, (_m, _name: string, inner: string) => inner.trim())
+    .replace(/<\/?function(?:=[\w.-]+)?>/gi, "")
+    .trim();
+}
+
 // Decides WHICH project_files row a piece of generated code targets — a
 // question extractFileUpdateBlock/classifyFileUpdate above never answered
 // at all, which was the original bug: every file-worthy reply landed on the
@@ -374,8 +610,16 @@ in existing-paths — only place a file into a folder that's already there.
 Respond with ONLY compact JSON: {"target": "existing"|"new", "filename": "short_name.ext"}
 (omit filename, or use null, when target is "existing")`;
 
-function extensionFor(language: string): string {
-  switch (language.trim().toLowerCase()) {
+function extensionFor(language: string | undefined | null): string {
+  // Confirmed live: a run_code tool call can reach here with `language`
+  // missing entirely (the model omitted the argument despite it being
+  // `required` in RUN_CODE_TOOL's own schema — tool-call argument JSON isn't
+  // guaranteed to match its declared schema just because the schema says
+  // so) — .trim() on undefined threw, uncaught by this function's own two
+  // call sites, and only survived because one of them happened to sit
+  // inside a try/catch with a fallback. Defaulting here means neither call
+  // site needs to know that could ever happen.
+  switch ((language ?? "").trim().toLowerCase()) {
     case "python":
       return ".py";
     case "javascript":
@@ -494,6 +738,77 @@ const RUN_CODE_TOOL: Groq.Chat.ChatCompletionTool = {
         },
       },
       required: ["code", "language"],
+    },
+  },
+};
+
+const SCAFFOLD_WEB_APP_TOOL: Groq.Chat.ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: "scaffold_web_app",
+    description:
+      "Write a full runnable web app or page (one or many files) into the project. Use " +
+      "this instead of a plain HTML code block or manual setup instructions for anything " +
+      "that's fundamentally a webpage or web app — a landing page, a form, a small " +
+      "dashboard, a full React/Next.js app. This does NOT start a live preview and its " +
+      "result never contains a url — the Project panel's Run button is the only place " +
+      "anyone sees it live; tell the person to click Run there. Prefer framework: " +
+      "'static' (plain HTML/CSS/JS, e.g. Tailwind via a CDN <script> tag — no build " +
+      "step) unless the request genuinely needs React/Next's routing or component " +
+      "state, in which case use framework: 'next' and include a package.json listing " +
+      "'next'/'react'/'react-dom' as dependencies. The sandbox always installs the " +
+      "latest Next.js, where the App Router needs no opt-in — never write a " +
+      "next.config.js with experimental appDir (valid only on old 13.0-13.3, rejected " +
+      "as an unrecognized option on current Next and crashes the dev server on boot); " +
+      "skip next.config.js entirely unless the app genuinely needs to configure " +
+      "something real. Every file's full, current content " +
+      "must be included every call — this is not a diff. You MUST invoke this as a real " +
+      "function/tool call through the API's own tool-calling mechanism — never write " +
+      "out {\"files\": [...], \"framework\": ...} as plain reply text (in a code block or " +
+      "otherwise). That is not how tool calls work and nothing will be built from it — " +
+      "it just wastes the whole reply describing a call that never actually happened.",
+    parameters: {
+      type: "object",
+      properties: {
+        files: {
+          type: "array",
+          description: "Every file the app needs, each with its full current content.",
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "Relative file path, e.g. 'index.html' or 'app/page.tsx'." },
+              content: { type: "string", description: "The file's complete content." },
+            },
+            required: ["path", "content"],
+          },
+        },
+        framework: {
+          type: "string",
+          enum: ["static", "next"],
+          description: "'static' for plain HTML/CSS/JS (default, fastest). 'next' for a real React/Next.js app.",
+        },
+      },
+      required: ["files", "framework"],
+    },
+  },
+};
+
+const WEB_SEARCH_TOOL: Groq.Chat.ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: "web_search",
+    description:
+      "Search the live web (via Tavily) and return real results — title, url, and a short " +
+      "snippet per result — plus a brief synthesized answer when one's available. Use this " +
+      "for current events, anything that could have changed since training, a fact you're " +
+      "not confident about, or anything explicitly asked to be looked up. Never fabricate a " +
+      "url or claim to have searched without actually calling this.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "The search query." },
+      },
+      required: ["query"],
     },
   },
 };
@@ -722,6 +1037,11 @@ export async function POST(request: Request) {
   if (!triggerRow) {
     return NextResponse.json({ error: "Triggering message not found" }, { status: 404 });
   }
+  // Captured as its own const: same TS-narrowing-doesn't-reach-nested-
+  // closures reason /api/projects/run/route.ts's own `userId` const already
+  // documents for `user` — runScaffoldToolCall (defined much further below)
+  // closes over this plain value instead of `triggerRow.sender_id` itself.
+  const triggerSenderId = triggerRow.sender_id;
 
   // Defense in depth for the per-user "Ask Koopi" toggle: the composer already gates
   // whether it calls this endpoint at all based on the sender's own setting, so this
@@ -925,22 +1245,75 @@ export async function POST(request: Request) {
       })
       .join("\n");
 
-    try {
-      const completion = await groq.chat.completions.create({
+    // Names the prompt is on the hook to attribute by: any human whose message
+    // this batch is long enough to plausibly be a decision/opinion, not just
+    // "ok"/"thanks". Short-message senders are excluded so small talk doesn't
+    // trigger a false-positive retry.
+    const namesToAttribute = Array.from(
+      new Set(
+        rows
+          .filter((r) => r.sender_type === "user" && r.content.trim().length >= 15)
+          .map((r) => r.username?.trim())
+          .filter((n): n is string => Boolean(n))
+      )
+    );
+    const missingFrom = (text: string) =>
+      namesToAttribute.filter((n) => !text.toLowerCase().includes(n.toLowerCase()));
+
+    async function draftSummary(correction?: string): Promise<string | undefined> {
+      const completion = await groq!.chat.completions.create({
         model: GROQ_MODEL.chat,
         max_completion_tokens: 400,
+        reasoning_effort: "low",
         messages: [
           { role: "system", content: MEMORY_SYSTEM_PROMPT },
           {
             role: "user",
             content:
               `Existing summary: ${existingSummary ?? "(none yet)"}\n\n` +
-              `New activity since then:\n${formatted}\n\nProduce the updated summary.`,
+              `New activity since then:\n${formatted}\n\nProduce the updated summary.` +
+              (correction ? `\n\n${correction}` : ""),
           },
         ],
       });
-      const updated = completion.choices[0]?.message?.content?.trim();
+      return completion.choices[0]?.message?.content?.trim();
+    }
+
+    try {
+      let updated = await draftSummary();
       if (!updated) return existingSummary;
+
+      // The system prompt already asks for per-person attribution, but that's
+      // an instruction, not a guarantee — a fast/small model can quietly
+      // collapse "Navin proposed Postgres; test2 suggested MongoDB" into "the
+      // team discussed database options" once token pressure builds up over
+      // many regen cycles. Check for it every time this runs (not just once
+      // at review time) and give the model one corrective pass before
+      // accepting a summary that dropped someone.
+      let missing = missingFrom(updated);
+      if (missing.length > 0) {
+        const retried = await draftSummary(
+          `Your draft didn't explicitly name: ${missing.join(", ")}. Each of them said ` +
+            `something substantive above — revise so every one of them is attributed by ` +
+            `name to their specific statement, not folded into a group summary.`
+        );
+        if (retried) {
+          const retryMissing = missingFrom(retried);
+          if (retryMissing.length < missing.length) {
+            updated = retried;
+            missing = retryMissing;
+          }
+        }
+      }
+      if (missing.length > 0) {
+        // Not fatal — still ship the summary — but this is the signal that
+        // makes attribution an observable, ongoing quality metric instead of
+        // a one-time prompt check: if this line starts showing up regularly,
+        // the prompt (or the model) needs another look.
+        console.warn(
+          `/api/chat: room memory for room ${roomId} still missing attribution for ${missing.join(", ")} after retry`
+        );
+      }
 
       const until = rows[rows.length - 1].created_at as string;
       const { error: rpcError } = await supabase.rpc("update_room_memory", {
@@ -973,24 +1346,54 @@ export async function POST(request: Request) {
   // (not just personality) the moment this shipped ahead of the migration
   // being applied — select("*") + an optional-chained field read degrades
   // to "default" instead, exactly like this always intended to.
-  async function getThreadPersonality(): Promise<Personality> {
+  // Same select("*")-not-select("column") reasoning as before, now also
+  // covering context_project_file_id (20260828_add_thread_context_file.sql)
+  // — naming either column before its migration is applied would 42703 the
+  // whole query and silently break every Koopi reply in every room, not
+  // just this one field.
+  async function getThreadContext(): Promise<{
+    personality: Personality;
+    contextProjectFileId: string | null;
+  }> {
     const { data: thread } = await supabase
       .from("threads")
       .select("*")
       .eq("id", threadId)
       .maybeSingle();
-    return (thread?.personality as Personality | null | undefined) ?? "default";
+    return {
+      personality: (thread?.personality as Personality | null | undefined) ?? "default",
+      contextProjectFileId: (thread?.context_project_file_id as string | null | undefined) ?? null,
+    };
   }
 
-  const [roomMemory, personality] = await Promise.all([
-    getRoomMemory(),
-    getThreadPersonality(),
-  ]);
+  // Only present for a "Discuss this file" thread (see RoomView's
+  // handleDiscussFile / ProjectPanel's onDiscussFile) — fetched fresh every
+  // reply, not frozen at thread-creation time, so the injected content is
+  // always what the file actually holds right now, including any change
+  // approved since the thread was opened.
+  async function fileContextBlock(contextProjectFileId: string | null): Promise<string> {
+    if (!contextProjectFileId) return "";
+    const { data: file } = await supabase
+      .from("project_files")
+      .select("path, content, language")
+      .eq("id", contextProjectFileId)
+      .maybeSingle();
+    if (!file) return "";
+    return (
+      `\n\nThis is a private, file-scoped conversation. The user is discussing this project file:\n\n` +
+      `### ${file.path}\n\`\`\`${file.language}\n${file.content}\n\`\`\`\n`
+    );
+  }
+
+  const [roomMemory, threadContext] = await Promise.all([getRoomMemory(), getThreadContext()]);
+  const { personality, contextProjectFileId } = threadContext;
 
   const effectiveSystemPrompt =
     (roomMemory
       ? `${SYSTEM_PROMPT}\n\nRoom memory (prior activity in this room, across other threads):\n${roomMemory}`
-      : SYSTEM_PROMPT) + personalityBlock(personality);
+      : SYSTEM_PROMPT) +
+    personalityBlock(personality) +
+    (await fileContextBlock(contextProjectFileId));
 
   const isRateLimited = (err: unknown) =>
     err instanceof Groq.RateLimitError || err instanceof OpenAI.RateLimitError;
@@ -1004,7 +1407,18 @@ export async function POST(request: Request) {
       : err instanceof UpstreamIdleTimeoutError
         ? "the model took too long to respond — try asking again."
         : "I hit an error trying to respond — try asking again.";
-    console.error(`/api/chat: model call failed for trigger ${triggerMessageId}:`, err);
+    // The bare `err` object alone renders as a truncated "[Object]" for its
+    // own nested `.error` (the actual provider-reported body — message/code/
+    // metadata) once console's default inspect depth is exceeded, which is
+    // exactly the field that would explain WHY a provider 400'd rather than
+    // just that it did. Logged as a separate, explicit arg so it prints in
+    // full instead of getting swallowed.
+    console.error(
+      `/api/chat: model call failed for trigger ${triggerMessageId}:`,
+      err instanceof Error ? err.message : err,
+      "detail:",
+      JSON.stringify((err as { error?: unknown })?.error ?? null)
+    );
     await supabase.from("messages").insert({
       room_id: roomId,
       thread_id: threadId,
@@ -1029,7 +1443,13 @@ export async function POST(request: Request) {
     try {
       const completion = await groq.chat.completions.create({
         model: GROQ_MODEL.chat,
-        max_completion_tokens: 40,
+        // 40 wasn't enough headroom once GROQ_MODEL.chat became a reasoning
+        // model — confirmed live that reasoning tokens alone (which count
+        // against this budget same as visible output) can eat a 20-40 token
+        // cap before any JSON comes out at all. 100 leaves real margin
+        // beyond the ~40-60 reasoning tokens observed at "low" effort.
+        max_completion_tokens: 100,
+        reasoning_effort: "low",
         messages: [
           { role: "system", content: SIGNAL_CLASSIFIER_PROMPT },
           {
@@ -1064,7 +1484,10 @@ export async function POST(request: Request) {
     try {
       const completion = await groq.chat.completions.create({
         model: GROQ_MODEL.chat,
-        max_completion_tokens: 20,
+        // Was 20 — confirmed live that's not enough once this became a
+        // reasoning model; see classifySignals' comment on the same issue.
+        max_completion_tokens: 80,
+        reasoning_effort: "low",
         messages: [
           { role: "system", content: FILE_UPDATE_CLASSIFIER_PROMPT },
           {
@@ -1115,7 +1538,9 @@ export async function POST(request: Request) {
     try {
       const completion = await groq.chat.completions.create({
         model: GROQ_MODEL.chat,
-        max_completion_tokens: 60,
+        // Was 60 — same reasoning-model budget fix as classifySignals above.
+        max_completion_tokens: 150,
+        reasoning_effort: "low",
         messages: [
           { role: "system", content: FILE_TARGET_PROMPT },
           {
@@ -1311,15 +1736,18 @@ export async function POST(request: Request) {
     // Groq and OpenRouter are both cast to the same ChatStream shape —
     // OpenRouter speaks OpenAI's wire format natively, and Groq's
     // separately-typed SDK speaks the same format under the hood.
-    async function tryOpenrouter(model: string): Promise<{ stream: ChatStream } | { error: unknown }> {
+    async function tryOpenrouter(
+      model: string,
+      maxCompletionTokens: number
+    ): Promise<{ stream: ChatStream } | { error: unknown }> {
       if (!openrouter) return { error: new Error("OPENROUTER_API_KEY is not set") };
       try {
         return {
           stream: (await openrouter.chat.completions.create({
             model,
-            max_completion_tokens: 4096,
+            max_completion_tokens: maxCompletionTokens,
             stream: true,
-            tools: [RUN_CODE_TOOL, OPEN_GUI_TOOL] as unknown as OpenAI.Chat.ChatCompletionTool[],
+            tools: [RUN_CODE_TOOL, OPEN_GUI_TOOL, SCAFFOLD_WEB_APP_TOOL, WEB_SEARCH_TOOL] as unknown as OpenAI.Chat.ChatCompletionTool[],
             messages: requestMessages as unknown as OpenAI.Chat.ChatCompletionMessageParam[],
           })) as ChatStream,
         };
@@ -1339,7 +1767,7 @@ export async function POST(request: Request) {
       // below — confirmed in Phase 0's audit that neither Groq's models nor
       // the code model accept image input at all, so there's nothing to
       // fail over FROM, only the one model that can actually read one.
-      const result = await tryOpenrouter(VISION_MODEL);
+      const result = await tryOpenrouter(VISION_MODEL, MAX_COMPLETION_TOKENS.build);
       if ("error" in result) {
         await postFailureNotice(result.error);
         return { kind: "text", messageId: null, text: "" };
@@ -1350,7 +1778,7 @@ export async function POST(request: Request) {
       // Code always goes straight to the code-specialized OpenRouter model —
       // Groq has no comparable free-tier code model, so there's no primary
       // leg to try before this one.
-      const result = await tryOpenrouter(OPENROUTER_CODE_MODEL);
+      const result = await tryOpenrouter(OPENROUTER_CODE_MODEL, MAX_COMPLETION_TOKENS.build);
       if ("error" in result) {
         await postFailureNotice(result.error);
         return { kind: "text", messageId: null, text: "" };
@@ -1361,9 +1789,10 @@ export async function POST(request: Request) {
       try {
         stream = (await groq.chat.completions.create({
           model: GROQ_MODEL[tier],
-          max_completion_tokens: 4096,
+          max_completion_tokens: MAX_COMPLETION_TOKENS[tier],
+          reasoning_effort: REASONING_EFFORT[tier],
           stream: true,
-          tools: [RUN_CODE_TOOL, OPEN_GUI_TOOL],
+          tools: [RUN_CODE_TOOL, OPEN_GUI_TOOL, SCAFFOLD_WEB_APP_TOOL, WEB_SEARCH_TOOL],
           messages: requestMessages,
         })) as ChatStream;
         provider = "groq";
@@ -1380,7 +1809,7 @@ export async function POST(request: Request) {
           `/api/chat: trigger=${triggerMessageId} groq failed, failing over to openrouter:`,
           groqErr instanceof Error ? groqErr.message : groqErr
         );
-        const result = await tryOpenrouter(OPENROUTER_MODEL[tier]);
+        const result = await tryOpenrouter(OPENROUTER_MODEL[tier], MAX_COMPLETION_TOKENS[tier]);
         if ("error" in result) {
           await postFailureNotice(result.error);
           return { kind: "text", messageId: null, text: "" };
@@ -1391,7 +1820,7 @@ export async function POST(request: Request) {
     } else {
       // No Groq key at all — go straight to OpenRouter as if it were the
       // primary for this tier.
-      const result = await tryOpenrouter(OPENROUTER_MODEL[tier]);
+      const result = await tryOpenrouter(OPENROUTER_MODEL[tier], MAX_COMPLETION_TOKENS[tier]);
       if ("error" in result) {
         await postFailureNotice(result.error);
         return { kind: "text", messageId: null, text: "" };
@@ -1498,6 +1927,30 @@ export async function POST(request: Request) {
       .filter((call) => call.id && call.name);
 
     if (finishReason === "tool_calls" && calls.length > 0) {
+      // A model narrating "here's the code:" with a fenced block right
+      // before calling scaffold_web_app is pure waste — every one of those
+      // files is about to be written for real by the tool call itself, so
+      // echoing them again in prose duplicates the exact same content for
+      // no reason other than tokens. Only scaffold_web_app gets this
+      // treatment: run_code/open_gui_session's own accompanying text is a
+      // genuinely different (and usually much shorter) case, not reported
+      // as a problem.
+      if (calls.some((c) => c.name === "scaffold_web_app") && textMessageId) {
+        const block = extractFileUpdateBlock(text);
+        if (block) {
+          const stripped = text.replace(block.fullMatch, "").trim();
+          if (stripped) {
+            await supabase.from("messages").update({ content: stripped }).eq("id", textMessageId);
+          } else {
+            // Nothing left but the code dump — no point leaving an empty
+            // bubble behind. Best-effort: if this delete is blocked (no
+            // DELETE policy on agent-authored messages), the stale text
+            // just stays visible, same as before this fix existed.
+            await supabase.from("messages").delete().eq("id", textMessageId);
+          }
+        }
+      }
+
       turns.push({
         role: "assistant",
         content: text || null,
@@ -1510,7 +1963,42 @@ export async function POST(request: Request) {
       return { kind: "tool_use", calls };
     }
 
+    // Confirmed live: a stream can complete cleanly (no streamError — the
+    // guard above only covers one that THREW) and still carry zero content
+    // deltas and zero tool calls — a small/free model just... says nothing.
+    // Without this, that's silent from here on: no textMessageId means the
+    // round-loop's own classification block never runs (it's gated on
+    // outcome.messageId), so nothing is ever written or shown, and the
+    // person who tagged Koopi sees total silence indistinguishable from
+    // being ignored. Same postFailureNotice path streamError already uses,
+    // for the same reason: something must always reach the chat.
+    if (!textMessageId && calls.length === 0) {
+      await postFailureNotice(new Error("The model returned an empty response — no text or tool call."));
+      return { kind: "text", messageId: null, text: "" };
+    }
+
     return { kind: "text", messageId: textMessageId, text };
+  }
+
+  // Same Owner/Admin-write-directly split every other project_files write
+  // in this app already respects (can_edit_project_directly,
+  // 20260817_add_room_roles_and_approval.sql) — an Owner/Admin scaffolding
+  // their own project isn't proposing anything to anyone; they're the ones
+  // who'd be approving it anyway, so gating it behind their own approval
+  // was never sensible. Only a Member's scaffold request goes through the
+  // pending-batch queue. Queries `participants` directly (not the
+  // auth.uid()-scoped get_room_role RPC) since this needs the TRIGGERING
+  // user's role, not necessarily whichever session happens to be executing
+  // this server route.
+  async function getSenderRole(userId: string | null): Promise<"owner" | "admin" | "member" | null> {
+    if (!userId) return null;
+    const { data } = await supabase
+      .from("participants")
+      .select("role")
+      .eq("room_id", roomId)
+      .eq("user_id", userId)
+      .maybeSingle();
+    return (data?.role as "owner" | "admin" | "member" | undefined) ?? null;
   }
 
   // Room's Project mode replaced the old per-thread thread_files panel — a
@@ -1519,7 +2007,27 @@ export async function POST(request: Request) {
   // thread_id. Lazily creates the room's project exactly like RoomView's own
   // ensureProject() does client-side; the projects.room_id unique constraint
   // makes a race between the two harmless (loser's insert 23505s, re-selects).
+  // Set by syncProjectFile and the plain-text isFileUpdate path, each time
+  // either one successfully writes a file — read by both (see
+  // syncProjectFile's own comment) so a later write in this SAME request
+  // always continues whatever this request already wrote, rather than
+  // re-guessing via a thread-history scan that can't see writes this
+  // request itself hasn't persisted to `history` yet.
+  let lastWrittenPathThisRequest: string | null = null;
   let cachedProjectId: string | null = null;
+  // Collects every fire-and-forget summarizeProjectFileChange call from
+  // syncProjectFile/scaffoldFiles/the inline isFileUpdate paths below —
+  // NOT awaited inline at each call site (that would serialize a ~1-2s Groq
+  // call with every single file write/scaffold file, adding real latency to
+  // the model's own reply for no benefit the person sending the message
+  // would ever see), but drained via Promise.allSettled right before this
+  // handler's own `finally { controller.close(); }`. A bare `void` here
+  // would risk the platform tearing down this request's execution context
+  // the moment the response stream finishes flushing — this file's own
+  // established pattern (classifySignals/classifyFileUpdate below, both
+  // `await`ed via Promise.all despite being just as "best-effort") already
+  // treats that as a real risk, not a hypothetical one.
+  const backgroundTasks: Promise<unknown>[] = [];
   async function ensureRoomProjectId(): Promise<string | null> {
     if (cachedProjectId) return cachedProjectId;
     const { data: existing } = await supabase
@@ -1568,33 +2076,159 @@ export async function POST(request: Request) {
   // LATER retry in this thread can find it via resolveContinuationHint.
   async function syncProjectFile(code: string, language: string): Promise<string | null> {
     if (!code.trim()) return null;
+
+    // A "Discuss this file" thread (contextProjectFileId set) never lets
+    // Koopi pick a target file at all — chooseFileTarget's whole job is
+    // "which file is this about", and here that's already answered by the
+    // thread itself. Nor does it ever write directly: same
+    // "never a direct write" test gate the old docked Assistant panel
+    // established, now enforced for its replacement entry point instead.
+    if (contextProjectFileId) {
+      const { data: file } = await supabase
+        .from("project_files")
+        .select("path")
+        .eq("id", contextProjectFileId)
+        .maybeSingle();
+      if (!file) return null;
+      const { data: inserted, error } = await supabase
+        .from("project_file_changes")
+        .insert({
+          project_file_id: contextProjectFileId,
+          proposed_by: triggerSenderId,
+          proposed_content: code,
+          source: "ai_assistant",
+          thread_id: threadId,
+        })
+        .select("id")
+        .single();
+      // Fire-and-forget, exactly like RoomView.tsx's own requestChangeSummary
+      // — the proposal is already fully valid and reviewable without a
+      // summary, which lands a moment later via the same realtime
+      // subscription the Pending panel already has open.
+      if (inserted) backgroundTasks.push(summarizeProjectFileChange(supabase, inserted.id));
+      if (error) {
+        console.warn(
+          `/api/chat: failed to propose a change for context file ${contextProjectFileId} in room ${roomId}:`,
+          error
+        );
+        return null;
+      }
+      return file.path;
+    }
+
     const projectId = await ensureRoomProjectId();
     if (!projectId) return null;
 
     const { data: fileRows } = await supabase
       .from("project_files")
-      .select("path, content")
+      .select("id, path, content")
       .eq("project_id", projectId);
     const existingPaths = (fileRows ?? []).map((f) => f.path).filter((p) => !isFolderMarker(p));
-    const candidate = explicitOpenCandidate(fileRows ?? []) ?? (await resolveContinuationHint(projectId));
+
+    // A file this exact request ALREADY wrote (earlier this same round loop
+    // — e.g. round 0's run_code call) wins over everything else, including
+    // resolveContinuationHint's own thread-history scan. That scan reads
+    // `history`, fetched once before the round loop started — it has no
+    // way to see a tool_call this very request inserted a moment ago, which
+    // is exactly the gap behind a confirmed-live duplicate: run_code writes
+    // file A, then the model's own follow-up text echoes the same code and
+    // — with no memory of A — chooseFileTarget's classifier reasonably
+    // guesses "new file" and creates file B for what should obviously stay
+    // one file.
+    const candidate: FileContinuationCandidate | null = lastWrittenPathThisRequest
+      ? {
+          path: lastWrittenPathThisRequest,
+          content: fileRows?.find((f) => f.path === lastWrittenPathThisRequest)?.content ?? "",
+          reason: "this exact request already wrote this file a moment ago",
+          forceExisting: true,
+        }
+      : (explicitOpenCandidate(fileRows ?? []) ?? (await resolveContinuationHint(projectId)));
 
     const { path } = await chooseFileTarget(triggerText, language, candidate, existingPaths);
 
-    const { error } = await supabase.from("project_files").upsert(
-      {
-        project_id: projectId,
-        path,
-        content: code,
-        language,
-        last_edited_by: null,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "project_id,path" }
-    );
-    if (error) {
-      console.warn(`/api/chat: failed to upsert project_files for room ${roomId}:`, error);
-      return null;
+    // Same Owner/Admin-write-directly split scaffoldFiles() and the plain
+    // fenced-code-block path both apply — confirmed live that this branch
+    // (reached via run_code/open_gui_session, not scaffold_web_app or a
+    // plain reply) was the one remaining project_files write with no role
+    // check at all: a Member's run_code result hit RLS on a direct UPDATE
+    // to an existing path, failed silently into a console.warn, and Koopi's
+    // closing reply went on to claim success anyway with nothing actually
+    // saved or proposed anywhere.
+    const existingFileId = fileRows?.find((f) => f.path === path)?.id;
+    const senderRole = await getSenderRole(triggerSenderId);
+    const canWriteDirectly = senderRole === "owner" || senderRole === "admin";
+
+    // `language` (the model's self-reported run_code/open_gui_session
+    // argument) still decided WHICH sandbox runner just executed this code
+    // — that's a real, separate need (SandboxRun genuinely has to know
+    // python vs. js vs. ts to run it) — but what gets PERSISTED/displayed
+    // is always derived from the actual chosen path, never trusted verbatim
+    // from the model. That mismatch (e.g. a .js file saved with
+    // language: "python") was the actual bug.
+    if (canWriteDirectly) {
+      const { error } = await supabase.from("project_files").upsert(
+        {
+          project_id: projectId,
+          path,
+          content: code,
+          language: languageFromPath(path),
+          last_edited_by: null,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "project_id,path" }
+      );
+      if (error) {
+        console.warn(`/api/chat: failed to upsert project_files for room ${roomId}:`, error);
+        return null;
+      }
+    } else {
+      let fileId = existingFileId;
+      if (!fileId) {
+        // Empty content until approved — same as scaffoldFiles' own
+        // new-file case: shows up in the tree immediately (INSERT stays
+        // open to any participant) but what it contains is still pending
+        // review.
+        const { data: inserted, error: insertErr } = await supabase
+          .from("project_files")
+          .insert({
+            project_id: projectId,
+            path,
+            content: "",
+            language: languageFromPath(path),
+            last_edited_by: null,
+          })
+          .select("id")
+          .single();
+        if (insertErr || !inserted) {
+          console.warn(`/api/chat: failed to create project_files row for room ${roomId}:`, insertErr);
+          return null;
+        }
+        fileId = inserted.id;
+      }
+      const { data: insertedChange, error: changeErr } = await supabase
+        .from("project_file_changes")
+        .insert({
+          project_file_id: fileId,
+          proposed_by: triggerSenderId,
+          proposed_content: code,
+          source: "ai_assistant",
+          thread_id: threadId,
+        })
+        .select("id")
+        .single();
+      if (insertedChange) backgroundTasks.push(summarizeProjectFileChange(supabase, insertedChange.id));
+      if (changeErr) {
+        console.warn(`/api/chat: failed to propose project_file_changes for room ${roomId}:`, changeErr);
+        return null;
+      }
+      // Not set for lastWrittenPathThisRequest below — same reasoning the
+      // contextProjectFileId branch above already follows: a proposal
+      // hasn't landed in project_files.content yet, so a later round of
+      // this same request shouldn't treat it as the current state to
+      // continue from.
+      return path;
     }
+    lastWrittenPathThisRequest = path;
     return path;
   }
 
@@ -1751,9 +2385,254 @@ export async function POST(request: Request) {
     return "done";
   }
 
+  // Simplest of the four tool handlers — no project file involved at all
+  // (a search isn't code or a file, so unlike every other tool call here
+  // there's nothing for syncProjectFile to do), just a real HTTP round trip
+  // to Tavily and the result relayed back. Same insert-tool_call/run/
+  // insert-tool_result shape every other handler uses, so the transcript
+  // renders it the same consistent way.
+  async function runWebSearchToolCall(call: PendingToolCall): Promise<"done"> {
+    const { query } = safeParse(call.arguments, { query: "" });
+
+    await supabase.from("messages").insert({
+      room_id: roomId,
+      thread_id: threadId,
+      sender_type: "agent",
+      sender_id: null,
+      type: "tool_call",
+      // Reuses ToolCallPayload's existing {code, language} shape — language:
+      // "web_search" is the signal RoomView's renderer uses to show "Searched
+      // the web" instead of a syntax-highlighted code block, `code` doubling
+      // as the query text since there's no actual code here.
+      content: JSON.stringify({ code: query, language: "web_search" }),
+      status: "complete",
+    });
+
+    const { results, answer, error } = await runWebSearch(query);
+
+    // Reuses ToolResultPayload's {stdout, stderr, exit_code} shape plus two
+    // more optional fields, same trick previewUrl/streamUrl already use.
+    const result = {
+      stdout: "",
+      stderr: error ?? "",
+      exit_code: error ? -1 : 0,
+      searchResults: results,
+      searchAnswer: answer,
+    };
+
+    await supabase.from("messages").insert({
+      room_id: roomId,
+      thread_id: threadId,
+      sender_type: "agent",
+      sender_id: null,
+      type: "tool_result",
+      content: JSON.stringify(result),
+      status: "complete",
+    });
+
+    turns.push({
+      role: "tool",
+      tool_call_id: call.id,
+      content: JSON.stringify(result),
+    });
+
+    return "done";
+  }
+
+  // Owner/Admin requests write straight to project_files.content — same
+  // can_edit_project_directly split every other write in this app already
+  // respects. Only a Member's scaffold goes through the pending-batch
+  // queue (project_file_changes, one shared batch_id — see
+  // 20260827_add_project_file_change_batch.sql), same "never a direct
+  // write" test gate components/ProjectAssistant.tsx originally established
+  // for a Member's proposals.
+  //
+  // Shared by runScaffoldToolCall (a real tool call) AND the leaked-JSON
+  // fallback below (a model that narrated the same payload as prose
+  // instead of actually calling the tool) — one write path regardless of
+  // which shape the request arrived in.
+  async function scaffoldFiles(
+    files: { path: string; content: string }[]
+  ): Promise<{ writtenPaths: string[]; proposedPaths: string[] }> {
+    const projectId = files.length ? await ensureRoomProjectId() : null;
+    const senderRole = await getSenderRole(triggerSenderId);
+    const canWriteDirectly = senderRole === "owner" || senderRole === "admin";
+    const batchId = randomUUID();
+    const writtenPaths: string[] = []; // landed directly — safe to preview
+    const proposedPaths: string[] = []; // pending — nothing to preview yet
+
+    if (projectId) {
+      const { data: existingRows } = await supabase
+        .from("project_files")
+        .select("id, path")
+        .eq("project_id", projectId);
+      const existingIdByPath = new Map((existingRows ?? []).map((r) => [r.path, r.id as string]));
+
+      for (const f of files) {
+        if (canWriteDirectly) {
+          const { error } = await supabase.from("project_files").upsert(
+            {
+              project_id: projectId,
+              path: f.path,
+              content: f.content,
+              language: languageFromPath(f.path),
+              last_edited_by: null,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "project_id,path" }
+          );
+          if (error) {
+            console.warn(`/api/chat: failed to write scaffolded file ${f.path} for room ${roomId}:`, error);
+            continue;
+          }
+          writtenPaths.push(f.path);
+          continue;
+        }
+
+        let fileId = existingIdByPath.get(f.path);
+        if (!fileId) {
+          // Empty content until approved — the file shows up in the tree
+          // immediately (already-open INSERT policy, same as any other new
+          // file) but what it actually CONTAINS is still pending review.
+          const { data: inserted, error: insertErr } = await supabase
+            .from("project_files")
+            .insert({
+              project_id: projectId,
+              path: f.path,
+              content: "",
+              language: languageFromPath(f.path),
+              last_edited_by: null,
+            })
+            .select("id")
+            .single();
+          if (insertErr || !inserted) {
+            console.warn(
+              `/api/chat: failed to create scaffolded file ${f.path} for room ${roomId}:`,
+              insertErr
+            );
+            continue;
+          }
+          fileId = inserted.id;
+        }
+
+        const { data: insertedChange, error: changeErr } = await supabase
+          .from("project_file_changes")
+          .insert({
+            project_file_id: fileId,
+            proposed_by: triggerSenderId,
+            proposed_content: f.content,
+            source: "ai_assistant",
+            batch_id: batchId,
+            thread_id: threadId,
+          })
+          .select("id")
+          .single();
+        // Fire-and-forget per file — a scaffold's N files each get their
+        // own summary, same as N separate single-file proposals would.
+        if (insertedChange) backgroundTasks.push(summarizeProjectFileChange(supabase, insertedChange.id));
+        if (changeErr) {
+          console.warn(
+            `/api/chat: failed to propose scaffolded change for ${f.path} in room ${roomId}:`,
+            changeErr
+          );
+          continue;
+        }
+        proposedPaths.push(f.path);
+      }
+    }
+
+    return { writtenPaths, proposedPaths };
+  }
+
+  function scaffoldOutcomeMessage(writtenPaths: string[], proposedPaths: string[]): string {
+    return writtenPaths.length
+      ? "Files written — open the Project panel and click Run to see it live."
+      : proposedPaths.length
+        ? "Proposed as a pending change — once an owner/admin approves it, click Run in the Project panel to see it live."
+        : "No files were written.";
+  }
+
+  async function runScaffoldToolCall(call: PendingToolCall): Promise<"done"> {
+    const { files: rawFiles, framework } = safeParse(call.arguments, {
+      files: [] as { path: string; content: string }[],
+      framework: "static" as "static" | "next",
+    });
+    const files = applyScaffoldGuards(
+      (Array.isArray(rawFiles) ? rawFiles : []).filter(
+        (f): f is { path: string; content: string } =>
+          Boolean(f && typeof f.path === "string" && f.path && typeof f.content === "string")
+      ),
+      framework
+    );
+
+    const { writtenPaths, proposedPaths } = await scaffoldFiles(files);
+
+    await supabase.from("messages").insert({
+      room_id: roomId,
+      thread_id: threadId,
+      sender_type: "agent",
+      sender_id: null,
+      type: "tool_call",
+      content: JSON.stringify({
+        code: "",
+        language: framework,
+        path: (writtenPaths.length ? writtenPaths : proposedPaths).join(", "),
+      }),
+      status: "complete",
+    });
+
+    // Deliberately does NOT call runWebApp/start a preview itself anymore —
+    // confirmed live that it produced its own throwaway sandbox every call
+    // (existingSandboxId always null here), completely disconnected from
+    // projects.preview_* (which only /api/projects/run-webapp ever writes),
+    // so the chat's own "live" link and the Project panel's actual live
+    // link could point at two different, unsynced sandboxes — one of them
+    // silently dead. One authoritative preview mechanism now: whatever's
+    // reachable via the panel's Run button, reading the same persisted
+    // project_files content this just wrote/proposed. See "run strictly
+    // from its code panel presence" in this session's own fix notes.
+    const outcome = scaffoldOutcomeMessage(writtenPaths, proposedPaths);
+
+    const result = {
+      stdout: writtenPaths.length || proposedPaths.length ? outcome : "",
+      stderr: writtenPaths.length || proposedPaths.length ? "" : outcome,
+      exit_code: writtenPaths.length || proposedPaths.length ? 0 : -1,
+    };
+
+    await supabase.from("messages").insert({
+      room_id: roomId,
+      thread_id: threadId,
+      sender_type: "agent",
+      sender_id: null,
+      type: "tool_result",
+      content: JSON.stringify(result),
+      status: "complete",
+    });
+
+    turns.push({
+      role: "tool",
+      tool_call_id: call.id,
+      content: JSON.stringify(result),
+    });
+
+    return "done";
+  }
+
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
+        // Set right before the round-cap break below, cleared by every other
+        // exit from this loop (a text reply, an interrupt, a stop request) —
+        // true only for the one case none of those cover: the model spent
+        // every round calling tools (e.g. scaffold_web_app on a large
+        // project, re-sending every file's full content each round per its
+        // own tool description) and never once wrapped up with a text
+        // reply. Before this, that path ended in total silence: each tool
+        // call still got its own card (runScaffoldToolCall's own "Files
+        // written"/"Proposed" message), but no closing reply ever arrived,
+        // which reads exactly like Koopi "just doesn't respond" even though
+        // the room's own server log shows a clean 200 with no error at all.
+        let ranOutOfRounds = false;
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
           // Only from round 1 onward — round 0 is the reply the user just
           // asked for, and stop_requested_at was just cleared for it above.
@@ -1761,10 +2640,49 @@ export async function POST(request: Request) {
 
           const outcome = await runModelTurn(controller);
 
+          // Computed once upfront, checked before anything else a text
+          // reply might trigger — a leaked scaffold_web_app payload isn't a
+          // normal reply at all, so it must never also fall through to the
+          // ordinary isFileUpdate classification below (which would
+          // otherwise see the same JSON blob as "a fenced code block" and
+          // mishandle it as a garbage single-file save).
+          const leaked =
+            outcome.kind === "text" && outcome.text ? extractLeakedScaffoldPayload(outcome.text) : null;
+          if (leaked && outcome.kind === "text" && outcome.messageId && outcome.text) {
+            const { writtenPaths, proposedPaths } = await scaffoldFiles(
+              applyScaffoldGuards(leaked.files, leaked.framework)
+            );
+            const note = scaffoldOutcomeMessage(writtenPaths, proposedPaths);
+            // The bare-JSON leak variant is typically prefixed with a stray
+            // "@scaffold_web_app" mention (the model imitating a tool-call
+            // marker as plain text) immediately before the JSON this just
+            // replaced — strip that leftover token too, not just the JSON.
+            const cleaned = outcome.text
+              .replace(leaked.fullMatch, note)
+              .replace(/@scaffold_web_app\b\s*/gi, "")
+              .trim();
+            await supabase
+              .from("messages")
+              .update({ content: cleaned || note })
+              .eq("id", outcome.messageId);
+          } else if (outcome.kind === "text" && outcome.messageId && outcome.text) {
+            // Not an unexecuted call (extractLeakedScaffoldPayload above already
+            // gets first crack at that) — just the same tag-imitation habit
+            // wrapping text that's already fine on its own, most commonly the
+            // model echoing a just-completed tool result back as its own
+            // wrap-up reply. Clean it before this is shown to anyone, and
+            // before the classification pass right below sees it too.
+            const cleaned = stripHallucinatedFunctionTags(outcome.text);
+            if (cleaned !== outcome.text) {
+              await supabase.from("messages").update({ content: cleaned }).eq("id", outcome.messageId);
+              outcome.text = cleaned;
+            }
+          }
+
           // Every completed text reply gets its own classification pass, independent of
           // whichever round produced it — a tool-use round's follow-up text is just as
           // eligible for either badge as a first-round reply.
-          if (outcome.kind === "text" && outcome.messageId && outcome.text) {
+          if (outcome.kind === "text" && outcome.messageId && outcome.text && !leaked) {
             // Extracted once upfront (cheap, regex-only) so its line count can
             // decide isFileUpdate deterministically for anything long enough
             // to be unambiguous — classifyFileUpdate (an LLM call) only gets
@@ -1802,52 +2720,188 @@ export async function POST(request: Request) {
               flagged: signals.flagged,
             };
 
+            // Moat/defensibility (PDF §4): every genuinely flagged reply —
+            // the evaluative stance actually surfacing a conflict or named
+            // risk, not just agreeing — becomes a real, queryable row
+            // instead of only ever a badge on one message that scrolls
+            // away. subject_user_id is whoever's plan/claim this turn was
+            // evaluating; decided_by stays null — a 'flagged' row is
+            // Koopi's own judgment call, not yet a human decision (unlike
+            // change_approved/rejected, logged separately by a DB trigger
+            // the moment a human actually resolves one).
+            if (signals.flagged) {
+              const { error: judgmentErr } = await supabase.from("judgment_calls").insert({
+                room_id: roomId,
+                thread_id: threadId,
+                kind: "flagged",
+                subject_user_id: triggerSenderId,
+                summary: outcome.text.trim().slice(0, 300),
+                message_id: outcome.messageId,
+              });
+              if (judgmentErr) {
+                console.warn(`/api/chat: failed to log flagged judgment call for room ${roomId}:`, judgmentErr);
+              }
+            }
+
             // Give the reply's code a persistent home in the room's project
             // instead of (only) living as static text in the transcript.
             // See chooseFileTarget for WHICH file this lands on — no longer
             // a single hardcoded path shared across every unrelated task.
-            if (isFileUpdate && block) {
+            if (isFileUpdate && block && contextProjectFileId) {
+              // Same "propose, never write directly" branch syncProjectFile
+              // takes above, for the plain-fenced-block path instead of a
+              // tool call — a "Discuss this file" thread never lets Koopi
+              // choose a target file OR write to it directly, regardless of
+              // which of the two ways it happens to produce code this turn.
+              const { data: file } = await supabase
+                .from("project_files")
+                .select("path")
+                .eq("id", contextProjectFileId)
+                .maybeSingle();
+              const { data: insertedChange, error } = file
+                ? await supabase
+                    .from("project_file_changes")
+                    .insert({
+                      project_file_id: contextProjectFileId,
+                      proposed_by: triggerSenderId,
+                      proposed_content: block.code,
+                      source: "ai_assistant",
+                      thread_id: threadId,
+                    })
+                    .select("id")
+                    .single()
+                : { data: null, error: new Error("context file not found") };
+              if (insertedChange) backgroundTasks.push(summarizeProjectFileChange(supabase, insertedChange.id));
+              if (!error && file) {
+                updates.content = outcome.text.replace(
+                  block.fullMatch,
+                  `📄 Proposed a change to ${file.path} — pending review in Changes →`
+                );
+              } else {
+                console.warn(
+                  `/api/chat: failed to propose a change for context file ${contextProjectFileId} in room ${roomId}:`,
+                  error
+                );
+              }
+            } else if (isFileUpdate && block) {
               const projectId = await ensureRoomProjectId();
               let targetPath: string | null = null;
+              let proposed = false;
               let fileErr: unknown = projectId ? null : new Error("no project for room");
               if (projectId) {
                 const { data: fileRows } = await supabase
                   .from("project_files")
-                  .select("path, content")
+                  .select("id, path, content")
                   .eq("project_id", projectId);
                 const existingPaths = (fileRows ?? []).map((f) => f.path).filter((p) => !isFolderMarker(p));
-                const candidate =
-                  explicitOpenCandidate(fileRows ?? []) ?? (await resolveContinuationHint(projectId));
+                // Same in-this-exact-request-continuation priority
+                // syncProjectFile's own comment explains — an earlier round
+                // of this same turn (a run_code tool call, say) may have
+                // already written a file that `history` (fetched before any
+                // of this turn's rounds ran) has no way to know about yet.
+                const candidate: FileContinuationCandidate | null = lastWrittenPathThisRequest
+                  ? {
+                      path: lastWrittenPathThisRequest,
+                      content: fileRows?.find((f) => f.path === lastWrittenPathThisRequest)?.content ?? "",
+                      reason: "this exact request already wrote this file a moment ago",
+                      forceExisting: true,
+                    }
+                  : (explicitOpenCandidate(fileRows ?? []) ?? (await resolveContinuationHint(projectId)));
                 const target = await chooseFileTarget(triggerText, block.language, candidate, existingPaths);
                 targetPath = target.path;
 
-                const { error } = await supabase.from("project_files").upsert(
-                  {
-                    project_id: projectId,
-                    path: target.path,
-                    content: block.code,
-                    language: block.language,
-                    // null = Koopi-authored — the agent has no profiles row, same
-                    // convention as sender_id: null on agent messages.
-                    last_edited_by: null,
-                    updated_at: new Date().toISOString(),
-                  },
-                  { onConflict: "project_id,path" }
-                );
-                fileErr = error;
+                // Same Owner/Admin-write-directly split scaffoldFiles() above
+                // already applies to a scaffold_web_app call — this plain
+                // fenced-code-block path (an ordinary chat reply, not a tool
+                // call) was the one project_files write left that never got
+                // it, so a Member's edit to an EXISTING file (globals.css,
+                // page.tsx, ... — exactly what "add Tailwind styling" touches)
+                // silently failed RLS (UPDATE is Owner/Admin-only, see
+                // 20260817_add_room_roles_and_approval.sql) with nothing ever
+                // landing in the Changes queue for review. A NEW path always
+                // worked (INSERT stays open to everyone), which is why this
+                // only ever broke edits to files that already existed.
+                const senderRole = await getSenderRole(triggerSenderId);
+                const canWriteDirectly = senderRole === "owner" || senderRole === "admin";
+
+                // block.language (the fenced block's own info-string, or
+                // "python" if untagged) is never trusted for the persisted
+                // column, same reasoning syncProjectFile's own comment gives
+                // — always derived from the chosen path instead.
+                if (canWriteDirectly) {
+                  const { error } = await supabase.from("project_files").upsert(
+                    {
+                      project_id: projectId,
+                      path: target.path,
+                      content: block.code,
+                      language: languageFromPath(target.path),
+                      // null = Koopi-authored — the agent has no profiles row, same
+                      // convention as sender_id: null on agent messages.
+                      last_edited_by: null,
+                      updated_at: new Date().toISOString(),
+                    },
+                    { onConflict: "project_id,path" }
+                  );
+                  fileErr = error;
+                } else {
+                  let fileId = fileRows?.find((f) => f.path === target.path)?.id;
+                  if (!fileId) {
+                    // Empty content until approved — same as scaffoldFiles'
+                    // own new-file case: shows up in the tree immediately
+                    // (INSERT stays open to any participant) but what it
+                    // contains is still pending review.
+                    const { data: inserted, error: insertErr } = await supabase
+                      .from("project_files")
+                      .insert({
+                        project_id: projectId,
+                        path: target.path,
+                        content: "",
+                        language: languageFromPath(target.path),
+                        last_edited_by: null,
+                      })
+                      .select("id")
+                      .single();
+                    fileId = inserted?.id;
+                    fileErr = insertErr;
+                  }
+                  if (fileId) {
+                    const { data: insertedChange, error: changeErr } = await supabase
+                      .from("project_file_changes")
+                      .insert({
+                        project_file_id: fileId,
+                        proposed_by: triggerSenderId,
+                        proposed_content: block.code,
+                        source: "ai_assistant",
+                        thread_id: threadId,
+                      })
+                      .select("id")
+                      .single();
+                    if (insertedChange) backgroundTasks.push(summarizeProjectFileChange(supabase, insertedChange.id));
+                    fileErr = changeErr;
+                    proposed = !changeErr;
+                  }
+                }
               }
               if (!fileErr) {
+                // A proposal hasn't actually landed in project_files.content
+                // yet (still pending review) — same reason syncProjectFile's
+                // own contextProjectFileId branch never sets this either, so
+                // a later block in this same turn doesn't treat unreviewed
+                // content as the "current" state to continue from.
+                if (!proposed) lastWrittenPathThisRequest = targetPath;
                 // Replace just the fenced block with a short reference, preserving
                 // any surrounding prose — not a duplicate copy of the file in every
                 // message once it already lives in the project. Names the actual
                 // file now that there's more than one possible target.
                 updates.content = outcome.text.replace(
                   block.fullMatch,
-                  `📄 Updated ${targetPath} — see it on the right →`
+                  proposed
+                    ? `📄 Proposed a change to ${targetPath} — pending review in Changes →`
+                    : `📄 Updated ${targetPath} — see it on the right →`
                 );
               } else {
                 console.warn(
-                  `/api/chat: failed to upsert project_files for room ${roomId}:`,
+                  `/api/chat: failed to write/propose project_files for room ${roomId}:`,
                   fileErr
                 );
               }
@@ -1857,12 +2911,21 @@ export async function POST(request: Request) {
           }
 
           if (outcome.kind !== "tool_use") break;
-          if (round === MAX_TOOL_ROUNDS) break;
+          if (round === MAX_TOOL_ROUNDS) {
+            ranOutOfRounds = true;
+            break;
+          }
 
           let stoppedEarly = false;
           for (const call of outcome.calls) {
             const toolOutcome =
-              call.name === "open_gui_session" ? await runGuiToolCall(call) : await runToolCall(call);
+              call.name === "open_gui_session"
+                ? await runGuiToolCall(call)
+                : call.name === "scaffold_web_app"
+                  ? await runScaffoldToolCall(call)
+                  : call.name === "web_search"
+                    ? await runWebSearchToolCall(call)
+                    : await runToolCall(call);
             if (toolOutcome === "interrupted") {
               stoppedEarly = true;
               break;
@@ -1870,9 +2933,34 @@ export async function POST(request: Request) {
           }
           if (stoppedEarly) break;
         }
+
+        // Whatever tool calls happened along the way already got their own
+        // cards (a scaffold's "Files written"/"Proposed" message, a run's
+        // output, ...) — this is specifically the closing reply that never
+        // came, so the person who asked isn't left staring at silence after
+        // everything else in the thread went quiet.
+        if (ranOutOfRounds) {
+          await supabase.from("messages").insert({
+            room_id: roomId,
+            thread_id: threadId,
+            sender_type: "agent",
+            sender_id: null,
+            type: "text",
+            content:
+              `@${triggerUsername} That took more steps than I could finish in one go — ` +
+              `check the Project panel for what landed so far, and ask me to continue if ` +
+              `anything's still missing.`,
+            status: "complete",
+          });
+        }
       } catch (err) {
         console.error(`/api/chat: unhandled error for trigger ${triggerMessageId}:`, err);
       } finally {
+        // Drained here, not left as bare fire-and-forget promises — see
+        // backgroundTasks' own comment. allSettled (not all) so one
+        // summary call failing/rejecting never throws out of this finally
+        // or blocks the others from finishing.
+        await Promise.allSettled(backgroundTasks);
         controller.close();
       }
     },

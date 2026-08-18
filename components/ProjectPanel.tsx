@@ -4,6 +4,8 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import dynamic from "next/dynamic";
 import { python } from "@codemirror/lang-python";
 import { javascript } from "@codemirror/lang-javascript";
+import { html } from "@codemirror/lang-html";
+import { EditorView } from "@codemirror/view";
 import {
   Play,
   Square,
@@ -20,24 +22,34 @@ import {
   Bot,
   Code2,
   GitPullRequest,
-  ChevronDown,
-  ChevronUp,
   Crown,
   Shield,
   User as UserIcon,
   Lock,
+  Loader2,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import type { RoomMember, ProjectFile, ProjectRunState, RoomRole } from "@/components/RoomView";
-import ProjectAssistant from "@/components/ProjectAssistant";
 import ProjectChanges from "@/components/ProjectChanges";
 import ProjectTerminal from "@/components/ProjectTerminal";
+import ProjectPreview from "@/components/ProjectPreview";
+import { languageFromPath } from "@/lib/languageFromPath";
+import { detectWebAppFramework } from "@/lib/webAppFramework";
 
 // CodeMirror touches browser globals at mount time — must never render on the
 // server. Same constraint CodePanel had, unchanged here.
 const CodeMirror = dynamic(() => import("@uiw/react-codemirror"), { ssr: false });
 
-const LANGUAGES = ["python", "javascript", "typescript", "bash"] as const;
+const LANGUAGES = [
+  "python",
+  "javascript",
+  "typescript",
+  "bash",
+  "html",
+  "css",
+  "json",
+  "markdown",
+] as const;
 
 // Same icon-per-role convention as RoomMembersModal, so the badge here and
 // the one in the members list read as the same concept.
@@ -47,34 +59,29 @@ const ROLE_ICON: Record<RoomRole, typeof Crown> = {
   member: UserIcon,
 };
 
+// lineWrapping applies to every language, not just the switch below — a
+// scaffolded web app's HTML in particular is confirmed live to sometimes
+// arrive as one genuinely valid, complete, un-formatted line (697 chars, 0
+// newlines — matches the live preview exactly, nothing wrong with the
+// content itself). Without wrapping, CodeMirror shows only whatever fits
+// before the pane's right edge and the rest just scrolls off-screen,
+// making a perfectly fine file look empty or broken. Wrapping is strictly
+// safer than reformatting the file's actual content server-side would be —
+// inserting real newlines into HTML risks introducing visible whitespace
+// gaps around adjacent inline elements (e.g. two <button>s written
+// side-by-side); this only changes how the existing text is displayed.
 function extensionsFor(language: string) {
   switch (language.toLowerCase()) {
     case "python":
-      return [python()];
+      return [python(), EditorView.lineWrapping];
     case "javascript":
-      return [javascript()];
+      return [javascript(), EditorView.lineWrapping];
     case "typescript":
-      return [javascript({ typescript: true })];
+      return [javascript({ typescript: true }), EditorView.lineWrapping];
+    case "html":
+      return [html(), EditorView.lineWrapping];
     default:
-      return [];
-  }
-}
-
-function languageFromPath(path: string): string {
-  const ext = path.split(".").pop()?.toLowerCase();
-  switch (ext) {
-    case "py":
-      return "python";
-    case "js":
-    case "mjs":
-      return "javascript";
-    case "ts":
-    case "tsx":
-      return "typescript";
-    case "sh":
-      return "bash";
-    default:
-      return "python";
+      return [EditorView.lineWrapping];
   }
 }
 
@@ -172,6 +179,11 @@ export default function ProjectPanel({
   // user-initiated ones, so it stays correct through auto-selection (e.g.
   // the first file being selected on mount) too.
   onActiveFileChange,
+  // Opens (or creates, if none exists yet for this file) a private,
+  // file-scoped thread in the room's normal chat directory — replaces the
+  // old docked "Assistant" drawer. RoomView owns thread state, so this is
+  // just a callback up to it, same shape onProposeChange already is.
+  onDiscussFile,
 }: {
   projectId: string;
   files: ProjectFile[];
@@ -182,10 +194,11 @@ export default function ProjectPanel({
   canWriteDirectly?: boolean;
   onProposeChange?: (file: ProjectFile, proposedContent: string) => Promise<void>;
   onActiveFileChange?: (file: ProjectFile | null) => void;
+  onDiscussFile?: (file: ProjectFile) => void;
 }) {
   const sortedFiles = useMemo(() => [...files].sort((a, b) => a.path.localeCompare(b.path)), [files]);
   // Everywhere that isn't the tree itself (selection, the editor, what
-  // ProjectChanges/ProjectAssistant see) should never know FOLDER_MARKER
+  // ProjectChanges sees) should never know FOLDER_MARKER
   // rows exist at all — they're an implementation detail of how an empty
   // folder stays represented (see FOLDER_MARKER's own comment), not
   // something a person could meaningfully open, propose a change to, or
@@ -284,6 +297,79 @@ export default function ProjectPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canReviewChanges, projectId, fileIds]);
 
+  // Highlights a file directly in the tree when it has a pending proposal —
+  // distinct from pendingChangeIds above, which is deliberately Owner/Admin-
+  // only (it drives the review-queue badge/toast, not relevant to a Member
+  // who isn't reviewing anything). This one is for the PROPOSER's own
+  // benefit too: a Member scaffolding something new should see right in the
+  // Editor tab that "index.js" is sitting there pending, not just discover
+  // it by clicking into Changes. Deliberately unrestricted by role — RLS on
+  // project_file_changes ("own proposals or admin/owner can read") already
+  // scopes this correctly on its own: a Member's query naturally only ever
+  // gets their own pending rows back, an Owner/Admin's gets everyone's.
+  const [pendingFileIds, setPendingFileIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (fileIds.length === 0) {
+      setPendingFileIds(new Set());
+      return;
+    }
+    const supabase = createClient();
+    let cancelled = false;
+
+    void supabase
+      .from("project_file_changes")
+      .select("project_file_id")
+      .in("project_file_id", fileIds)
+      .eq("status", "pending")
+      .then(({ data }) => {
+        if (!cancelled && data) setPendingFileIds(new Set(data.map((r) => r.project_file_id as string)));
+      });
+
+    const channel = supabase
+      .channel(`project-pending-tree:${projectId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "project_file_changes" },
+        (payload) => {
+          const row = (payload.new ?? payload.old) as Record<string, unknown> | null;
+          const fileId = row?.project_file_id as string | undefined;
+          if (!fileId || !fileIds.includes(fileId)) return;
+          const status = row?.status as string | undefined;
+
+          if (payload.eventType === "DELETE" || status !== "pending") {
+            // Another pending row for the same file might still exist —
+            // re-check rather than assume this was the only one.
+            void supabase
+              .from("project_file_changes")
+              .select("id")
+              .eq("project_file_id", fileId)
+              .eq("status", "pending")
+              .limit(1)
+              .then(({ data }) => {
+                if (cancelled) return;
+                setPendingFileIds((prev) => {
+                  const stillPending = Boolean(data?.length);
+                  if (stillPending === prev.has(fileId)) return prev;
+                  const next = new Set(prev);
+                  if (stillPending) next.add(fileId);
+                  else next.delete(fileId);
+                  return next;
+                });
+              });
+            return;
+          }
+
+          setPendingFileIds((prev) => (prev.has(fileId) ? prev : new Set(prev).add(fileId)));
+        }
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      supabase.removeChannel(channel);
+    };
+  }, [projectId, fileIds]);
+
   const [selectedId, setSelectedId] = useState<string | null>(visibleFiles[0]?.id ?? null);
   useEffect(() => {
     if (selectedId && visibleFiles.some((f) => f.id === selectedId)) return;
@@ -306,6 +392,61 @@ export default function ProjectPanel({
     // is already stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedFile?.id, selectedFile?.path]);
+
+  // "X is working on Y" (PDF §3 async coordination) — Supabase's Presence
+  // API specifically, not a plain broadcast: presence auto-syncs the FULL
+  // current state to anyone who joins the channel late (someone who opens
+  // the Project panel after a teammate already has a file open still sees
+  // them immediately), which a raw broadcast — only ever seen by clients
+  // already subscribed at the moment it fires — can't do on its own.
+  //
+  // One channel per project, created here; `presenceChannel` only flips
+  // from null once SUBSCRIBED actually fires (track() before that point
+  // silently does nothing per the Supabase JS client), which is also what
+  // the second effect below waits on before ever calling track() itself.
+  const [viewersByPath, setViewersByPath] = useState<Map<string, string[]>>(new Map());
+  const [presenceChannel, setPresenceChannel] = useState<ReturnType<
+    ReturnType<typeof createClient>["channel"]
+  > | null>(null);
+  const currentUsername = memberById.get(currentUserId)?.username ?? "Someone";
+
+  useEffect(() => {
+    const supabase = createClient();
+    const channel = supabase.channel(`project:${projectId}:presence`, {
+      config: { presence: { key: currentUserId } },
+    });
+
+    channel
+      .on("presence", { event: "sync" }, () => {
+        const state = channel.presenceState<{ path: string | null; username: string }>();
+        const map = new Map<string, string[]>();
+        for (const [userId, presences] of Object.entries(state)) {
+          if (userId === currentUserId) continue; // never show yourself as "another viewer"
+          const latest = presences[presences.length - 1];
+          if (!latest?.path) continue;
+          const list = map.get(latest.path) ?? [];
+          list.push(latest.username);
+          map.set(latest.path, list);
+        }
+        setViewersByPath(map);
+      })
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") setPresenceChannel(channel);
+      });
+
+    return () => {
+      setPresenceChannel(null);
+      void supabase.removeChannel(channel);
+    };
+  }, [projectId, currentUserId]);
+
+  // Re-tracks on the SAME channel from above whenever the selection or
+  // username changes — fires once right away too, the moment
+  // presenceChannel flips from null (the channel's own initial track()).
+  useEffect(() => {
+    if (!presenceChannel) return;
+    void presenceChannel.track({ path: selectedFile?.path ?? null, username: currentUsername });
+  }, [presenceChannel, selectedFile?.path, currentUsername]);
 
   const [draft, setDraft] = useState(selectedFile?.content ?? "");
   const [dirty, setDirty] = useState(false);
@@ -383,13 +524,6 @@ export default function ProjectPanel({
     };
   }, [contextMenu]);
   const [rightTab, setRightTab] = useState<"editor" | "changes">("editor");
-  // Docked assistant drawer within the Editor tab — replaces the old
-  // standalone "Assistant" tab (usability review: two competing "talk to
-  // AI" surfaces, room chat and this, was confusing). Same underlying
-  // ProjectAssistant component/behavior, just relocated; not tied to
-  // whether a file is selected, so the empty-state "ask the assistant"
-  // hint below can open it too.
-  const [assistantOpen, setAssistantOpen] = useState(false);
 
   const savedContentRef = useRef(selectedFile?.content ?? "");
   const dirtyRef = useRef(false);
@@ -482,6 +616,45 @@ export default function ProjectPanel({
     savedContentRef.current = draft;
     setDirty(false);
     setConflict(false);
+  }
+
+  // Autosave — direct-write users (owner/admin) get a debounced write
+  // shortly after typing pauses, without needing to reach for the Save
+  // button or Ctrl/Cmd+S below at all; those remain as an explicit,
+  // discoverable "save right now" action for anyone who wants to trigger
+  // (or just confirm) a save immediately instead of waiting/trusting it's
+  // happening in the background — this effect and that button both
+  // ultimately just call save(), so there's nothing to keep in sync between
+  // them. Deliberately NOT extended to the propose path (non-owner/admin):
+  // every save() there inserts a fresh project_file_changes row and kicks
+  // off an AI summary (see RoomView's proposeProjectFileChange) —
+  // autosaving on every pause in typing would flood the pending-changes
+  // list and burn a model call per pause instead of per deliberate "here's
+  // my change", so that path keeps its explicit, manual-only Propose button.
+  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!canWriteDirectly || !dirty || conflict) return;
+    if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = setTimeout(() => {
+      void save();
+    }, 800);
+    return () => {
+      if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft, canWriteDirectly, conflict]);
+
+  // Switching files resets the editor to the newly-selected file's content
+  // (see the [selectedId] effect above) — without this, a still-pending
+  // autosave debounce would simply be abandoned and the last few keystrokes
+  // silently lost. Flushes synchronously against the file being left,
+  // before the click's own setSelectedId(f.id) below fires.
+  function selectFile(id: string) {
+    if (canWriteDirectly && dirtyRef.current) {
+      if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+      void save();
+    }
+    setSelectedId(id);
   }
 
   function discardMine() {
@@ -710,8 +883,92 @@ export default function ProjectPanel({
 
   const isRunning = runState.status === "running";
 
+  // A "web app" project (package.json, or a .html file with no
+  // package.json — see lib/webAppFramework.ts) is served, not executed to
+  // completion — Run always re-serves the whole app via
+  // /api/projects/run-webapp regardless of which file happens to be
+  // selected, never tries to `node`-execute a .jsx file standalone.
+  const webAppFramework = useMemo(() => detectWebAppFramework(files), [files]);
+  const isPreviewBusy = runState.previewStatus === "starting";
+
+  // Purely client-side, set the instant Run/Restart is clicked — every
+  // "real" busy signal (previewStatus/status flipping to starting/running)
+  // only exists once the server round-trip lands, and that round-trip
+  // itself (POST /api/projects/run(-webapp) → CAS-claim → realtime update
+  // reaching this client) was confirmed live to take a couple of visibly
+  // silent seconds with nothing on screen acknowledging the click at all —
+  // exactly the "freezes with no sign" gap. This closes it: the button
+  // reacts on the same tick as the click, not once the network catches up.
+  const [justClicked, setJustClicked] = useState(false);
+  const startingSafetyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    // Clear as soon as the server confirms — either a real run/preview is
+    // now underway (isRunning / previewStatus no longer idle) or it already
+    // finished/failed before this client even saw "starting" in between.
+    if (isRunning || runState.previewStatus !== "idle") {
+      setJustClicked(false);
+      if (startingSafetyTimer.current) clearTimeout(startingSafetyTimer.current);
+    }
+  }, [isRunning, runState.previewStatus]);
+  useEffect(() => {
+    return () => {
+      if (startingSafetyTimer.current) clearTimeout(startingSafetyTimer.current);
+    };
+  }, []);
+
+  // Confirmed live: a preview sandbox's expiry used to renew ONLY on an
+  // explicit Run/Restart click — someone just using the live demo tab
+  // (never touching Koopi itself) generated zero traffic back here, so the
+  // clock lapsed under nothing but normal use, the sandbox became
+  // unreachable, and the next click created a fresh one on a fresh
+  // subdomain — a different origin, wiping every bit of that demo's
+  // client-side state (a "logged in" member session included). This keeps
+  // renewing it every few minutes for as long as this panel stays open on
+  // a running preview, same idea as lib/presence.ts's heartbeat for room
+  // presence. 5 minutes leaves wide margin under WEBAPP_SANDBOX_TIMEOUT_MS
+  // (1 hour) even if a tick or two drops. Best-effort/fire-and-forget — a
+  // failed renew here isn't shown anywhere; the next real Run already
+  // handles recreating a dead sandbox regardless.
+  useEffect(() => {
+    if (!webAppFramework || runState.previewStatus !== "running") return;
+    const ping = () => {
+      void fetch("/api/projects/preview-heartbeat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId }),
+      }).catch(() => {});
+    };
+    const id = setInterval(ping, 5 * 60_000);
+    return () => clearInterval(id);
+  }, [webAppFramework, runState.previewStatus, projectId]);
+
   async function runFile() {
-    if (dirty || isRunning || !selectedFile) return;
+    if (webAppFramework) {
+      if (isPreviewBusy || justClicked) return;
+      setJustClicked(true);
+      // Safety net — if the realtime update never arrives (dropped
+      // subscription, etc.) don't leave the button stuck disabled forever.
+      startingSafetyTimer.current = setTimeout(() => setJustClicked(false), 15000);
+      try {
+        const res = await fetch("/api/projects/run-webapp", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectId }),
+        });
+        if (!res.ok) {
+          console.error("ProjectPanel: run-webapp request failed", await res.text().catch(() => ""));
+          setJustClicked(false);
+        }
+      } catch (err) {
+        console.error("ProjectPanel: run-webapp request failed", err);
+        setJustClicked(false);
+      }
+      return;
+    }
+
+    if (dirty || isRunning || !selectedFile || justClicked) return;
+    setJustClicked(true);
+    startingSafetyTimer.current = setTimeout(() => setJustClicked(false), 15000);
     try {
       const res = await fetch("/api/projects/run", {
         method: "POST",
@@ -720,12 +977,15 @@ export default function ProjectPanel({
       });
       if (!res.ok) {
         console.error("ProjectPanel: run request failed", await res.text().catch(() => ""));
+        setJustClicked(false);
       }
     } catch (err) {
       console.error("ProjectPanel: run request failed", err);
+      setJustClicked(false);
     }
-    // No local state change — Running…/result arrive via the projects
-    // realtime channel, same as every other viewer sees them.
+    // Actual Running…/result state still arrives via the projects realtime
+    // channel, same as every other viewer sees them — justClicked only
+    // covers the gap before that first update lands.
   }
 
   async function stopRun() {
@@ -790,7 +1050,32 @@ export default function ProjectPanel({
           </button>
         </div>
 
-        {isRunning ? (
+        {webAppFramework ? (
+          // No Stop here — a live preview isn't an owner-scoped foreground
+          // process like a script run; Run always just (re-)serves the
+          // current files, restarting the dev/static server in place.
+          // justClicked covers the gap before the server's own "starting"
+          // status has had time to reach this client at all — see its
+          // definition above for why that gap is otherwise silent.
+          <button
+            type="button"
+            onClick={() => void runFile()}
+            disabled={isPreviewBusy || justClicked}
+            title={isPreviewBusy || justClicked ? "Starting…" : "Serve this app live"}
+            className="ml-auto flex items-center gap-1 rounded-md bg-accent px-2 py-1 text-xs font-medium text-accent-foreground transition-opacity hover:opacity-90 disabled:opacity-70"
+          >
+            {isPreviewBusy || justClicked ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={2} />
+            ) : (
+              <Play className="h-3.5 w-3.5" strokeWidth={2} />
+            )}
+            {isPreviewBusy || justClicked
+              ? "Starting…"
+              : runState.previewStatus === "running"
+                ? "Restart"
+                : "Run"}
+          </button>
+        ) : isRunning ? (
           <button
             type="button"
             onClick={() => void stopRun()}
@@ -800,12 +1085,28 @@ export default function ProjectPanel({
             <Square className="h-3.5 w-3.5" strokeWidth={2} />
             Stop
           </button>
+        ) : justClicked ? (
+          <button
+            type="button"
+            disabled
+            title="Starting…"
+            className="ml-auto flex items-center gap-1 rounded-md bg-accent px-2 py-1 text-xs font-medium text-accent-foreground opacity-70"
+          >
+            <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={2} />
+            Starting…
+          </button>
         ) : (
           <button
             type="button"
             onClick={() => void runFile()}
             disabled={dirty || !selectedFile}
-            title={dirty ? "Save before running" : `Run ${selectedFile?.path ?? ""}`}
+            title={
+              dirty
+                ? canWriteDirectly
+                  ? "Waiting for autosave…"
+                  : "Propose your change first"
+                : `Run ${selectedFile?.path ?? ""}`
+            }
             className="ml-auto flex items-center gap-1 rounded-md bg-accent px-2 py-1 text-xs font-medium text-accent-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
           >
             <Play className="h-3.5 w-3.5" strokeWidth={2} />
@@ -998,12 +1299,27 @@ export default function ProjectPanel({
                   >
                     <button
                       type="button"
-                      onClick={() => setSelectedId(f.id)}
+                      onClick={() => selectFile(f.id)}
                       className="flex min-w-0 flex-1 items-center gap-1 text-left"
                       title={f.path}
                     >
                       <FileCode className="h-3 w-3 shrink-0" strokeWidth={1.75} />
                       <span className="truncate">{f.path.split("/").pop()}</span>
+                      {(() => {
+                        const viewers = viewersByPath.get(f.path);
+                        return viewers?.length ? (
+                          <span
+                            title={`${viewers.join(", ")} ${viewers.length === 1 ? "is" : "are"} viewing this`}
+                            className="h-1.5 w-1.5 shrink-0 rounded-full bg-blue-400"
+                          />
+                        ) : null;
+                      })()}
+                      {pendingFileIds.has(f.id) && (
+                        <span
+                          title="Pending review — see Changes"
+                          className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500"
+                        />
+                      )}
                     </button>
                     <button
                       type="button"
@@ -1149,6 +1465,15 @@ export default function ProjectPanel({
             <>
               <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-1.5">
                 <span className="truncate text-xs text-foreground">{selectedFile.path}</span>
+                {(() => {
+                  const viewers = viewersByPath.get(selectedFile.path);
+                  return viewers?.length ? (
+                    <span className="flex shrink-0 items-center gap-1 truncate text-[10px] text-blue-400">
+                      <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-blue-400" />
+                      {viewers.join(", ")} {viewers.length === 1 ? "is" : "are"} also here
+                    </span>
+                  ) : null;
+                })()}
                 {!canWriteDirectly && (
                   <span
                     title="Your edits go to an admin/owner for review before they apply"
@@ -1175,32 +1500,70 @@ export default function ProjectPanel({
                     </option>
                   ))}
                 </select>
-                <button
-                  type="button"
-                  onClick={() => setAssistantOpen((v) => !v)}
-                  title="Ask about this file — private to you until you accept a suggestion"
-                  className={`flex items-center gap-1 rounded-md border px-2 py-1 text-xs transition-colors ${
-                    assistantOpen ? "border-accent text-accent" : "border-border text-muted hover:text-foreground"
-                  }`}
-                >
-                  <Bot className="h-3.5 w-3.5" strokeWidth={1.75} />
-                  Ask about this file
-                  {assistantOpen ? (
-                    <ChevronUp className="h-3 w-3" strokeWidth={2} />
-                  ) : (
-                    <ChevronDown className="h-3 w-3" strokeWidth={2} />
-                  )}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void save()}
-                  disabled={!dirty || saving || proposing || conflict}
-                  title={canWriteDirectly ? "Save (Ctrl/Cmd+S)" : "Propose change (Ctrl/Cmd+S)"}
-                  className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted transition-colors hover:text-foreground disabled:opacity-40"
-                >
-                  <Save className="h-3.5 w-3.5" strokeWidth={1.75} />
-                  {saving ? "Saving…" : proposing ? "Proposing…" : canWriteDirectly ? "Save" : "Propose"}
-                </button>
+                {onDiscussFile && (
+                  <button
+                    type="button"
+                    onClick={() => onDiscussFile(selectedFile)}
+                    title="Open a private thread about this file — visible only to you, proposed changes still need admin/owner approval"
+                    className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted transition-colors hover:text-foreground"
+                  >
+                    <Bot className="h-3.5 w-3.5" strokeWidth={1.75} />
+                    Discuss this file
+                  </button>
+                )}
+                {canWriteDirectly ? (
+                  // Edits autosave on their own (see the debounced effect
+                  // above) — this button is never load-bearing, but a new
+                  // person has no reason yet to trust that and shouldn't
+                  // have to take it on faith. Clicking it (or Ctrl/Cmd+S)
+                  // just force-flushes the pending debounce immediately;
+                  // when there's nothing dirty it's a disabled "Saved"
+                  // readout instead of disappearing entirely.
+                  <button
+                    type="button"
+                    onClick={() => void save()}
+                    disabled={!dirty || saving || conflict}
+                    title={
+                      conflict
+                        ? "Someone else's edit landed while you had unsaved changes — resolve below"
+                        : "Edits save automatically as you type — click to save right now (Ctrl/Cmd+S)"
+                    }
+                    className="flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted transition-colors hover:text-foreground disabled:opacity-60"
+                  >
+                    {conflict ? (
+                      <>
+                        <AlertTriangle className="h-3.5 w-3.5 text-amber-500" strokeWidth={1.75} />
+                        Conflict
+                      </>
+                    ) : saving ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.75} />
+                        Saving…
+                      </>
+                    ) : dirty ? (
+                      <>
+                        <Save className="h-3.5 w-3.5" strokeWidth={1.75} />
+                        Save
+                      </>
+                    ) : (
+                      <>
+                        <Save className="h-3.5 w-3.5" strokeWidth={1.75} />
+                        Saved
+                      </>
+                    )}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void save()}
+                    disabled={!dirty || proposing || conflict}
+                    title="Propose change (Ctrl/Cmd+S)"
+                    className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted transition-colors hover:text-foreground disabled:opacity-40"
+                  >
+                    <Save className="h-3.5 w-3.5" strokeWidth={1.75} />
+                    {proposing ? "Proposing…" : "Propose"}
+                  </button>
+                )}
               </div>
               <div className="min-h-0 flex-1 overflow-auto">
                 <CodeMirror
@@ -1215,41 +1578,24 @@ export default function ProjectPanel({
             </>
           ) : (
             <div className="flex flex-1 flex-col items-center justify-center gap-1.5 px-4 text-center text-xs text-muted">
-              <p>
-                Create a file, or{" "}
-                <button
-                  type="button"
-                  onClick={() => setAssistantOpen(true)}
-                  className="font-medium text-accent underline-offset-2 hover:underline"
-                >
-                  ask the assistant to generate one
-                </button>
-                .
-              </p>
+              <p>Create a file, or ask Koopi in the chat to generate one.</p>
             </div>
           )}
 
-          {assistantOpen && (
-            <div className="flex shrink-0 flex-col border-t border-border" style={{ height: 260 }}>
-              <div className="flex shrink-0 items-center gap-1.5 border-b border-border bg-background px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted">
-                <Bot className="h-3 w-3" strokeWidth={1.75} />
-                Assistant — private to you
-              </div>
-              <ProjectAssistant
-                projectId={projectId}
-                files={visibleFiles}
-                activeFile={selectedFile}
-                currentUserId={currentUserId}
-              />
-            </div>
+          {webAppFramework ? (
+            <ProjectPreview
+              runState={runState}
+              onRequestFreshLink={runFile}
+              freshLinkDisabled={isPreviewBusy || justClicked}
+            />
+          ) : (
+            <ProjectTerminal
+              projectId={projectId}
+              runState={runState}
+              currentUserId={currentUserId}
+              memberById={memberById}
+            />
           )}
-
-          <ProjectTerminal
-            projectId={projectId}
-            runState={runState}
-            currentUserId={currentUserId}
-            memberById={memberById}
-          />
             </>
           )}
         </div>

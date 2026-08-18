@@ -146,6 +146,9 @@ export default async function RoomPage({
     // Undefined (not present in the row at all) until the migration above
     // is applied — falls back to "default" the same as a genuine NULL.
     personality: (t.personality as Personality | null | undefined) ?? "default",
+    // Same undefined-until-migrated fallback, for
+    // 20260828_add_thread_context_file.sql's column.
+    contextProjectFileId: (t.context_project_file_id as string | null | undefined) ?? null,
   }));
 
   const threadIds = initialThreads.map((t) => t.id);
@@ -208,11 +211,16 @@ export default async function RoomPage({
   // thread_files single-file-per-thread model. Not lazily created here;
   // RoomView creates it client-side the first time anyone opens the panel,
   // so a room nobody has opened Project on yet simply has no project row.
+  // select("*") here too (not the explicit column list this used to be) —
+  // same 42703-hard-fails-the-whole-query reasoning the threads query above
+  // already documents, now that this row also carries
+  // 20260826_add_project_webapp_preview.sql's preview_* columns: naming
+  // them explicitly before that migration is applied would take down the
+  // whole Project panel (initialProject -> null) for every room, not just
+  // degrade the live-preview feature alone.
   const { data: projectRow } = await supabase
     .from("projects")
-    .select(
-      "id, room_id, name, created_by, run_status, run_entry_path, run_owner_id, last_run_stdout, last_run_stderr, last_run_exit_code, last_run_at, last_run_by"
-    )
+    .select("*")
     .eq("room_id", id)
     .maybeSingle();
 
@@ -230,6 +238,10 @@ export default async function RoomPage({
         lastRunExitCode: projectRow.last_run_exit_code,
         lastRunAt: projectRow.last_run_at,
         lastRunBy: projectRow.last_run_by,
+        previewStatus: (projectRow.preview_status as Project["previewStatus"] | null | undefined) ?? "idle",
+        previewUrl: (projectRow.preview_url as string | null | undefined) ?? null,
+        previewError: (projectRow.preview_error as string | null | undefined) ?? null,
+        previewFramework: (projectRow.preview_framework as string | null | undefined) ?? null,
       }
     : null;
 

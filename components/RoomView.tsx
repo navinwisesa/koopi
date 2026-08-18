@@ -29,6 +29,8 @@ import {
   AlertTriangle,
   MonitorPlay,
   ExternalLink,
+  Search,
+  Scale,
   Users,
   Paperclip,
   FileText,
@@ -38,6 +40,8 @@ import {
 import Avatar from "@/components/Avatar";
 import ProjectPanel from "@/components/ProjectPanel";
 import RoomMembersModal from "@/components/RoomMembersModal";
+import JudgmentLog from "@/components/JudgmentLog";
+import { CatchUpBanner, TldrButton } from "@/components/CatchUp";
 import NewChatModal from "@/components/NewChatModal";
 import ResizeHandle from "@/components/ResizeHandle";
 import PersonalitySelector, { type Personality } from "@/components/PersonalitySelector";
@@ -104,6 +108,11 @@ export type Thread = {
   // can run different active styles independently. See
   // 20260825_thread_scoped_personality.sql.
   personality: Personality;
+  // Set only for a "Discuss this file" thread (see ProjectPanel's
+  // onDiscussFile) — the project file this thread's conversation is scoped
+  // to, injected into the system prompt server-side by app/api/chat/route.ts.
+  // null for every ordinary thread. See 20260828_add_thread_context_file.sql.
+  contextProjectFileId: string | null;
 };
 
 // Room-scoped (not thread-scoped) — one project per room, keyed by fileId
@@ -133,6 +142,15 @@ export type ProjectRunState = {
   lastRunExitCode: number | null;
   lastRunAt: string | null;
   lastRunBy: string | null;
+  // Live web-app preview state — a genuinely separate lifecycle from
+  // status/entryPath above (a server meant to keep running, not exit), see
+  // 20260826_add_project_webapp_preview.sql. previewStatus stays 'idle' for
+  // every project that's never had a web-app run started, i.e. this is a
+  // no-op for every project this feature doesn't apply to.
+  previewStatus: "idle" | "starting" | "running" | "error";
+  previewUrl: string | null;
+  previewError: string | null;
+  previewFramework: string | null;
 };
 
 export type Project = {
@@ -143,6 +161,12 @@ export type Project = {
 } & ProjectRunState;
 
 const HEARTBEAT_MS = 30_000;
+// How many missed messages trigger the automatic "here's what you missed"
+// banner on switching into a thread — low enough to catch a real backlog,
+// high enough that a couple of quick replies while you glanced away don't
+// pop something up for no reason. The manual TL;DR button bypasses this
+// entirely and works regardless of count.
+const CATCH_UP_THRESHOLD = 5;
 // Tailwind's `lg` breakpoint — below this the sidebar is a drawer that
 // should get out of the way after a selection; above it, it stays put.
 const DRAWER_BREAKPOINT_PX = 1024;
@@ -166,6 +190,11 @@ type ToolResultPayload = {
   // Only present for open_gui_session results — a live, watchable view of a
   // GUI app running in a virtual desktop, in place of stdout/stderr.
   streamUrl?: string | null;
+  // Only present for web_search results (see lib/webSearch.ts) — a list of
+  // real results in place of stdout/stderr, plus an optional short
+  // synthesized answer.
+  searchResults?: { title: string; url: string; snippet: string }[];
+  searchAnswer?: string | null;
 };
 
 function parseJson<T>(raw: string, fallback: T): T {
@@ -225,6 +254,7 @@ function rowToThread(row: Record<string, unknown>): Thread {
     // any .select() elsewhere — undefined here (not an error) just means
     // the migration adding this column hasn't landed yet.
     personality: (row.personality as Personality | null | undefined) ?? "default",
+    contextProjectFileId: (row.context_project_file_id as string | null | undefined) ?? null,
   };
 }
 
@@ -242,6 +272,10 @@ function rowToProject(row: Record<string, unknown>): Project {
     lastRunExitCode: (row.last_run_exit_code as number | null) ?? null,
     lastRunAt: (row.last_run_at as string | null) ?? null,
     lastRunBy: (row.last_run_by as string | null) ?? null,
+    previewStatus: ((row.preview_status as string) ?? "idle") as ProjectRunState["previewStatus"],
+    previewUrl: (row.preview_url as string | null) ?? null,
+    previewError: (row.preview_error as string | null) ?? null,
+    previewFramework: (row.preview_framework as string | null) ?? null,
   };
 }
 
@@ -435,6 +469,7 @@ export default function RoomView({
   );
   const [newChatOpen, setNewChatOpen] = useState(false);
   const [membersModalOpen, setMembersModalOpen] = useState(false);
+  const [judgmentLogOpen, setJudgmentLogOpen] = useState(false);
 
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -1044,8 +1079,29 @@ export default function RoomView({
     [supabase, currentUserId]
   );
 
+  // "Here's what you missed" (PDF §3 async coordination) — the backlog has
+  // to be captured HERE, before markThreadRead below overwrites
+  // last_read_at to now, or there'd be nothing left to catch up on by the
+  // time anything could ask. CATCH_UP_THRESHOLD only gates the automatic
+  // banner; the manual TL;DR button (in the thread header) calls the same
+  // catch-up API regardless of count.
+  const [catchUp, setCatchUp] = useState<{ threadId: string; since: string; count: number } | null>(null);
+
   useEffect(() => {
-    if (activeThreadId) markThreadRead(activeThreadId);
+    if (!activeThreadId) return;
+    const previousReadAt = lastReadAt[activeThreadId];
+    if (previousReadAt) {
+      const missed = messages.filter(
+        (m) =>
+          m.threadId === activeThreadId &&
+          m.createdAt > previousReadAt &&
+          !(m.senderType === "user" && m.senderId === currentUserId)
+      ).length;
+      setCatchUp(missed >= CATCH_UP_THRESHOLD ? { threadId: activeThreadId, since: previousReadAt, count: missed } : null);
+    } else {
+      setCatchUp(null);
+    }
+    markThreadRead(activeThreadId);
     // Only re-fires on an actual thread switch, deliberately — bumping this on every
     // incoming message would spam writes. The currently-open thread is instead just
     // excluded from the unread computation below, which handles "already looking at
@@ -1118,6 +1174,53 @@ export default function RoomView({
     if (isNarrowViewport()) setSidebarOpen(false);
   }
 
+  // Replaces the old docked "Assistant" panel: opens (or creates) a private
+  // thread scoped to one project file, reusing the same
+  // create_thread_with_invites primitive every other thread already goes
+  // through — an empty invitee list means exactly one participant (its
+  // creator), private by construction, same mechanism
+  // 20260807_fix_room_memory_thread_privacy.sql's own privacy fix already
+  // relies on. create_thread_with_invites itself isn't touched (its current
+  // body isn't migration-tracked in this repo — see
+  // 20260828_add_thread_context_file.sql's own comment); the file scope is
+  // set in a second call to the small additive set_thread_context_file RPC
+  // instead.
+  async function handleDiscussFile(file: ProjectFile) {
+    const existing = threads.find(
+      (t) => t.contextProjectFileId === file.id && t.createdBy === currentUserId
+    );
+    if (existing) {
+      setActiveThreadId(existing.id);
+      if (isNarrowViewport()) setSidebarOpen(false);
+      return;
+    }
+
+    const { data, error } = await supabase.rpc("create_thread_with_invites", {
+      p_room_id: roomId,
+      p_title: `Discuss: ${file.path}`,
+      p_invitee_ids: [],
+    });
+    if (error || !data) {
+      console.error("RoomView: failed to create a discuss-file thread", error);
+      return;
+    }
+    const created = rowToThread((Array.isArray(data) ? data[0] : data) as Record<string, unknown>);
+
+    const { error: contextErr } = await supabase.rpc("set_thread_context_file", {
+      p_thread_id: created.id,
+      p_context_project_file_id: file.id,
+    });
+    if (contextErr) {
+      console.error("RoomView: failed to set the new thread's file context", contextErr);
+    }
+
+    // Optimistic: reflects the file scope locally right away rather than
+    // waiting on set_thread_context_file's own realtime round trip, same
+    // "seed ahead of replication" reasoning handleThreadCreated already
+    // applies to participants/koopi_active above.
+    handleThreadCreated({ ...created, contextProjectFileId: file.id }, [currentUserId]);
+  }
+
   // Storage object names only tolerate a limited charset reliably across
   // providers/CDNs — the ORIGINAL filename is preserved separately in
   // message_attachments.filename for display, this is only ever used to
@@ -1132,11 +1235,22 @@ export default function RoomView({
     return null;
   }
 
-  async function uploadAttachments(messageId: string, files: File[]) {
+  // Returns the names of any files that didn't make it, so handleSend can
+  // tell the sender — this used to swallow every failure into
+  // console.error/warn with nothing surfaced in the UI at all, so a name
+  // collision, network blip, or a file the bucket's own size/mime policy
+  // rejected (20260823_add_message_attachments.sql's 20MB/image+pdf-only
+  // limits) left the sender's screenshot or PDF silently never attached —
+  // the message still sent with just its text, and Koopi (seeing no
+  // attachment row at all) would react as if none had ever been sent,
+  // with no indication anywhere of why.
+  async function uploadAttachments(messageId: string, files: File[]): Promise<string[]> {
+    const failed: string[] = [];
     for (const file of files) {
       const kind = mimeToAttachmentKind(file.type);
       if (!kind) {
         console.warn(`RoomView: skipping attachment with unsupported type: ${file.type}`);
+        failed.push(file.name);
         continue;
       }
       const storagePath = `${roomId}/${messageId}/${sanitizeFilename(file.name)}`;
@@ -1144,10 +1258,12 @@ export default function RoomView({
         .from("message-attachments")
         .upload(storagePath, file, { contentType: file.type, upsert: false });
       if (uploadError) {
-        // Best-effort per file — one bad upload (name collision, a transient
-        // network blip) shouldn't take the rest of the batch or the
-        // already-sent message text down with it.
+        // Still best-effort per file — one bad upload (name collision, a
+        // transient network blip) shouldn't take the rest of the batch or
+        // the already-sent message text down with it; it's just no longer
+        // silent about which file(s) it happened to.
         console.error(`RoomView: failed to upload attachment ${file.name}`, uploadError);
+        failed.push(file.name);
         continue;
       }
       const { error: rowError } = await supabase.from("message_attachments").insert({
@@ -1159,8 +1275,12 @@ export default function RoomView({
         kind,
         byte_size: file.size,
       });
-      if (rowError) console.error(`RoomView: failed to record attachment row for ${file.name}`, rowError);
+      if (rowError) {
+        console.error(`RoomView: failed to record attachment row for ${file.name}`, rowError);
+        failed.push(file.name);
+      }
     }
+    return failed;
   }
 
   async function handleSend(e: FormEvent) {
@@ -1196,7 +1316,17 @@ export default function RoomView({
         .single();
       if (insertError) throw insertError;
 
-      if (files.length > 0) await uploadAttachments(inserted.id, files);
+      // Non-fatal — the message itself already sent successfully with its
+      // text, so a failed attachment shouldn't block Koopi from being
+      // invoked at all, just be visible instead of silently vanishing.
+      if (files.length > 0) {
+        const failed = await uploadAttachments(inserted.id, files);
+        if (failed.length > 0) {
+          setError(
+            `Couldn't attach ${failed.length === 1 ? failed[0] : `${failed.length} files (${failed.join(", ")})`} — the rest of your message still sent.`
+          );
+        }
+      }
 
       if (!shouldInvokeAgent) return;
 
@@ -1481,6 +1611,16 @@ export default function RoomView({
 
               <button
                 type="button"
+                onClick={() => setJudgmentLogOpen(true)}
+                title="Judgment log — flagged conflicts and resolved change proposals"
+                className="flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-muted transition-colors hover:text-foreground"
+              >
+                <Scale className="h-3.5 w-3.5" strokeWidth={1.75} />
+                <span className="hidden sm:inline">Judgment log</span>
+              </button>
+
+              <button
+                type="button"
                 onClick={copyInvite}
                 className="flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-muted transition-colors hover:text-foreground"
               >
@@ -1568,17 +1708,28 @@ export default function RoomView({
                 <span className="min-w-0 truncate text-sm font-medium text-foreground">
                   {activeThread.title || "Untitled thread"}
                 </span>
-                <PersonalitySelector
-                  threadId={activeThread.id}
-                  personality={activeThread.personality}
-                  onChanged={handleThreadPersonalityChanged}
-                />
+                <div className="flex shrink-0 items-center gap-2">
+                  <TldrButton threadId={activeThread.id} since={lastReadAt[activeThread.id] ?? undefined} />
+                  <PersonalitySelector
+                    threadId={activeThread.id}
+                    personality={activeThread.personality}
+                    onChanged={handleThreadPersonalityChanged}
+                  />
+                </div>
               </div>
             )}
 
             {/* ---------- transcript ---------- */}
             <div className="min-h-0 flex-1 overflow-y-auto">
               <div className="mx-auto max-w-3xl px-6 py-8">
+                {catchUp && catchUp.threadId === activeThread?.id && (
+                  <CatchUpBanner
+                    threadId={catchUp.threadId}
+                    since={catchUp.since}
+                    count={catchUp.count}
+                    onDismiss={() => setCatchUp(null)}
+                  />
+                )}
                 {threadMessages.length === 0 && !isActiveThreadTyping ? (
                   <div className="flex h-full min-h-[40vh] items-center justify-center">
                     <p className="text-sm text-muted">
@@ -1653,7 +1804,7 @@ export default function RoomView({
                               {isAgent && m.modelTier && (() => {
                                 // Groq is the primary provider for chat/build; OpenRouter is its
                                 // fallback there, but is the sole (never "fallback") provider for
-                                // code and vision — neither cohere/north-mini-code nor the vision
+                                // code and vision — neither poolside/laguna-s-2.1 nor the vision
                                 // model lives anywhere but OpenRouter.
                                 const isFallback =
                                   m.modelTier !== "code" && m.modelTier !== "vision" && m.modelProvider === "openrouter";
@@ -1705,43 +1856,102 @@ export default function RoomView({
                             )}
 
                             {m.type === "tool_call" ? (
-                              <div className="mt-1 overflow-hidden rounded-lg border border-border">
-                                <div className="flex items-center gap-1.5 border-b border-border bg-surface px-3 py-1.5 text-xs font-medium text-muted">
-                                  <Terminal className="h-3.5 w-3.5" strokeWidth={2} />
-                                  {m.status === "streaming"
-                                    ? "Running code…"
-                                    : m.status === "interrupted"
-                                      ? "Code execution stopped"
-                                      : "Ran code"}
-                                  {(() => {
-                                    const { language } = parseJson<ToolCallPayload>(
-                                      m.content,
-                                      { code: "", language: "" }
-                                    );
-                                    return language ? (
-                                      <span className="ml-auto rounded bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted">
-                                        {language}
-                                      </span>
-                                    ) : null;
-                                  })()}
-                                </div>
-                                <pre className="overflow-x-auto bg-background px-3 py-2 font-mono text-xs leading-relaxed text-foreground">
-                                  {
-                                    parseJson<ToolCallPayload>(m.content, {
-                                      code: "",
-                                      language: "",
-                                    }).code
-                                  }
-                                </pre>
-                              </div>
+                              (() => {
+                                const { code, language } = parseJson<ToolCallPayload>(m.content, {
+                                  code: "",
+                                  language: "",
+                                });
+                                // web_search reuses {code, language} purely as a
+                                // transport shape (see runWebSearchToolCall's own
+                                // comment) — code is the query text, not
+                                // anything that reads sensibly as syntax-
+                                // highlighted code, so it gets its own header/
+                                // body instead of "Ran code".
+                                if (language === "web_search") {
+                                  return (
+                                    <div className="mt-1 overflow-hidden rounded-lg border border-border">
+                                      <div className="flex items-center gap-1.5 border-b border-border bg-surface px-3 py-1.5 text-xs font-medium text-muted">
+                                        <Search className="h-3.5 w-3.5" strokeWidth={2} />
+                                        Searched the web
+                                      </div>
+                                      <p className="bg-background px-3 py-2 text-xs italic text-foreground">
+                                        “{code}”
+                                      </p>
+                                    </div>
+                                  );
+                                }
+                                return (
+                                  <div className="mt-1 overflow-hidden rounded-lg border border-border">
+                                    <div className="flex items-center gap-1.5 border-b border-border bg-surface px-3 py-1.5 text-xs font-medium text-muted">
+                                      <Terminal className="h-3.5 w-3.5" strokeWidth={2} />
+                                      {m.status === "streaming"
+                                        ? "Running code…"
+                                        : m.status === "interrupted"
+                                          ? "Code execution stopped"
+                                          : "Ran code"}
+                                      {language ? (
+                                        <span className="ml-auto rounded bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted">
+                                          {language}
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                    <pre className="overflow-x-auto bg-background px-3 py-2 font-mono text-xs leading-relaxed text-foreground">
+                                      {code}
+                                    </pre>
+                                  </div>
+                                );
+                              })()
                             ) : m.type === "tool_result" ? (
                               (() => {
-                                const { stdout, stderr, exit_code, streamUrl } =
+                                const { stdout, stderr, exit_code, streamUrl, searchResults, searchAnswer } =
                                   parseJson<ToolResultPayload>(m.content, {
                                     stdout: "",
                                     stderr: "",
                                     exit_code: 0,
                                   });
+
+                                if (searchResults) {
+                                  return (
+                                    <div className="mt-1 overflow-hidden rounded-lg border border-border">
+                                      <div className="flex items-center gap-1.5 border-b border-border bg-surface px-3 py-1.5 text-xs font-medium text-muted">
+                                        <Search className="h-3.5 w-3.5" strokeWidth={2} />
+                                        {searchResults.length > 0
+                                          ? `${searchResults.length} result${searchResults.length === 1 ? "" : "s"}`
+                                          : "No results"}
+                                      </div>
+                                      <div className="bg-background px-3 py-2">
+                                        {searchAnswer && (
+                                          <p className="mb-2 text-xs leading-relaxed text-foreground">{searchAnswer}</p>
+                                        )}
+                                        {searchResults.length > 0 ? (
+                                          <ul className="space-y-2">
+                                            {searchResults.map((r, i) => (
+                                              <li key={i} className="min-w-0">
+                                                <a
+                                                  href={r.url}
+                                                  target="_blank"
+                                                  rel="noopener noreferrer"
+                                                  className="flex items-center gap-1 truncate text-xs font-medium text-accent hover:underline"
+                                                >
+                                                  <span className="truncate">{r.title}</span>
+                                                  <ExternalLink className="h-3 w-3 shrink-0" strokeWidth={2} />
+                                                </a>
+                                                <p className="truncate text-[10px] text-muted">{r.url}</p>
+                                                {r.snippet && (
+                                                  <p className="mt-0.5 text-[11px] leading-relaxed text-foreground">
+                                                    {r.snippet}
+                                                  </p>
+                                                )}
+                                              </li>
+                                            ))}
+                                          </ul>
+                                        ) : (
+                                          stderr && <p className="text-xs text-red-400">{stderr}</p>
+                                        )}
+                                      </div>
+                                    </div>
+                                  );
+                                }
 
                                 if (streamUrl) {
                                   return (
@@ -2115,6 +2325,7 @@ export default function RoomView({
                   canWriteDirectly={canEditProjectDirectly}
                   onProposeChange={proposeProjectFileChange}
                   onActiveFileChange={setActiveProjectFile}
+                  onDiscussFile={handleDiscussFile}
                 />
               </div>
             </>
@@ -2141,6 +2352,10 @@ export default function RoomView({
           isOwner={isOwner}
           onClose={() => setMembersModalOpen(false)}
         />
+      )}
+
+      {judgmentLogOpen && (
+        <JudgmentLog roomId={roomId} members={members} onClose={() => setJudgmentLogOpen(false)} />
       )}
     </div>
   );
