@@ -2301,6 +2301,18 @@ export default function RoomView({
 
           {projectPanelOpen && project && (
             <>
+              {/* Below md there's no room for a side-by-side split, so this
+                  becomes a full-screen overlay instead — same fixed-backdrop
+                  pattern RoomSidebar already uses for its own mobile drawer
+                  (z-30 backdrop, z-40 panel), not a second, drifting
+                  convention. The toggle that opened this sits in the chat
+                  column, which this overlay now covers, so it needs its own
+                  close affordance rather than relying on that same button
+                  still being reachable. */}
+              <div
+                className="fixed inset-0 z-30 bg-black/60 md:hidden"
+                onClick={() => setProjectPanelOpen(false)}
+              />
               <div className="hidden md:block">
                 <ResizeHandle
                   onMouseDown={onCodePanelHandleMouseDown}
@@ -2308,13 +2320,29 @@ export default function RoomView({
                 />
               </div>
               <div
-                style={{ width: codePanelWidth }}
-                // Deliberate elevation/border break from the chat column,
-                // same "distinct pane" language RoomSidebar's border-r
-                // already uses on the opposite edge — the two modes
+                // codePanelWidth only applies from md up — set as a CSS
+                // variable rather than an inline `width` so it never fights
+                // the mobile overlay's own full-screen sizing (an inline
+                // width alongside `inset-0` would over-constrain the box and
+                // pin it to a narrow strip instead of filling the screen).
+                style={{ "--code-panel-width": `${codePanelWidth}px` } as React.CSSProperties}
+                // Deliberate elevation/border break from the chat column on
+                // desktop, same "distinct pane" language RoomSidebar's
+                // border-r already uses on the opposite edge — the two modes
                 // shouldn't blend together at a glance.
-                className="hidden shrink-0 border-l border-border bg-surface md:flex md:flex-col"
+                className="fixed inset-0 z-40 flex flex-col bg-surface md:static md:inset-auto md:z-auto md:w-[var(--code-panel-width)] md:shrink-0 md:border-l md:border-border"
               >
+                <div className="flex items-center justify-between border-b border-border px-4 py-3 md:hidden">
+                  <span className="text-sm font-medium text-foreground">Project</span>
+                  <button
+                    type="button"
+                    onClick={() => setProjectPanelOpen(false)}
+                    aria-label="Close project panel"
+                    className="rounded-md p-1.5 text-muted hover:text-foreground"
+                  >
+                    <X className="h-5 w-5" strokeWidth={1.75} />
+                  </button>
+                </div>
                 <ProjectPanel
                   projectId={project.id}
                   files={sortedProjectFiles}
