@@ -231,7 +231,19 @@ shared across pages, or something a static page can't do. Default to
 "static" for anything that's fundamentally a single page or a handful of
 pages (a calculator, a form, a landing page, a small dashboard, etc.) — it
 starts almost instantly, unlike installing a whole framework for something
-that doesn't need one. When you do use "next", the sandbox always installs
+that doesn't need one. If the project already has real files in it (see the
+"currently contains these files" listing elsewhere in this prompt, when
+present) — especially a framework's own structure like app/page.tsx,
+app/layout.tsx, package.json — a request to restyle, fix, or add to "the
+app" is virtually always about THAT app, not a reason to scaffold a second,
+disconnected one from scratch. Match its existing framework (don't scaffold
+"static" into a project that's already "next", or vice versa), reuse its
+existing filenames for anything you're editing, and pass its other
+untouched files through with their content exactly as shown — the same
+"never regenerate an untouched file from memory" rule that listing itself
+states applies to scaffold_web_app too, not just a plain fenced-file edit.
+Only scaffold an entirely fresh set of files when the project is genuinely
+empty or the request is for a new, unrelated app. When you do use "next", the sandbox always installs
 the latest Next.js (currently 15.x), where the App Router (the app/
 directory) is the stable default — it needs no opt-in. Do NOT write a
 next.config.js containing experimental: { appDir: true } or any other
@@ -579,36 +591,53 @@ type FileContinuationCandidate = {
 const FILE_TARGET_PROMPT = `You decide where generated code belongs in a shared multi-file
 coding project.
 
-You're given the user's current request, the code's language, the full list of paths already in
-the project, and — if one applies — a single candidate file plus a reason it was suggested.
+You're given the user's current request, the code's language, a short content preview of every
+OTHER file already in the project, and — if one applies — a single candidate file (the file Koopi
+most recently touched in this conversation) plus a reason it was suggested.
 
-Decide "existing" (the code belongs in the candidate file) vs "new" (it's a distinct, unrelated
-task that deserves its own file). Favor "existing" whenever the request is plausibly a
-continuation of the candidate — modifying, fixing, or adding to it ("add error handling to this",
-"make this support email login", "fix the bug above"), or a retry/rephrasing of the same ask that
-produced it in the first place, even if the wording doesn't match verbatim. Only answer "new" when
-the request is genuinely about a different task the candidate doesn't already cover. If the
-candidate's reason says its last run just failed with an error, weight that even more heavily
-toward "existing" — an error followed by essentially the same ask again is almost always a retry,
-not a new task. If no candidate is given at all, always answer "new" — there's nothing to
+Decide "existing" (the code belongs in a file already in the project — the candidate, or a
+DIFFERENT existing file if one of the previews is a clearly better match) vs "new" (it's a
+distinct task nothing already in the project covers). The candidate is a recency guess, not a
+content guarantee — before defaulting to it, check whether the request is actually about
+something a DIFFERENT existing file's preview shows (e.g. asked to rename a button whose exact
+text only appears in one specific file's preview, not the candidate's) — a real content match
+beats a recency guess every time. Within that, still favor "existing" whenever the request is
+plausibly a continuation of whichever file it actually matches — modifying, fixing, or adding to
+it ("add error handling to this", "make this support email login", "fix the bug above"), or a
+retry/rephrasing of the same ask that produced it in the first place, even if the wording doesn't
+match verbatim. Only answer "new" when the request is genuinely about a task nothing already in
+the project — candidate or any preview — already covers. If the candidate's reason says its last
+run just failed with an error, weight that even more heavily toward the candidate specifically —
+an error followed by essentially the same ask again is almost always a retry, not a new task.
+If no candidate is given AND no preview matches either, answer "new" — there's nothing to
 continue.
 
-Whenever target is "new" (or no candidate is given), also suggest a short, descriptive filename
-for the code — lowercase, underscores instead of spaces, a sensible extension for the language
-(e.g. "palindrome_checker.py", "median_calculator.py"). Base it on what the code actually DOES,
-not the literal wording of the request, and avoid picking something that basically duplicates a
-name already in the existing-paths list.
+When target is "existing", filename MUST be exactly one of the paths you were shown (the
+candidate's own path, or one of the other existing paths named above its preview) — never a path
+you're inventing or guessing at.
 
-Paths in this project can be nested ("utils/helpers.py", "src/api/routes.py") — the existing-paths
-list reflects the project's real folder structure, not just flat filenames. If the new file's
-purpose clearly fits an existing folder shown in that list (a small helper when a "utils/" or
-"helpers/" folder already exists, an API route when "src/api/" already has other routes in it),
-prefix your suggested filename with that same folder path so it lands alongside its siblings,
-instead of defaulting to the project root. Don't invent a NEW folder that doesn't already appear
-in existing-paths — only place a file into a folder that's already there.
+Whenever target is "new", also suggest a short, descriptive filename for the code — lowercase,
+underscores instead of spaces, a sensible extension for the language (e.g.
+"palindrome_checker.py", "median_calculator.py"). Base it on what the code actually DOES, not the
+literal wording of the request, and avoid picking something that basically duplicates a name
+already in the project.
 
-Respond with ONLY compact JSON: {"target": "existing"|"new", "filename": "short_name.ext"}
-(omit filename, or use null, when target is "existing")`;
+Paths in this project can be nested ("utils/helpers.py", "src/api/routes.py") — reflecting the
+project's real folder structure, not just flat filenames. If a new file's purpose clearly fits an
+existing folder (a small helper when a "utils/" or "helpers/" folder already exists, an API route
+when "src/api/" already has other routes in it), prefix your suggested filename with that same
+folder path so it lands alongside its siblings, instead of defaulting to the project root. Don't
+invent a NEW folder that doesn't already appear among the existing paths — only place a file into
+a folder that's already there.
+
+Respond with ONLY compact JSON: {"target": "existing"|"new", "filename": "path.ext"}`;
+
+// How much of each OTHER existing file's content to show the classifier above — enough to
+// recognize "this is clearly the file that has the text/element being asked about" without
+// pricing in every file's full content on every single file-target decision (this call happens
+// on every code-worthy reply, not just once per turn like projectFilesContextBlock).
+const FILE_TARGET_PREVIEW_CHARS_PER_FILE = 400;
+const FILE_TARGET_PREVIEW_TOTAL_CHARS = 6000;
 
 function extensionFor(language: string | undefined | null): string {
   // Confirmed live: a run_code tool call can reach here with `language`
@@ -1570,16 +1599,29 @@ export async function POST(request: Request) {
   // Decides which project_files path a piece of file-worthy code lands on.
   // `candidate` is the one file (if any) worth considering as a continuation
   // — either the sender's explicit Project-panel selection, or a same-thread
-  // fallback from resolveContinuationHint below. `existingPaths` is fetched
-  // fresh by each call site right before calling this, so a second
-  // file-worthy reply in the same turn (tool call + a final text block, say)
-  // sees whatever the first one just created and won't collide with it.
+  // fallback from resolveContinuationHint below. `existingFiles` (path +
+  // content) is fetched fresh by each call site right before calling this,
+  // so a second file-worthy reply in the same turn (tool call + a final text
+  // block, say) sees whatever the first one just created and won't collide
+  // with it.
+  //
+  // Confirmed live: `candidate` is only ever a RECENCY guess (whichever file
+  // Koopi last touched in this thread) — it has no idea whether the request
+  // is actually ABOUT that file. A member asked to rename a button; the
+  // thread's most-recently-touched file happened to be an unrelated
+  // just-scaffolded index.html with no such button in it, so the old
+  // classifier (which only ever saw the candidate's own content plus a bare
+  // list of other PATHS, no content) had nothing to recognize the real
+  // target — app/page.tsx, which actually had the button — by, and
+  // fabricated a new file instead. Passing every other file a short content
+  // preview (not just its name) is what lets the classifier catch that.
   async function chooseFileTarget(
     triggerText: string,
     language: string,
     candidate: FileContinuationCandidate | null,
-    existingPaths: string[]
+    existingFiles: { path: string; content: string }[]
   ): Promise<{ path: string; isNewFile: boolean }> {
+    const existingPaths = existingFiles.map((f) => f.path);
     const fallbackToNewFile = () => ({
       path: uniquePath(slugFilename(triggerText, language), existingPaths),
       isNewFile: true,
@@ -1597,6 +1639,22 @@ export async function POST(request: Request) {
     const fallback = () => (candidate ? { path: candidate.path, isNewFile: false } : fallbackToNewFile());
     if (!groq) return fallback();
 
+    // Every OTHER file gets a short content preview (not just its path) so
+    // the classifier can match by what a file actually contains, capped
+    // both per-file and in total — this runs on every code-worthy reply, not
+    // once per turn, so it stays much tighter than projectFilesContextBlock.
+    let previewBudget = FILE_TARGET_PREVIEW_TOTAL_CHARS;
+    const otherPreviews = existingFiles
+      .filter((f) => f.path !== candidate?.path && !isFolderMarker(f.path) && f.content)
+      .map((f) => {
+        if (previewBudget <= 0) return null;
+        const snippet = f.content.slice(0, FILE_TARGET_PREVIEW_CHARS_PER_FILE);
+        previewBudget -= snippet.length;
+        return `### ${f.path}\n${snippet}`;
+      })
+      .filter((b): b is string => b !== null)
+      .join("\n\n");
+
     try {
       const completion = await groq.chat.completions.create({
         model: GROQ_MODEL.chat,
@@ -1607,21 +1665,28 @@ export async function POST(request: Request) {
           { role: "system", content: FILE_TARGET_PROMPT },
           {
             role: "user",
-            content: candidate
-              ? `User's request:\n${triggerText}\n\nCandidate file: ${candidate.path}\n` +
-                `Why it was suggested: ${candidate.reason}\n` +
-                `--- its current content (may be empty or unrelated) ---\n${candidate.content.slice(0, 800)}\n\n` +
-                `Other existing paths in the project: ${existingPaths.filter((p) => p !== candidate.path).join(", ") || "(none)"}\n\n` +
-                `Generated code language: ${language}`
-              : `User's request:\n${triggerText}\n\nNo candidate file — nothing open, nothing recent in this thread.\n\n` +
-                `Existing paths in the project: ${existingPaths.join(", ") || "(none)"}\n\nGenerated code language: ${language}`,
+            content:
+              (candidate
+                ? `User's request:\n${triggerText}\n\nCandidate file: ${candidate.path}\n` +
+                  `Why it was suggested: ${candidate.reason}\n` +
+                  `--- its current content (may be empty or unrelated) ---\n${candidate.content.slice(0, 800)}\n\n`
+                : `User's request:\n${triggerText}\n\nNo candidate file — nothing open, nothing recent in this thread.\n\n`) +
+              `Other files already in the project (short previews — match by content, not just filename):\n` +
+              (otherPreviews || "(none)") +
+              `\n\nGenerated code language: ${language}`,
           },
         ],
       });
       const raw = completion.choices[0]?.message?.content?.trim() ?? "";
       const parsed = safeParse<{ target?: string; filename?: string }>(raw, {});
-      if (candidate && parsed.target === "existing") {
-        return { path: candidate.path, isNewFile: false };
+      if (parsed.target === "existing") {
+        const chosen = parsed.filename?.trim();
+        // Only ever an existing path the model was actually shown above —
+        // never trusted as a brand-new path just because target=="existing".
+        if (chosen && existingPaths.includes(chosen)) {
+          return { path: chosen, isNewFile: false };
+        }
+        if (candidate) return { path: candidate.path, isNewFile: false };
       }
       const suggested = parsed.filename?.trim();
       // Reject anything that doesn't look like a plausible relative path
@@ -2185,7 +2250,7 @@ export async function POST(request: Request) {
       .from("project_files")
       .select("id, path, content")
       .eq("project_id", projectId);
-    const existingPaths = (fileRows ?? []).map((f) => f.path).filter((p) => !isFolderMarker(p));
+    const existingFiles = (fileRows ?? []).filter((f) => !isFolderMarker(f.path));
 
     // A file this exact request ALREADY wrote (earlier this same round loop
     // — e.g. round 0's run_code call) wins over everything else, including
@@ -2206,7 +2271,7 @@ export async function POST(request: Request) {
         }
       : (explicitOpenCandidate(fileRows ?? []) ?? (await resolveContinuationHint(projectId)));
 
-    const { path } = await chooseFileTarget(triggerText, language, candidate, existingPaths);
+    const { path } = await chooseFileTarget(triggerText, language, candidate, existingFiles);
 
     // Same Owner/Admin-write-directly split scaffoldFiles() and the plain
     // fenced-code-block path both apply — confirmed live that this branch
@@ -2855,7 +2920,7 @@ export async function POST(request: Request) {
                   .from("project_files")
                   .select("id, path, content")
                   .eq("project_id", projectId);
-                const existingPaths = (fileRows ?? []).map((f) => f.path).filter((p) => !isFolderMarker(p));
+                const existingFiles = (fileRows ?? []).filter((f) => !isFolderMarker(f.path));
                 // Same in-this-exact-request-continuation priority
                 // syncProjectFile's own comment explains — an earlier round
                 // of this same turn (a run_code tool call, say) may have
@@ -2869,7 +2934,7 @@ export async function POST(request: Request) {
                       forceExisting: true,
                     }
                   : (explicitOpenCandidate(fileRows ?? []) ?? (await resolveContinuationHint(projectId)));
-                const target = await chooseFileTarget(triggerText, block.language, candidate, existingPaths);
+                const target = await chooseFileTarget(triggerText, block.language, candidate, existingFiles);
                 targetPath = target.path;
 
                 // Same Owner/Admin-write-directly split scaffoldFiles() above
