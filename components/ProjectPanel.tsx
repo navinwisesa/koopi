@@ -27,6 +27,8 @@ import {
   User as UserIcon,
   Lock,
   Loader2,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import type { RoomMember, ProjectFile, ProjectRunState, RoomRole } from "@/components/RoomView";
@@ -454,6 +456,11 @@ export default function ProjectPanel({
   const [proposing, setProposing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [conflict, setConflict] = useState(false);
+  // Collapsible files tree — the panel is already tight on mobile (now a
+  // full-screen overlay, see RoomView's own mobile-panel comment) where the
+  // 144px file list eats real editor width; defaults open since that's the
+  // existing, familiar layout on desktop.
+  const [filesSidebarOpen, setFilesSidebarOpen] = useState(true);
   const [newFileOpen, setNewFileOpen] = useState(false);
   const [newFilePath, setNewFilePath] = useState("");
   // Same single-active-input shape as newFileOpen/newFilePath, kept as its
@@ -1134,7 +1141,20 @@ export default function ProjectPanel({
       )}
 
       <div className="flex min-h-0 flex-1">
-        <div className="flex w-36 shrink-0 flex-col border-r border-border">
+        {!filesSidebarOpen && (
+          // Collapsed rail — same width class other icon-only rails in this
+          // app use, just enough to hold the reopen affordance without
+          // taking any real space back from the editor.
+          <button
+            type="button"
+            onClick={() => setFilesSidebarOpen(true)}
+            title="Show files"
+            className="flex w-7 shrink-0 flex-col items-center border-r border-border py-2 text-muted transition-colors hover:text-foreground"
+          >
+            <PanelLeftOpen className="h-3.5 w-3.5" strokeWidth={1.75} />
+          </button>
+        )}
+        <div className={`flex w-36 shrink-0 flex-col border-r border-border ${filesSidebarOpen ? "" : "hidden"}`}>
           <div className="flex items-center justify-between px-2 py-1.5">
             <span className="text-[10px] font-semibold uppercase tracking-wider text-muted">Files</span>
             <div className="flex items-center gap-0.5">
@@ -1153,6 +1173,14 @@ export default function ProjectPanel({
                 className="rounded p-0.5 text-muted transition-colors hover:text-foreground"
               >
                 <FolderPlus className="h-3.5 w-3.5" strokeWidth={1.75} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setFilesSidebarOpen(false)}
+                title="Hide files"
+                className="rounded p-0.5 text-muted transition-colors hover:text-foreground"
+              >
+                <PanelLeftClose className="h-3.5 w-3.5" strokeWidth={1.75} />
               </button>
             </div>
           </div>
