@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Sandbox, CommandExitError, type CommandHandle } from "e2b";
 
 export type RunResult = {
@@ -18,12 +19,23 @@ const EXEC_TIMEOUT_MS = 20_000;
 const INTERACTIVE_SANDBOX_TIMEOUT_MS = 10 * 60_000;
 const INTERACTIVE_EXEC_TIMEOUT_MS = 10 * 60_000;
 
-const RUNNERS: Record<string, { file: string; cmd: (path: string) => string }> = {
-  python: { file: "/tmp/run/main.py", cmd: (p) => `python3 ${p}` },
-  javascript: { file: "/tmp/run/main.js", cmd: (p) => `node ${p}` },
-  typescript: { file: "/tmp/run/main.ts", cmd: (p) => `npx -y tsx ${p}` },
-  bash: { file: "/tmp/run/main.sh", cmd: (p) => `bash ${p}` },
-  shell: { file: "/tmp/run/main.sh", cmd: (p) => `bash ${p}` },
+// Confirmed live (by reading, not guessing): this room-wide sandbox
+// (SandboxRun below) has no serialization at all — unlike Project-mode runs,
+// which /api/projects/run/route.ts gates behind an idle->running CAS claim
+// so only one is ever active per project, `run_code` can fire concurrently
+// from any chat request in the room with nothing stopping two people (or
+// two rounds of the same turn) from triggering it at once. A per-LANGUAGE
+// fixed path here — the shape this used to be — meant two concurrent same-
+// language run_code calls sharing this room's sandbox would both write to
+// the exact same file, each free to clobber the other's script mid-write or
+// mid-execution. `ext` (not a fixed `file`) lets run() below build a fresh,
+// unique path per call instead.
+const RUNNERS: Record<string, { ext: string; cmd: (path: string) => string }> = {
+  python: { ext: "py", cmd: (p) => `python3 ${p}` },
+  javascript: { ext: "js", cmd: (p) => `node ${p}` },
+  typescript: { ext: "ts", cmd: (p) => `npx -y tsx ${p}` },
+  bash: { ext: "sh", cmd: (p) => `bash ${p}` },
+  shell: { ext: "sh", cmd: (p) => `bash ${p}` },
 };
 
 function runnerFor(language: string) {
@@ -100,9 +112,14 @@ export class SandboxRun {
 
     try {
       const runner = runnerFor(this.language);
-      await sandbox.files.write(runner.file, this.code);
+      // Unique per call, not a fixed "main.<ext>" — see RUNNERS' own
+      // comment: this sandbox is shared room-wide with no mutual exclusion,
+      // so two concurrent same-language run_code calls must never be able
+      // to write over the exact same file.
+      const file = `/tmp/run/${randomUUID()}.${runner.ext}`;
+      await sandbox.files.write(file, this.code);
 
-      const handle = await sandbox.commands.run(runner.cmd(runner.file), {
+      const handle = await sandbox.commands.run(runner.cmd(file), {
         background: true,
         timeoutMs: EXEC_TIMEOUT_MS,
       });
@@ -342,7 +359,7 @@ export class SandboxProjectRun {
   }
 }
 
-function joinUnderRoot(root: string, relativePath: string): string {
+export function joinUnderRoot(root: string, relativePath: string): string {
   const cleaned = relativePath.replace(/\\/g, "/").split("/").filter((seg) => seg && seg !== ".");
   const stack: string[] = [];
   for (const seg of cleaned) {
