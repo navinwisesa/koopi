@@ -1693,6 +1693,15 @@ export async function POST(request: Request) {
       path: uniquePath(slugFilename(triggerText, language), existingPaths),
       isNewFile: true,
     });
+    // Belt-and-suspenders alongside resolveContinuationHint's own validation
+    // at its source: candidate.path gets returned as-is below in more than
+    // one place (the forceExisting shortcut, the classifier's "existing"
+    // answer, the no-groq/classifier-failure fallback) — every one of those
+    // is a real DB row's key the instant it's used. Discarding an implausible
+    // candidate here means a bad path can never reach any of them, no matter
+    // which source it came from or which one of resolveContinuationHint's
+    // own validation gets missed in some future change.
+    if (candidate && !isPlausibleRelativePath(candidate.path)) candidate = null;
     // The one case narrow enough to skip the classifier entirely — see
     // resolveContinuationHint for exactly when this is set.
     if (candidate?.forceExisting) {
@@ -1834,7 +1843,19 @@ export async function POST(request: Request) {
       } else if (row.type === "text") {
         path = row.content?.match(/📄 Updated (\S+) —/)?.[1];
       }
-      if (!path) continue;
+      // A scaffold_web_app tool_call's own `path` field is display text —
+      // runScaffoldToolCall joins every file it touched with ", " for a
+      // human-readable summary ("index.html, style.css"), not a single real
+      // path. Confirmed live as the actual mechanism behind a proposed
+      // change landing in a project_files row literally named
+      // "index.html, style.css": that joined string got picked up here as
+      // "the file Koopi most recently worked on", then passed through
+      // chooseFileTarget completely unvalidated (isPlausibleRelativePath
+      // only ever ran when a brand-NEW filename was being chosen — a
+      // pre-existing candidate was implicitly trusted). Rejecting it here,
+      // at the one place it enters the system, closes this regardless of
+      // how many files a single scaffold call touched.
+      if (!path || !isPlausibleRelativePath(path)) continue;
 
       const { data: fileRow } = await supabase
         .from("project_files")
