@@ -1,5 +1,29 @@
-import { PDFParse } from "pdf-parse";
 import { createWorker } from "tesseract.js";
+
+// pdf-parse's rendering path (getScreenshot, used below) goes through
+// pdfjs-dist, which — outside a real browser — expects a global `DOMMatrix`
+// to already exist and references it at MODULE LOAD time, not lazily inside
+// a function. A static top-level `import { PDFParse } from "pdf-parse"`
+// therefore made this file's own module evaluation throw
+// "ReferenceError: DOMMatrix is not defined" before any of our code ever
+// ran — confirmed live via Vercel's runtime logs, every /api/chat request
+// crashing at import. @napi-rs/canvas (pdf-parse's own native dependency,
+// see next.config.ts's serverExternalPackages comment) ships a real
+// DOMMatrix implementation; installing it on globalThis before pdf-parse is
+// loaded — and loading pdf-parse itself lazily, inside extractPdf() below,
+// rather than as a static import — fixes the ordering.
+let domMatrixReady: Promise<void> | null = null;
+function ensureDomMatrixPolyfill(): Promise<void> {
+  if (typeof (globalThis as unknown as { DOMMatrix?: unknown }).DOMMatrix !== "undefined") {
+    return Promise.resolve();
+  }
+  if (!domMatrixReady) {
+    domMatrixReady = import("@napi-rs/canvas").then(({ DOMMatrix }) => {
+      (globalThis as unknown as { DOMMatrix: unknown }).DOMMatrix = DOMMatrix;
+    });
+  }
+  return domMatrixReady;
+}
 
 // Below this many extracted characters per page, a PDF reads as
 // image-heavy/scanned rather than real body text — e.g. a screenshot of an
@@ -69,6 +93,8 @@ async function runOcr(pageImageDataUrls: string[]): Promise<string> {
  * attachment.
  */
 export async function extractPdf(data: Buffer): Promise<PdfExtraction> {
+  await ensureDomMatrixPolyfill();
+  const { PDFParse } = await import("pdf-parse");
   const parser = new PDFParse({ data });
   try {
     const textResult = await parser.getText();
