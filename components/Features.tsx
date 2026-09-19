@@ -1,5 +1,6 @@
 import { Users, SquareArrowOutUpRight, BrainCircuit, GitBranch } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import ScrollIn from "@/components/landing/ScrollIn";
 
 type Feature = {
   icon: LucideIcon;
@@ -36,32 +37,31 @@ const features: Feature[] = [
 
 export default function Features() {
   return (
-    <section id="features" className="mx-auto max-w-6xl px-6 py-20 sm:py-28">
-      <div className="mx-auto mb-14 max-w-2xl text-center">
-        <h2 className="font-display text-3xl font-semibold tracking-tight sm:text-4xl">
-          Built for teams who ship
-        </h2>
-        <p className="mt-4 text-balance text-muted">
-          Koopi drops your whole squad into the same AI coding session — no
-          hand-offs, no merge hell, no waiting your turn.
-        </p>
-      </div>
+    <section id="features" className="border-t border-border">
+      <div className="mx-auto grid max-w-6xl gap-12 px-6 py-20 sm:py-28 lg:grid-cols-[5fr_7fr] lg:gap-20">
+        <ScrollIn className="lg:sticky lg:top-28 lg:self-start">
+          <h2 className="text-balance font-display text-3xl font-semibold leading-tight tracking-tight sm:text-4xl">
+            Built for teams who ship
+          </h2>
+          <p className="mt-4 max-w-md text-pretty leading-relaxed text-muted">
+            Koopi drops your whole squad into the same AI coding session — no hand-offs, no merge hell, no waiting
+            your turn.
+          </p>
+        </ScrollIn>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {features.map(({ icon: Icon, title, description }) => (
-          <div
-            key={title}
-            className="rounded-lg border border-border bg-surface p-6 transition-colors hover:border-accent/50"
-          >
-            <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-md bg-accent/10 text-accent">
-              <Icon className="h-5 w-5" strokeWidth={1.75} />
-            </div>
-            <h3 className="font-display text-xl font-semibold">{title}</h3>
-            <p className="mt-2 text-sm leading-relaxed text-muted">
-              {description}
-            </p>
-          </div>
-        ))}
+        <ul className="border-t border-border">
+          {features.map(({ icon: Icon, title, description }, idx) => (
+            <li key={title} className="border-b border-border">
+              <ScrollIn delay={idx * 90} className="grid grid-cols-[2rem_1fr] gap-x-4 py-7">
+                <Icon className="mt-1 h-5 w-5 text-accent-text" strokeWidth={1.75} aria-hidden="true" />
+                <div>
+                  <h3 className="font-display text-xl font-semibold">{title}</h3>
+                  <p className="mt-2 max-w-[58ch] leading-relaxed text-muted">{description}</p>
+                </div>
+              </ScrollIn>
+            </li>
+          ))}
+        </ul>
       </div>
     </section>
   );
