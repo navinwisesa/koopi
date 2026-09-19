@@ -13,17 +13,15 @@ export default function Nav() {
           </span>
         </Link>
 
-        <span className="hidden h-5 w-px bg-border sm:block" />
-
-        <div className="hidden items-center gap-8 text-sm text-muted sm:flex">
-          <a href="#features" className="transition-colors hover:text-foreground">
+        <div className="ml-4 hidden items-center gap-8 text-sm text-muted sm:flex">
+          <a href="#features" className="transition-colors duration-150 hover:text-foreground">
             Features
           </a>
         </div>
 
         <Link
           href="/auth"
-          className="ml-auto rounded-md bg-accent px-4 py-2 font-display text-sm font-medium text-accent-foreground transition-opacity hover:opacity-90"
+          className="ml-auto rounded-md bg-accent px-4 py-2 font-display text-sm font-medium text-accent-foreground transition-[background-color,transform] duration-150 hover:bg-[#1f3af5] active:translate-y-px"
         >
           Let&apos;s build
         </Link>
