@@ -62,7 +62,6 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
   const editor = useRef<HTMLDialogElement>(null);
   const carpetButton = useRef<HTMLButtonElement>(null);
   const root = useRef<HTMLDivElement>(null);
-  const viewport = useRef<HTMLDivElement>(null);
   const map = useRef<SVGSVGElement>(null);
   const keys = useRef(new Set<string>());
   const destination = useRef<Point | null>(null);
@@ -99,8 +98,6 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
     positionRef.current = landing;
     setPosition(landing);
     setFacing(direction);
-    const container = viewport.current;
-    if (container && map.current) container.scrollLeft = landing.x / 960 * map.current.clientWidth - container.clientWidth / 2;
   }, [active, editing, currentFloor, floorCount, stop]);
 
   const leaveDoor = useCallback(() => {
@@ -177,13 +174,6 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
         setPosition(next);
         if (dx) setFacing(dx < 0 ? -1 : 1);
         setWalking(door === null && (next.x !== current.x || next.y !== current.y));
-        const container = viewport.current;
-        if (container && map.current) {
-          const screenX = next.x / 960 * map.current.clientWidth;
-          if (screenX < container.scrollLeft + 80 || screenX > container.scrollLeft + container.clientWidth - 80) {
-            container.scrollLeft = screenX - container.clientWidth / 2;
-          }
-        }
       } else { setWalking(false); }
       frame = requestAnimationFrame(tick);
     }
@@ -230,7 +220,7 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
         <span className={styles.floorLabel} role="status">Floor {currentFloor + 1} / {floorCount}</span>
       </div>
       <div ref={root} className={styles.playArea} tabIndex={0} role="group" aria-label="Walkable clubhouse" aria-describedby="clubhouse-help clubhouse-controls">
-        <div ref={viewport} className={styles.viewport}>
+        <div className={styles.viewport}>
           <svg ref={map} viewBox="0 0 960 620" className={styles.map} role="img" aria-label={`Clubhouse floor ${currentFloor + 1}, ${visibleRooms.length} room doors`}
             onClick={event => {
               const svg = map.current;
@@ -264,6 +254,7 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
                   <text x={x + 135} y={y + 72} fill="#e2d4c8" fontSize="12">{room.visibility}</text>
                   <g className={styles.door} role="button" tabIndex={-1} aria-label={`Walk to ${room.name}`} onClick={event => { event.stopPropagation(); walkTo(door); }}>
                     <title>{room.name} — walk to this door</title>
+                    <rect data-hit-area x={x} y={top ? 32 : 416} width="276" height="160" fill="transparent" />
                     <rect x={door.x - 123} y={y + 100} width="246" height="32" rx="6" fill={nearby === index ? "#0c29e8" : "#202a33"} stroke={nearby === index ? "#9aabff" : "#53616d"} />
                     <text x={door.x} y={y + 121} textAnchor="middle" fill="#f2f2f0" fontSize="15" fontWeight="600">{room.name.length > 25 ? `${room.name.slice(0, 24)}…` : room.name}</text>
                   </g>
@@ -272,6 +263,7 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
                   <text x={x + 138} y={y + 68} textAnchor="middle" fill="#dbcdc0" fontSize="12">Room to grow</text>
                   <g className={styles.door} role="button" tabIndex={-1} aria-label={`Walk to empty room ${index + 1}`} onClick={event => { event.stopPropagation(); walkTo(door); }}>
                     <title>Create a room here</title>
+                    <rect data-hit-area x={x} y={top ? 32 : 416} width="276" height="160" fill="transparent" />
                     <rect x={door.x - 123} y={y + 100} width="246" height="32" rx="6" fill={nearby === index ? "#0c29e8" : "#202a33"} stroke="#9aabff" strokeDasharray="4 4" />
                     <text x={door.x} y={y + 121} textAnchor="middle" fill="#f2f2f0" fontSize="15">Create a room</text>
                     <rect x={door.x - 34} y={top ? 178 : 425} width="68" height="11" rx="3" fill="#9aabff" />
@@ -297,6 +289,7 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
               return <g key={direction} className={styles.stairs} aria-label={`Walk to ${label.toLowerCase()} staircase`} role="button" tabIndex={-1}
                 onClick={event => { event.stopPropagation(); walkTo({ x: right ? 888 : 72, y: SPAWN.y }); }}>
                 <title>{label} — walk onto the stairs</title>
+                <rect data-hit-area x={x - 32} y="244" width="160" height="160" fill="transparent" />
                 <rect {...area} rx="5" fill="#141e29" stroke="#9aabff" strokeWidth="2" />
                 <g>
                   {Array.from({ length: 7 }, (_, step) => <g key={step}>

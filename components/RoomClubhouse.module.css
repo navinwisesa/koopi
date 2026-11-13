@@ -4,13 +4,13 @@
 .floorLabel { flex-shrink: 0; color: var(--accent-text); font-size: 12px; }
 .playArea { position: relative; border-block: 1px solid var(--border-strong); }
 .playArea:focus-visible { outline-offset: -3px; }
-.viewport { overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; scrollbar-color: var(--border-strong) #1c2328; }
-.map { display: block; width: 100%; min-width: 720px; cursor: crosshair; user-select: none; font-family: var(--font-nunito-sans), sans-serif; }
+.viewport { width: 100%; overflow: hidden; }
+.map { display: block; width: 100%; height: auto; aspect-ratio: 960 / 620; cursor: crosshair; user-select: none; touch-action: pan-y pinch-zoom; font-family: var(--font-nunito-sans), sans-serif; }
 .door { cursor: pointer; }
-.door:hover rect { fill: var(--accent); stroke: var(--accent-text); }
+.door:hover rect:not([data-hit-area]) { fill: var(--accent); stroke: var(--accent-text); }
 .carpet { cursor: pointer; }
 .stairs { cursor: pointer; }
-.stairs:hover > rect { stroke: #eef1ff; }
+.stairs:hover > rect:not([data-hit-area]) { stroke: #eef1ff; }
 .carpet:hover > rect:first-of-type { stroke: #aebeff; }
 .dialogue { position: absolute; bottom: 16px; left: 16px; right: 16px; display: flex; align-items: flex-start; gap: 16px; padding: 20px; border: 2px solid var(--accent-text); border-radius: 10px; background: #111b2b; box-shadow: 0 8px 24px #0006; }
 .speaker { display: grid; place-items: center; flex-shrink: 0; width: 44px; height: 44px; border-radius: 8px; background: var(--accent); color: var(--accent-foreground); font-weight: 700; font-size: 24px; }
@@ -63,6 +63,9 @@
   .enter { width: 100%; }
   .bottomBar { padding: 0 16px 16px; }
   .directory summary { padding: 16px; }
+}
+@media (max-width: 767px) {
+  .dialogue { position: static; margin: 12px; }
 }
 @media (prefers-reduced-motion: no-preference) {
   .walking .leftFoot { animation: step 260ms ease-in-out infinite alternate; }
