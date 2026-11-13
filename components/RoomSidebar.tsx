@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, MoreVertical, PanelLeft, Pencil, Plus, Trash2 } from "lucide-react";
+import Link from "next/link";
+import { ArrowLeft, ChevronDown, MoreVertical, PanelLeft, Pencil, Plus, Trash2 } from "lucide-react";
 import { presenceOf, PRESENCE_DOT, type Presence } from "@/lib/presence";
 import { createClient } from "@/lib/supabase/client";
 import { useResizableWidth } from "@/lib/useResizableWidth";
@@ -225,14 +226,13 @@ export default function RoomSidebar({
       >
         {/* ---------- sidebar top bar ---------- */}
         <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-3">
-          <button
-            type="button"
-            onClick={onNewChat}
-            className="flex items-center gap-1.5 rounded-md bg-accent px-3 py-1.5 font-display text-sm font-semibold text-accent-foreground transition-opacity hover:opacity-90"
+          <Link
+            href="/dashboard"
+            className="flex min-h-11 items-center gap-2 rounded-md px-2 font-display text-sm font-semibold text-muted transition-colors hover:bg-background hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-text"
           >
-            <Plus className="h-4 w-4" strokeWidth={2.5} />
-            New chat
-          </button>
+            <ArrowLeft className="h-4 w-4" aria-hidden="true" />
+            Back to rooms
+          </Link>
 
           <button
             type="button"
@@ -415,6 +415,16 @@ export default function RoomSidebar({
               );
             })
           )}
+        </div>
+        <div className="shrink-0 border-t border-border px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+          <button
+            type="button"
+            onClick={onNewChat}
+            className="flex min-h-11 w-full items-center justify-center gap-2 rounded-md bg-accent px-3 py-2.5 font-display text-sm font-semibold text-accent-foreground transition-opacity hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-text"
+          >
+            <Plus className="h-4 w-4" strokeWidth={2.5} aria-hidden="true" />
+            New chat
+          </button>
         </div>
       </aside>
 

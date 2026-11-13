@@ -18,6 +18,7 @@ import {
   Check,
   Square,
   ArrowUp,
+  ArrowLeft,
   PanelLeft,
   PanelRight,
   MessageSquarePlus,
@@ -1502,7 +1503,7 @@ export default function RoomView({
   }
 
   return (
-    <div className="flex h-screen bg-background">
+    <div className="flex h-dvh bg-background">
       <RoomSidebar
         threads={threads}
         threadParticipants={threadParticipants}
@@ -1536,10 +1537,10 @@ export default function RoomView({
             )}
 
             <div className="flex min-w-0 items-center gap-2">
-              <Link href="/dashboard" className="flex shrink-0 items-center">
-                <span className="flex h-7 w-7 items-center justify-center rounded-md bg-accent font-display text-sm font-bold text-accent-foreground">
+              <Link href="/dashboard" aria-label="Back to rooms" title="Back to rooms" className="flex shrink-0 items-center gap-2 rounded-md text-sm text-muted transition-colors hover:text-foreground">
+                {!sidebarOpen ? <><ArrowLeft className="h-4 w-4" aria-hidden="true" /><span className="hidden md:inline">Back to rooms</span></> : <span className="flex h-7 w-7 items-center justify-center rounded-md bg-accent font-display text-sm font-bold text-accent-foreground">
                   K
-                </span>
+                </span>}
               </Link>
 
               {editingName ? (
