@@ -300,7 +300,6 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
                 <text x={x + 48} y="385" textAnchor="middle" fill="#c1cdff" fontSize="12">{label}</text>
               </g>;
             })}
-            <text x="480" y="584" textAnchor="middle" fill="#b4c2cc" fontSize="12" letterSpacing="2">YOUR NEXT IDEA IS A DOOR AWAY</text>
             <g transform={`translate(${position.x} ${position.y})`} data-testid="clubhouse-player" aria-hidden="true" pointerEvents="none">
               <ellipse cy="8" rx="17" ry="7" fill="#10171e" opacity=".5" />
               <g transform={`scale(${facing} 1)`}>
