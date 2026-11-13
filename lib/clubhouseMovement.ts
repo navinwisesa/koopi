@@ -5,25 +5,25 @@ export function doorPosition(index: number): Point {
   return { x: 180 + (index % 3) * 300, y: index < 3 ? 236 : 398 };
 }
 
-// The player's feet are the ground anchor. Expanded plant bounds include the
-// person's body so neither keyboard movement nor tap-to-walk clips foliage.
 export function canStand(point: Point): boolean {
-  if (point.x < 55 || point.x > 905 || point.y < 230 || point.y > 404) return false;
-  return ![65, 895].some(x => Math.abs(point.x - x) < 44 && point.y > 258 && point.y < 365);
+  return point.x >= 55 && point.x <= 905 && point.y >= 230 && point.y <= 404;
 }
 
 export function movePlayer(current: Point, delta: Point): Point {
-  const next = { ...current };
-  // Substeps prevent jumping across a collider on a slow frame. Separate axes
-  // let diagonal movement slide along a solid object rather than stick to it.
-  const steps = Math.max(1, Math.ceil(Math.hypot(delta.x, delta.y) / 4));
-  for (let i = 0; i < steps; i++) {
-    const horizontal = { x: clamp(next.x + delta.x / steps, 55, 905), y: next.y };
-    if (canStand(horizontal)) next.x = horizontal.x;
-    const vertical = { x: next.x, y: clamp(next.y + delta.y / steps, 230, 404) };
-    if (canStand(vertical)) next.y = vertical.y;
-  }
-  return next;
+  return { x: clamp(current.x + delta.x, 55, 905), y: clamp(current.y + delta.y, 230, 404) };
+}
+
+export type StairDirection = -1 | 1;
+export function stairAt(point: Point, floor: number, floorCount: number): StairDirection | null {
+  if (point.y < 285 || point.y > 355) return null;
+  if (point.x <= 94 && floor > 0) return -1;
+  if (point.x >= 866 && floor < floorCount - 1) return 1;
+  return null;
+}
+
+// Land clear of the opposite staircase so a transition cannot bounce back.
+export function stairArrival(direction: StairDirection): Point {
+  return { x: direction === 1 ? 155 : 805, y: SPAWN.y };
 }
 
 export function doorAt(point: Point): number | null {
