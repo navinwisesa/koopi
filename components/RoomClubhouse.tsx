@@ -170,7 +170,7 @@ export default function RoomClubhouse({ rooms, displayName, onCreate, active }: 
             <rect x="362" y="272" width="236" height="90" rx="12" fill="#233456" stroke="#536797" strokeWidth="2" />
             <rect x="370" y="280" width="220" height="74" rx="8" fill="none" stroke="#536797" strokeDasharray="3 4" />
             <text x="480" y="310" textAnchor="middle" fill="#aebeff" fontSize="25" fontWeight="700" letterSpacing="5">KOOPI</text>
-            <text x="480" y="338" textAnchor="middle" fill="#c0c9df" fontSize="12">GOOD THINGS START HERE</text>
+            <text x="480" y="338" textAnchor="middle" fill="#c0c9df" fontSize="12">what do you wanna make today?</text>
             <Plant x={65} y={300} /><Plant x={895} y={300} />
             <rect x="70" y="558" width="116" height="16" rx="5" fill="#b39b81" />
             <rect x="774" y="558" width="116" height="16" rx="5" fill="#b39b81" />
