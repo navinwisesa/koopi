@@ -40,6 +40,24 @@ test('arrival landings are clear of both triggers so stairs cannot bounce', () =
   assert.ok(stairArrival(-1).x > SPAWN.x);
 });
 
+test('stair transition registers on first body contact at either inner edge', () => {
+  assert.equal(stairAt({ x: 808, y: 322 }, 0, 2), 1);
+  assert.equal(stairAt({ x: 807.9, y: 322 }, 0, 2), null);
+  assert.equal(stairAt({ x: 152, y: 322 }, 1, 2), -1);
+  assert.equal(stairAt({ x: 152.1, y: 322 }, 1, 2), null);
+  // Regression: standing partly inside the right stair used to do nothing.
+  assert.equal(stairAt({ x: 840, y: 322 }, 0, 2), 1);
+});
+
+test('full visible stair area registers contact from above and below', () => {
+  for (const [x, floor, direction] of [[888, 0, 1], [72, 1, -1]]) {
+    assert.equal(stairAt({ x, y: 263 }, floor, 2), direction);
+    assert.equal(stairAt({ x, y: 262.9 }, floor, 2), null);
+    assert.equal(stairAt({ x, y: 404 }, floor, 2), direction);
+  }
+  assert.equal(stairAt({ x: 807, y: 262 }, 0, 2), null);
+});
+
 test('walls bound movement while the central corridor remains traversable', () => {
   assert.deepEqual(movePlayer(SPAWN, { x: 0, y: -500 }), { x: 480, y: 230 });
   assert.deepEqual(movePlayer(SPAWN, { x: 0, y: 500 }), { x: 480, y: 404 });

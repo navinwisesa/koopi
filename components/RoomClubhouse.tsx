@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronLeft, ChevronRight, DoorOpen, Pencil, X } from "lucide-react";
 import type { RoomView } from "@/components/DashboardRooms";
-import { type Point, type StairDirection, SPAWN, clamp, doorPosition, movePlayer, doorAt, stairAt, stairArrival } from "@/lib/clubhouseMovement";
+import { type Point, type StairDirection, SPAWN, STAIR_AREAS, clamp, doorPosition, movePlayer, doorAt, stairAt, stairArrival } from "@/lib/clubhouseMovement";
 import styles from "./RoomClubhouse.module.css";
 
 const MOVEMENT: Record<string, Point> = {
@@ -261,21 +261,23 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
             </g>
             {([-1, 1] as const).map(direction => {
               const right = direction === 1;
-              const x = right ? 826 : 38;
+              const area = right ? STAIR_AREAS.right : STAIR_AREAS.left;
+              const x = area.x;
               const available = right ? currentFloor < floorCount - 1 : currentFloor > 0;
+              if (!available) return null;
               const label = right ? "Next floor" : "Previous floor";
-              return <g key={direction} className={styles.stairs} aria-label={`Walk to ${label.toLowerCase()} staircase`} aria-disabled={!available} role="button" tabIndex={-1}
-                onClick={event => { event.stopPropagation(); if (available) walkTo({ x: right ? 888 : 72, y: SPAWN.y }); }}>
-                <title>{available ? `${label} — walk onto the stairs` : right ? "You are on the top floor" : "You are on the first floor"}</title>
-                <rect x={x} y="274" width="96" height="90" rx="5" fill="#141e29" stroke={available ? "#9aabff" : "#56616d"} strokeWidth="2" />
-                <g opacity={available ? 1 : .45}>
+              return <g key={direction} className={styles.stairs} aria-label={`Walk to ${label.toLowerCase()} staircase`} role="button" tabIndex={-1}
+                onClick={event => { event.stopPropagation(); walkTo({ x: right ? 888 : 72, y: SPAWN.y }); }}>
+                <title>{label} — walk onto the stairs</title>
+                <rect {...area} rx="5" fill="#141e29" stroke="#9aabff" strokeWidth="2" />
+                <g>
                   {Array.from({ length: 7 }, (_, step) => <g key={step}>
                     <rect x={x + 7 + step * 12} y={291 - (right ? step : 6 - step) * 2} width="12" height={52 + (right ? step : 6 - step) * 2} fill={step % 2 ? "#56657a" : "#667992"} stroke="#1c2a3c" strokeWidth="1" />
                     <path d={`M${x + 8 + step * 12} ${292 - (right ? step : 6 - step) * 2}v${50 + (right ? step : 6 - step) * 2}`} stroke="#b0bed2" strokeWidth="1" />
                   </g>)}
                   <path d={right ? `M${x + 26} 312h44m-9-9 9 9-9 9` : `M${x + 70} 312H${x + 26}m9-9-9 9 9 9`} fill="none" stroke="#f2f2f0" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
                 </g>
-                <text x={x + 48} y="385" textAnchor="middle" fill={available ? "#c1cdff" : "#b4c2cc"} fontSize="12">{available ? label : right ? "Top floor" : "First floor"}</text>
+                <text x={x + 48} y="385" textAnchor="middle" fill="#c1cdff" fontSize="12">{label}</text>
               </g>;
             })}
             <rect x="70" y="558" width="116" height="16" rx="5" fill="#b39b81" />
@@ -347,7 +349,7 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
               } }}><Icon size={18} /></button>
           ))}
         </div>
-        {floorCount > 1 && <div className={styles.pagination}><button type="button" aria-label="Previous floor" disabled={!active || editing || prompt !== null || currentFloor === 0} onClick={() => takeStairs(-1)}><ChevronLeft size={18} /></button><span>Floor {currentFloor + 1}</span><button type="button" aria-label="Next floor" disabled={!active || editing || prompt !== null || currentFloor === floorCount - 1} onClick={() => takeStairs(1)}><ChevronRight size={18} /></button></div>}
+        {floorCount > 1 && <div className={styles.pagination}>{currentFloor > 0 && <button type="button" aria-label="Previous floor" disabled={!active || editing || prompt !== null} onClick={() => takeStairs(-1)}><ChevronLeft size={18} /></button>}<span>Floor {currentFloor + 1}</span>{currentFloor < floorCount - 1 && <button type="button" aria-label="Next floor" disabled={!active || editing || prompt !== null} onClick={() => takeStairs(1)}><ChevronRight size={18} /></button>}</div>}
       </div>
       <button ref={carpetButton} type="button" onClick={openEditor} className={styles.editCarpet}><Pencil size={14} aria-hidden="true" />Customize carpet</button>
       <dialog ref={editor} className={styles.editor} aria-labelledby="carpet-editor-title" onCancel={event => { event.preventDefault(); closeEditor(); }} onClose={() => setEditing(false)}>

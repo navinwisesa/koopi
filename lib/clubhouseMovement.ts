@@ -14,10 +14,19 @@ export function movePlayer(current: Point, delta: Point): Point {
 }
 
 export type StairDirection = -1 | 1;
+export const STAIR_AREAS = {
+  left: { x: 38, y: 274, width: 96, height: 90 },
+  right: { x: 826, y: 274, width: 96, height: 90 },
+} as const;
+
 export function stairAt(point: Point, floor: number, floorCount: number): StairDirection | null {
-  if (point.y < 285 || point.y > 355) return null;
-  if (point.x <= 94 && floor > 0) return -1;
-  if (point.x >= 866 && floor < floorCount - 1) return 1;
+  // Match the character's visible body, not just the feet anchor. The name
+  // bubble is decoration and does not participate in physical contact.
+  const touches = (area: typeof STAIR_AREAS.left | typeof STAIR_AREAS.right) =>
+    point.x + 18 >= area.x && point.x - 18 <= area.x + area.width &&
+    point.y + 11 >= area.y && point.y - 56 <= area.y + area.height;
+  if (floor > 0 && touches(STAIR_AREAS.left)) return -1;
+  if (floor < floorCount - 1 && touches(STAIR_AREAS.right)) return 1;
   return null;
 }
 
