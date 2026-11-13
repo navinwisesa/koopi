@@ -12,17 +12,18 @@ export default function Hero() {
           What will{" "}
           <span className="whitespace-nowrap">
             you
-            <span className="relative inline-block w-0 align-baseline">
+            <span className="relative inline-block whitespace-pre align-baseline">
+              {" "}
               <span
                 aria-hidden="true"
-                className="pointer-events-none absolute bottom-[0.62em] left-[0.28em] flex -translate-x-1/2 -rotate-6 flex-col items-center text-accent-text"
+                className="pointer-events-none absolute bottom-[0.62em] left-1/2 flex -translate-x-1/2 flex-col items-center text-accent-text"
               >
-                <span className="font-sans text-[0.36em] font-semibold italic leading-none">guys</span>
+                <span className="-rotate-6 font-sans text-[0.36em] font-semibold italic leading-none">guys</span>
                 <svg viewBox="0 0 16 10" className="mt-[0.06em] h-[0.16em] w-[0.26em]" fill="none">
                   <path d="M1 1.5 8 8.5l7-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </span>
-            </span>{" "}
+            </span>
             make
           </span>{" "}
           today?
