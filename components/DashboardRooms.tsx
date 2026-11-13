@@ -1,11 +1,10 @@
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import dynamic from "next/dynamic";
-import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Plus, LogIn, X, Users, Globe, Mail, Lock, Trash2, List, Map } from "lucide-react";
-import Avatar from "@/components/Avatar";
+import { Plus, LogIn, X } from "lucide-react";
+import type { Carpet } from "@/lib/accountCarpet";
 import CreateRoomModal, { type Visibility } from "@/components/CreateRoomModal";
 import { createClient } from "@/lib/supabase/client";
 
@@ -18,7 +17,6 @@ export type RoomView = {
   lastActive: string;
 };
 
-const VIS_ICON = { public: Globe, invited: Mail, private: Lock } as const;
 const RoomClubhouse = dynamic(() => import("@/components/RoomClubhouse"), {
   loading: () => <p className="py-20 text-center text-muted" role="status">Opening the clubhouse…</p>,
 });
@@ -32,12 +30,14 @@ export default function DashboardRooms({
   userId,
   displayName,
   loadError,
+  initialCarpet,
 }: {
   rooms: RoomView[];
   workspaceId: string | null;
   userId: string;
   displayName: string;
   loadError: string | null;
+  initialCarpet?: Carpet | null;
 }) {
   const router = useRouter();
   const [showCreate, setShowCreate] = useState(false);
@@ -45,45 +45,7 @@ export default function DashboardRooms({
   const [joining, setJoining] = useState(false);
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(loadError);
-  // Inline "are you sure" instead of a modal — matches this list's own
-  // lightweight feel, but a room delete is destructive enough (every
-  // thread, message, and project file in it, cascading in Postgres — see
-  // 20260830_add_room_delete_policy.sql) that it still gets a real
-  // confirmation step, unlike a single file delete elsewhere in this app.
-  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [view, setView] = useState<"simple" | "world">("simple");
-  const [viewReady, setViewReady] = useState(false);
-
-  useEffect(() => {
-    try {
-      setView(localStorage.getItem(`koopi:rooms-view:${userId}`) === "world" ? "world" : "simple");
-    } catch { /* Storage may be unavailable in private browsing. */ }
-    setViewReady(true);
-  }, [userId]);
-
-  function changeView(next: "simple" | "world") {
-    setView(next);
-    try { localStorage.setItem(`koopi:rooms-view:${userId}`, next); } catch { /* Keep the toggle usable. */ }
-  }
-
   const working = busy;
-
-  async function handleDeleteRoom(roomId: string) {
-    setDeletingId(roomId);
-    const { error: deleteError } = await createClient().from("rooms").delete().eq("id", roomId);
-    setDeletingId(null);
-    setConfirmingDeleteId(null);
-    if (deleteError) {
-      // RLS silently returns zero rows deleted (not a thrown error) for
-      // anyone who isn't the room's creator — this message only ever
-      // surfaces for a genuine failure (network, etc.), not a permission
-      // gap, since the button itself is only ever shown to the creator.
-      setError(deleteError.message || "Could not delete that room.");
-      return;
-    }
-    router.refresh();
-  }
 
   async function handleJoin(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -201,126 +163,9 @@ export default function DashboardRooms({
       )}
 
       <section className="mt-14">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="font-display text-sm font-semibold uppercase tracking-wider text-muted">
-          Your rooms
-        </h2>
-        <div role="group" aria-label="Room selection view" className="flex rounded-lg border border-border bg-surface p-1">
-          {([{ id: "simple", label: "Simple", icon: List }, { id: "world", label: "World", icon: Map }] as const).map(({ id, label, icon: Icon }) => (
-            <button key={id} type="button" aria-pressed={view === id} disabled={!viewReady}
-              onClick={() => changeView(id)}
-              className={`flex min-h-10 items-center gap-2 rounded-md px-3 text-sm font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-text ${view === id ? "bg-accent text-accent-foreground" : "text-muted hover:text-foreground"}`}>
-              <Icon className="h-4 w-4" aria-hidden="true" />{label}
-            </button>
-          ))}
-        </div>
-        </div>
-
-        {view === "world" ? (
-          <RoomClubhouse rooms={rooms} userId={userId} displayName={displayName} onCreate={() => setShowCreate(true)} active={!showCreate && !joining} />
-        ) : rooms.length === 0 ? (
-          <div className="mt-4 rounded-xl border border-dashed border-border px-6 py-14 text-center">
-            <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-full bg-accent/10 text-accent">
-              <Users className="h-5 w-5" strokeWidth={1.75} />
-            </div>
-            <p className="font-display text-base font-semibold">No rooms yet</p>
-            <p className="mt-1 text-sm text-muted">Create one to get started.</p>
-          </div>
-        ) : (
-          <ul className="mt-4 flex flex-col gap-2">
-            {rooms.map((room) => {
-              const VisIcon = VIS_ICON[room.visibility] ?? Lock;
-              const isOwner = room.createdBy === userId;
-
-              if (confirmingDeleteId === room.id) {
-                return (
-                  <li key={room.id}>
-                    <div className="flex items-center justify-between gap-4 rounded-lg border border-red-500/40 bg-red-500/5 px-5 py-4">
-                      <p className="min-w-0 text-sm text-foreground">
-                        Delete <span className="font-semibold">{room.name}</span>? Every thread,
-                        message, and project file in it goes with it — this can&apos;t be undone.
-                      </p>
-                      <div className="flex shrink-0 items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => setConfirmingDeleteId(null)}
-                          disabled={deletingId === room.id}
-                          className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted transition-colors hover:text-foreground disabled:opacity-60"
-                        >
-                          Cancel
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void handleDeleteRoom(room.id)}
-                          disabled={deletingId === room.id}
-                          className="rounded-md bg-red-500 px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-60"
-                        >
-                          {deletingId === room.id ? "Deleting…" : "Delete room"}
-                        </button>
-                      </div>
-                    </div>
-                  </li>
-                );
-              }
-
-              return (
-                <li key={room.id} className="group flex items-center gap-2">
-                  <Link
-                    href={`/room/${room.id}`}
-                    className="flex min-w-0 flex-1 items-center gap-4 rounded-lg border border-border bg-surface px-5 py-4 transition-colors hover:border-accent/50"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate font-display text-base font-semibold">
-                        {room.name}
-                      </p>
-                      <p className="mt-0.5 flex items-center gap-1.5 text-xs text-muted">
-                        <VisIcon className="h-3 w-3" strokeWidth={1.75} />
-                        {room.visibility}
-                      </p>
-                    </div>
-
-                    <div className="flex shrink-0 -space-x-2">
-                      {room.members.slice(0, 3).map((m, i) => (
-                        <Avatar
-                          key={`${room.id}-${m.name}-${i}`}
-                          name={m.name}
-                          src={m.avatarUrl}
-                          size="sm"
-                          className="ring-2 ring-surface"
-                        />
-                      ))}
-                      {room.members.length > 3 && (
-                        <span className="flex h-6 w-6 items-center justify-center rounded-full bg-border text-[10px] font-medium text-muted ring-2 ring-surface">
-                          +{room.members.length - 3}
-                        </span>
-                      )}
-                    </div>
-
-                    <span className="hidden w-24 shrink-0 text-right text-sm text-muted sm:block">
-                      {room.lastActive}
-                    </span>
-                  </Link>
-
-                  {/* Sibling to the Link, not nested inside it — a <button>
-                      inside an <a> is invalid HTML. Owner-only: RLS
-                      (20260830_add_room_delete_policy.sql) already enforces
-                      this server-side regardless, but there's no reason to
-                      show a Member a delete button that can only ever fail. */}
-                  {isOwner && (
-                    <button
-                      type="button"
-                      onClick={() => setConfirmingDeleteId(room.id)}
-                      title="Delete room"
-                      className="shrink-0 rounded-lg border border-border p-3 text-muted opacity-0 transition-colors hover:border-red-500/40 hover:text-red-500 focus-visible:opacity-100 group-hover:opacity-100"
-                    >
-                      <Trash2 className="h-4 w-4" strokeWidth={1.75} />
-                    </button>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        )}
+        <h2 className="font-display text-sm font-semibold uppercase tracking-wider text-muted">Your rooms</h2>
+        <RoomClubhouse rooms={rooms} userId={userId} displayName={displayName} initialCarpet={initialCarpet}
+          onCreate={() => setShowCreate(true)} active={!showCreate && !joining} />
       </section>
     </>
   );

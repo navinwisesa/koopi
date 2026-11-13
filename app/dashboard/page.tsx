@@ -4,6 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import BackgroundGrid from "@/components/BackgroundGrid";
 import UserMenu from "@/components/UserMenu";
 import DashboardRooms, { type RoomView } from "@/components/DashboardRooms";
+import { carpetFromMetadata } from "@/lib/accountCarpet";
 
 /** Formatted on the server and passed down, so the string is stable through hydration. */
 function relativeTime(iso: string | null): string {
@@ -159,6 +160,7 @@ export default async function DashboardPage() {
             userId={user.id}
             displayName={username}
             loadError={roomsError?.message ?? null}
+            initialCarpet={carpetFromMetadata(meta)}
           />
         </div>
       </main>

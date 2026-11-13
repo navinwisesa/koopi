@@ -2,11 +2,15 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import Link from "next/link";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronLeft, ChevronRight, DoorOpen, Layers, Pencil, X } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronLeft, ChevronRight, DoorOpen, House, Layers, Pencil, X } from "lucide-react";
 import type { RoomView } from "@/components/DashboardRooms";
 import { type Point, type StairDirection, SPAWN, STAIR_AREAS, clamp, doorPosition, movePlayer, doorAt, stairAt, stairArrival } from "@/lib/clubhouseMovement";
 import styles from "./RoomClubhouse.module.css";
+import { type Carpet, DEFAULT_CARPET } from "@/lib/accountCarpet";
+import { useAccountCarpet } from "@/lib/useAccountCarpet";
+import { APARTMENT_DESTINATIONS, APARTMENT_SPAWN, HOME_PORTAL_AREA, apartmentPath, atApartmentExit, atHomePortal, moveInApartment } from "@/lib/apartmentMovement";
+import ApartmentInterior from "@/components/ApartmentInterior";
+import WorldRoomDirectory from "@/components/WorldRoomDirectory";
 
 const MOVEMENT: Record<string, Point> = {
   ArrowUp: { x: 0, y: -1 }, w: { x: 0, y: -1 },
@@ -14,7 +18,6 @@ const MOVEMENT: Record<string, Point> = {
   ArrowLeft: { x: -1, y: 0 }, a: { x: -1, y: 0 },
   ArrowRight: { x: 1, y: 0 }, d: { x: 1, y: 0 },
 };
-const DEFAULT_CARPET = { headline: "KOOPI", caption: "what do you wanna make today?" };
 const isTyping = (target: EventTarget | null) => target instanceof HTMLElement && !!target.closest('input, textarea, select, [contenteditable="true"], [role="dialog"]');
 
 function CarpetText({ children, y, size, headline = false }: {
@@ -45,26 +48,27 @@ function CarpetText({ children, y, size, headline = false }: {
     fontFamily={headline ? "var(--font-league-spartan), sans-serif" : undefined}>{children}</text>;
 }
 
-export default function RoomClubhouse({ rooms, userId, displayName, onCreate, active }: {
-  rooms: RoomView[]; userId: string; displayName: string; onCreate: () => void; active: boolean;
+export default function RoomClubhouse({ rooms, userId, displayName, onCreate, active, initialCarpet }: {
+  rooms: RoomView[]; userId: string; displayName: string; onCreate: () => void; active: boolean; initialCarpet?: Carpet | null;
 }) {
   const router = useRouter();
   const [floor, setFloor] = useState(0);
+  const [inApartment, setInApartment] = useState(false);
   const [position, setPosition] = useState<Point>(SPAWN);
   const [walking, setWalking] = useState(false);
   const [facing, setFacing] = useState(1);
   const [prompt, setPrompt] = useState<number | null>(null);
   const promptRef = useRef<number | null>(null);
   const [editing, setEditing] = useState(false);
-  const [carpet, setCarpet] = useState(DEFAULT_CARPET);
+  const { carpet, ready: carpetReady, saving: carpetSaving, error: carpetError, save: saveAccountCarpet, reload: reloadCarpet } = useAccountCarpet(userId, initialCarpet);
   const [draft, setDraft] = useState(DEFAULT_CARPET);
-  const [storageError, setStorageError] = useState("");
   const editor = useRef<HTMLDialogElement>(null);
   const carpetButton = useRef<HTMLButtonElement>(null);
   const root = useRef<HTMLDivElement>(null);
   const map = useRef<SVGSVGElement>(null);
   const keys = useRef(new Set<string>());
   const destination = useRef<Point | null>(null);
+  const waypoints = useRef<Point[]>([]);
   const positionRef = useRef<Point>(SPAWN);
   const floorCount = Math.floor(rooms.length / 6) + 1;
   const currentFloor = Math.min(floor, floorCount - 1);
@@ -73,23 +77,33 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
   const promptedRoom = prompt === null ? undefined : visibleRooms[prompt];
   const topDoor = prompt !== null && prompt < 3;
 
-  useEffect(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(`koopi:carpet:${userId}`) ?? "null");
-      if (saved && typeof saved.headline === "string" && typeof saved.caption === "string") {
-        setCarpet({ headline: saved.headline.slice(0, 22), caption: saved.caption.slice(0, 46) });
-      }
-    } catch { /* Default carpet remains available without storage. */ }
-  }, [userId]);
-
   const stop = useCallback(() => {
     keys.current.clear();
     destination.current = null;
+    waypoints.current = [];
     setWalking(false);
   }, []);
 
-  const takeStairs = useCallback((direction: StairDirection) => {
+  const enterApartment = useCallback(() => {
     if (!active || editing || promptRef.current !== null) return;
+    stop();
+    setInApartment(true);
+    positionRef.current = APARTMENT_SPAWN;
+    setPosition(APARTMENT_SPAWN);
+  }, [active, editing, stop]);
+
+  const exitApartment = useCallback(() => {
+    if (!active || editing) return;
+    stop();
+    setInApartment(false);
+    setFloor(0);
+    const landing = stairArrival(1);
+    positionRef.current = landing;
+    setPosition(landing);
+  }, [active, editing, stop]);
+
+  const takeStairs = useCallback((direction: StairDirection) => {
+    if (!active || editing || inApartment || promptRef.current !== null) return;
     const nextFloor = currentFloor + direction;
     if (nextFloor < 0 || nextFloor >= floorCount) return;
     stop();
@@ -98,7 +112,7 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
     positionRef.current = landing;
     setPosition(landing);
     setFacing(direction);
-  }, [active, editing, currentFloor, floorCount, stop]);
+  }, [active, editing, inApartment, currentFloor, floorCount, stop]);
 
   const leaveDoor = useCallback(() => {
     const index = promptRef.current;
@@ -121,15 +135,15 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
   }, [visibleRooms, router, stop, leaveDoor, onCreate]);
 
   function openEditor() {
-    if (!active) return;
+    if (!active || !carpetReady || carpetSaving || inApartment) return;
     stop();
     setDraft(carpet);
-    setStorageError("");
     setEditing(true);
     editor.current?.showModal();
   }
 
   function closeEditor() {
+    if (carpetSaving) return;
     editor.current?.close();
     setEditing(false);
     carpetButton.current?.focus({ preventScroll: true });
@@ -147,22 +161,29 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
       keys.current.forEach(key => { dx += MOVEMENT[key]?.x ?? 0; dy += MOVEMENT[key]?.y ?? 0; });
       const current = positionRef.current;
       if (!dx && !dy && destination.current) {
+        if (Math.hypot(destination.current.x - current.x, destination.current.y - current.y) < 4) destination.current = waypoints.current.shift() ?? null;
+      }
+      if (!dx && !dy && destination.current) {
         dx = destination.current.x - current.x;
         dy = destination.current.y - current.y;
-        if (Math.hypot(dx, dy) < 4) { destination.current = null; dx = 0; dy = 0; }
       }
       const distance = Math.hypot(dx, dy);
       if (distance) {
         const step = Math.min(190 * dt, destination.current ? distance : Infinity);
-        let next = movePlayer(current, { x: dx / distance * step, y: dy / distance * step });
-        const stairs = stairAt(next, currentFloor, floorCount);
+        let next = (inApartment ? moveInApartment : movePlayer)(current, { x: dx / distance * step, y: dy / distance * step });
+        if (inApartment ? atApartmentExit(next) : currentFloor === 0 && atHomePortal(next)) {
+          if (inApartment) exitApartment(); else enterApartment();
+          frame = requestAnimationFrame(tick);
+          return;
+        }
+        const stairs = inApartment ? null : stairAt(next, currentFloor, floorCount);
         if (stairs !== null) {
           takeStairs(stairs);
           frame = requestAnimationFrame(tick);
           return;
         }
         if (next.x === current.x && next.y === current.y) destination.current = null;
-        const door = doorAt(next);
+        const door = inApartment ? null : doorAt(next);
         if (door !== null) {
           next = doorPosition(door);
           stop();
@@ -194,7 +215,7 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
         }
         return;
       }
-      if (MOVEMENT[key]) { event.preventDefault(); destination.current = null; keys.current.add(key); }
+      if (MOVEMENT[key]) { event.preventDefault(); destination.current = null; waypoints.current = []; keys.current.add(key); }
     }
     function onKeyUp(event: KeyboardEvent) { keys.current.delete(event.key.length === 1 ? event.key.toLowerCase() : event.key); }
     function onFocus(event: FocusEvent) { if (isTyping(event.target)) stop(); }
@@ -204,29 +225,32 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
     window.addEventListener("blur", stop);
     document.addEventListener("visibilitychange", stop);
     return () => { cancelAnimationFrame(frame); document.removeEventListener("keydown", onKeyDown); document.removeEventListener("keyup", onKeyUp); document.removeEventListener("focusin", onFocus); window.removeEventListener("blur", stop); document.removeEventListener("visibilitychange", stop); stop(); };
-  }, [active, editing, stop, enterDoor, leaveDoor, currentFloor, floorCount, takeStairs]);
+  }, [active, editing, stop, enterDoor, leaveDoor, currentFloor, floorCount, takeStairs, inApartment, enterApartment, exitApartment]);
 
   function walkTo(point: Point) {
     if (!active || editing || promptRef.current !== null) return;
     keys.current.clear();
-    destination.current = { x: clamp(point.x, 55, 905), y: clamp(point.y, 230, 404) };
+    waypoints.current = inApartment ? apartmentPath(positionRef.current, point) : [];
+    destination.current = inApartment ? waypoints.current.shift() ?? null : { x: clamp(point.x, 55, 905), y: clamp(point.y, 230, 404) };
     root.current?.focus({ preventScroll: true });
   }
 
   return (
     <div className={styles.clubhouse}>
       <div className={styles.floorBar}>
-        <span className={styles.floorLabel} role="status"><Layers size={14} aria-hidden="true" /><span>Floor <strong>{currentFloor + 1}</strong><span className={styles.floorTotal}> / {floorCount}</span></span></span>
+        {inApartment && <button type="button" onClick={exitApartment} className={styles.returnButton}><ArrowLeft size={15} aria-hidden="true" />Return to first floor</button>}
+        <span className={styles.floorLabel} role="status">{inApartment ? <><House size={14} aria-hidden="true" /><span>Your apartment</span></> : <><Layers size={14} aria-hidden="true" /><span>Floor <strong>{currentFloor + 1}</strong><span className={styles.floorTotal}> / {floorCount}</span></span></>}</span>
       </div>
       <div ref={root} className={styles.playArea} tabIndex={0} role="group" aria-label="Walkable clubhouse" aria-describedby="clubhouse-controls">
         <div className={styles.viewport}>
-          <svg ref={map} viewBox="0 0 960 620" className={styles.map} role="img" aria-label={`Clubhouse floor ${currentFloor + 1}, ${visibleRooms.length} room doors`}
+          <svg ref={map} viewBox="0 0 960 620" className={styles.map} role="img" aria-label={inApartment ? "Your one-bedroom apartment" : `Clubhouse floor ${currentFloor + 1}, ${visibleRooms.length} room doors`}
             onClick={event => {
               const svg = map.current;
               if (!svg) return;
               const bounds = svg.getBoundingClientRect();
               walkTo({ x: (event.clientX - bounds.left) / bounds.width * 960, y: (event.clientY - bounds.top) / bounds.height * 620 });
             }}>
+            {inApartment ? <ApartmentInterior displayName={displayName} onWalk={walkTo} /> : <>
             <defs>
               <pattern id="clubhouse-tile" width="60" height="40" patternUnits="userSpaceOnUse"><rect width="60" height="40" fill="#30373c" /><path d="M60 0H0V40" fill="none" stroke="#394147" strokeWidth="1" /></pattern>
               <pattern id="clubhouse-wood" width="60" height="18" patternUnits="userSpaceOnUse"><rect width="60" height="18" fill="#665c54" /><path d="M60 0H0V18" fill="none" stroke="#776c61" strokeWidth="1" /></pattern>
@@ -252,7 +276,7 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
                   <text x={x + 135} y={y + 52} fill="#f2f2f0" fontSize="12">{room.members.length} {room.members.length === 1 ? "member" : "members"}</text>
                   <text x={x + 135} y={y + 72} fill="#e2d4c8" fontSize="12">{room.visibility}</text>
                   <g className={styles.door} role="button" tabIndex={-1} aria-label={`Walk to ${room.name}`} onClick={event => { event.stopPropagation(); walkTo(door); }}>
-                    <title>{room.name} — walk to this door</title>
+                    <title>{`${room.name} — walk to this door`}</title>
                     <rect data-hit-area x={x} y={top ? 32 : 416} width="276" height="160" fill="transparent" />
                     <rect x={door.x - 123} y={y + 100} width="246" height="32" rx="6" fill={nearby === index ? "#0c29e8" : "#202a33"} stroke={nearby === index ? "#9aabff" : "#53616d"} />
                     <text x={door.x} y={y + 121} textAnchor="middle" fill="#f2f2f0" fontSize="15" fontWeight="600">{room.name.length > 25 ? `${room.name.slice(0, 24)}…` : room.name}</text>
@@ -287,7 +311,7 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
               const label = right ? "Next floor" : "Previous floor";
               return <g key={direction} className={styles.stairs} aria-label={`Walk to ${label.toLowerCase()} staircase`} role="button" tabIndex={-1}
                 onClick={event => { event.stopPropagation(); walkTo({ x: right ? 888 : 72, y: SPAWN.y }); }}>
-                <title>{label} — walk onto the stairs</title>
+                <title>{`${label} — walk onto the stairs`}</title>
                 <rect data-hit-area x={x - 32} y="244" width="160" height="160" fill="transparent" />
                 <rect {...area} rx="5" fill="#141e29" stroke="#9aabff" strokeWidth="2" />
                 <g>
@@ -300,6 +324,15 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
                 <text x={x + 48} y="385" textAnchor="middle" fill="#c1cdff" fontSize="12">{label}</text>
               </g>;
             })}
+            {currentFloor === 0 && <g className={styles.homePortal} role="button" tabIndex={-1} aria-label="Walk to my apartment portal" onClick={event => { event.stopPropagation(); walkTo({ x: 72, y: SPAWN.y }); }}>
+              <title>Teleport to your private apartment</title>
+              <rect {...HOME_PORTAL_AREA} rx="8" fill="#26374b" stroke="#a6bcff" strokeWidth="2" />
+              <ellipse cx="86" cy="336" rx="31" ry="13" fill="#5475c3" stroke="#b4caff" strokeWidth="2" />
+              <path d="M58 307 86 283l28 24m-48-6v30h40v-30m-27 30v-20h14v20" fill="#425781" stroke="#d7e3ff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+              <text x="86" y="385" textAnchor="middle" fill="#c1cdff" fontSize="12">My apartment</text>
+              <rect data-hit-area x="6" y="244" width="160" height="160" fill="transparent" />
+            </g>}
+            </>}
             <g transform={`translate(${position.x} ${position.y})`} data-testid="clubhouse-player" aria-hidden="true" pointerEvents="none">
               <ellipse cy="8" rx="17" ry="7" fill="#10171e" opacity=".5" />
               <g transform={`scale(${facing} 1)`}>
@@ -335,9 +368,9 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
         </div>}
       </div>
       <div className={styles.toolbar}>
-        <p id="clubhouse-controls" className="text-sm text-muted"><span className="text-foreground">WASD / arrows</span> to walk · tap the floor to move<br /><span className="text-xs">Right stairs: next floor. Left stairs: previous floor. Tap the carpet to personalize it.</span></p>
+        <p id="clubhouse-controls" className="text-sm text-muted"><span className="text-foreground">WASD / arrows</span> to walk · tap the floor to move<br /><span className="text-xs">{inApartment ? "Explore your bedroom, bathroom, kitchen and living room. Walk to the exit to return." : "Right stairs: next floor. Left stairs: previous floor. First floor's left portal: your apartment."}</span></p>
         <div className={styles.entry} aria-live="polite">
-          {prompt !== null ? <span className="text-sm text-accent-text">At the door · come in or head back</span>
+          {inApartment ? <span className="text-sm text-accent-text">Your personal space</span> : prompt !== null ? <span className="text-sm text-accent-text">At the door · come in or head back</span>
             : rooms.length === 0 ? <button type="button" onClick={onCreate} className={styles.enter}>Create your first room</button>
               : <span className="text-sm text-muted">Approach a door to enter</span>}
         </div>
@@ -354,7 +387,7 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
                 else if (key === (index < 3 ? "ArrowDown" : "ArrowUp")) leaveDoor();
                 return;
               }
-              destination.current = null; keys.current.add(key);
+              destination.current = null; waypoints.current = []; keys.current.add(key);
             }}
               onPointerUp={() => keys.current.delete(key)} onPointerCancel={stop} onLostPointerCapture={() => keys.current.delete(key)}
               onClick={event => { if (event.detail === 0) {
@@ -366,31 +399,36 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
               } }}><Icon size={18} /></button>
           ))}
         </div>
-        {floorCount > 1 && <div className={styles.pagination}>{currentFloor > 0 && <button type="button" aria-label="Previous floor" disabled={!active || editing || prompt !== null} onClick={() => takeStairs(-1)}><ChevronLeft size={18} /></button>}<span>Floor {currentFloor + 1}</span>{currentFloor < floorCount - 1 && <button type="button" aria-label="Next floor" disabled={!active || editing || prompt !== null} onClick={() => takeStairs(1)}><ChevronRight size={18} /></button>}</div>}
+        {!inApartment && floorCount > 1 && <div className={styles.pagination}>{currentFloor > 0 && <button type="button" aria-label="Previous floor" disabled={!active || editing || prompt !== null} onClick={() => takeStairs(-1)}><ChevronLeft size={18} /></button>}<span>Floor {currentFloor + 1}</span>{currentFloor < floorCount - 1 && <button type="button" aria-label="Next floor" disabled={!active || editing || prompt !== null} onClick={() => takeStairs(1)}><ChevronRight size={18} /></button>}</div>}
       </div>
-      <button ref={carpetButton} type="button" onClick={openEditor} className={styles.editCarpet}><Pencil size={14} aria-hidden="true" />Customize carpet</button>
+      {inApartment ? <div className={styles.apartmentDestinations} role="group" aria-label="Apartment destinations">
+        {APARTMENT_DESTINATIONS.map(({ name, point }) => <button key={name} type="button" className={styles.secondary} onClick={() => walkTo(point)} disabled={!active}>{name}</button>)}
+        <button type="button" className={styles.secondary} onClick={() => walkTo({ x: 480, y: 562 })} disabled={!active}>Walk to exit</button>
+      </div> : <>
+        <button ref={carpetButton} type="button" onClick={openEditor} disabled={!carpetReady || carpetSaving} className={styles.editCarpet}><Pencil size={14} aria-hidden="true" />{carpetReady ? "Customize carpet" : "Loading account carpet…"}</button>
+        {carpetError && <p role="alert" className={styles.accountError}>{carpetError}{!carpetReady && <button type="button" onClick={reloadCarpet}>Retry</button>}</p>}
+      </>}
       <dialog ref={editor} className={styles.editor} aria-labelledby="carpet-editor-title" onCancel={event => { event.preventDefault(); closeEditor(); }} onClose={() => setEditing(false)}>
-        <form onSubmit={event => {
+        <form onSubmit={async event => {
           event.preventDefault();
           const value = { headline: draft.headline.trim() || DEFAULT_CARPET.headline, caption: draft.caption.trim() || DEFAULT_CARPET.caption };
-          setCarpet(value);
-          try { localStorage.setItem(`koopi:carpet:${userId}`, JSON.stringify(value)); } catch {
-            setStorageError("Carpet updated for this visit. Your browser couldn't save it for next time.");
-            return;
+          if (await saveAccountCarpet(value)) {
+            editor.current?.close();
+            setEditing(false);
+            carpetButton.current?.focus({ preventScroll: true });
           }
-          closeEditor();
         }}>
-          <div className={styles.editorHeading}><h3 id="carpet-editor-title">Make yourself at home</h3><button type="button" aria-label="Close carpet editor" onClick={closeEditor}><X size={20} /></button></div>
-          <p className="mb-5 text-sm text-muted">Your carpet, your words. Saved for you on this device.</p>
+          <div className={styles.editorHeading}><h3 id="carpet-editor-title">Make yourself at home</h3><button type="button" aria-label="Close carpet editor" disabled={carpetSaving} onClick={closeEditor}><X size={20} /></button></div>
+          <p className="mb-5 text-sm text-muted">Saved to your account, wherever you sign in.</p>
           <label htmlFor="carpet-headline">Headline <span>{draft.headline.length}/22</span></label>
-          <input id="carpet-headline" autoFocus maxLength={22} value={draft.headline} onChange={event => setDraft({ ...draft, headline: event.target.value })} />
+          <input id="carpet-headline" autoFocus disabled={carpetSaving} maxLength={22} value={draft.headline} onChange={event => setDraft({ ...draft, headline: event.target.value })} />
           <label htmlFor="carpet-caption">Small caption <span>{draft.caption.length}/46</span></label>
-          <input id="carpet-caption" maxLength={46} value={draft.caption} onChange={event => setDraft({ ...draft, caption: event.target.value })} />
-          {storageError && <p role="status" className="mt-3 text-sm text-accent-text">{storageError}</p>}
-          <div className={styles.editorActions}><button type="button" className={styles.secondary} onClick={() => setDraft(DEFAULT_CARPET)}>Reset text</button><button type="submit" className={styles.enter}>Save carpet</button></div>
+          <input id="carpet-caption" disabled={carpetSaving} maxLength={46} value={draft.caption} onChange={event => setDraft({ ...draft, caption: event.target.value })} />
+          {carpetError && <p role="alert" className="mt-3 text-sm text-accent-text">{carpetError}</p>}
+          <div className={styles.editorActions}><button type="button" disabled={carpetSaving} className={styles.secondary} onClick={() => setDraft(DEFAULT_CARPET)}>Reset text</button><button type="submit" disabled={carpetSaving} className={styles.enter}>{carpetSaving ? "Saving…" : "Save carpet"}</button></div>
         </form>
       </dialog>
-      {!!rooms.length && <details className={styles.directory}><summary>Room directory · jump straight in</summary><ul>{visibleRooms.map(room => <li key={room.id}><Link href={`/room/${room.id}`}>{room.name}<ArrowRight size={15} aria-hidden="true" /></Link></li>)}</ul></details>}
+      {!inApartment && !!rooms.length && <WorldRoomDirectory rooms={visibleRooms} userId={userId} />}
     </div>
   );
 }

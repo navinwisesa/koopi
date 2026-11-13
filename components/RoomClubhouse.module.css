@@ -1,6 +1,16 @@
 .clubhouse { margin-top: 1rem; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--surface); }
 .clubhouse :focus-visible { outline: 2px solid var(--accent-text); outline-offset: 3px; }
-.floorBar { display: flex; justify-content: flex-end; padding: 10px 12px 0; background: #1c2328; }
+.floorBar { display: flex; align-items: center; justify-content: flex-end; gap: 12px; padding: 10px 12px 0; background: #1c2328; }
+.returnButton { display: flex; align-items: center; gap: 6px; min-height: 44px; margin-right: auto; color: var(--accent-text); font-size: 13px; }
+.homePortal { cursor: pointer; }
+.homePortal:hover > rect:not([data-hit-area]) { stroke: #eef1ff; }
+.apartmentDestinations { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; padding: 0 24px 20px; }
+.accountError { padding: 0 24px 16px; color: var(--accent-text); font-size: 14px; }
+.accountError button { margin-left: 12px; min-height: 44px; text-decoration: underline; }
+.clubhouse button:disabled { cursor: default; opacity: .5; }
+.directoryDelete { display: grid; place-items: center; min-width: 44px; min-height: 44px; color: var(--muted); }
+.directoryDelete:hover { color: #f87171; }
+.deleteConfirmation { padding: 12px 0; font-size: 14px; }
 .floorLabel { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid #536797; border-radius: 6px; background: #233456; color: #dbe3ff; font-family: var(--font-nunito-sans), sans-serif; font-size: 12px; line-height: 1.2; }
 .floorLabel strong { font-weight: 800; }
 .floorTotal { color: #c0c9df; }
@@ -54,6 +64,7 @@
 .directory a { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 10px 0; overflow-wrap: anywhere; color: var(--accent-text); }
 .directory a:hover { text-decoration: underline; }
 @media (max-width: 639px) {
+  .apartmentDestinations { grid-template-columns: repeat(2, minmax(0, 1fr)); padding-inline: 16px; }
   .dialogue { bottom: 12px; left: 12px; right: 12px; padding: 14px; gap: 10px; }
   .speaker { width: 32px; height: 32px; font-size: 18px; }
   .dialogueText { font-size: 16px; }
