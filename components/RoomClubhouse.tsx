@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronLeft, ChevronRight, DoorOpen, Pencil, X } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronLeft, ChevronRight, DoorOpen, Layers, Pencil, X } from "lucide-react";
 import type { RoomView } from "@/components/DashboardRooms";
 import { type Point, type StairDirection, SPAWN, STAIR_AREAS, clamp, doorPosition, movePlayer, doorAt, stairAt, stairArrival } from "@/lib/clubhouseMovement";
 import styles from "./RoomClubhouse.module.css";
@@ -215,11 +215,10 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
 
   return (
     <div className={styles.clubhouse}>
-      <div className={styles.heading}>
-        <div><h3 className="font-display text-xl font-semibold">The clubhouse</h3><p id="clubhouse-help" className="mt-1 text-sm text-muted">Walk to a door. Make something together.</p></div>
-        <span className={styles.floorLabel} role="status">Floor {currentFloor + 1} / {floorCount}</span>
+      <div className={styles.floorBar}>
+        <span className={styles.floorLabel} role="status"><Layers size={14} aria-hidden="true" /><span>Floor <strong>{currentFloor + 1}</strong><span className={styles.floorTotal}> / {floorCount}</span></span></span>
       </div>
-      <div ref={root} className={styles.playArea} tabIndex={0} role="group" aria-label="Walkable clubhouse" aria-describedby="clubhouse-help clubhouse-controls">
+      <div ref={root} className={styles.playArea} tabIndex={0} role="group" aria-label="Walkable clubhouse" aria-describedby="clubhouse-controls">
         <div className={styles.viewport}>
           <svg ref={map} viewBox="0 0 960 620" className={styles.map} role="img" aria-label={`Clubhouse floor ${currentFloor + 1}, ${visibleRooms.length} room doors`}
             onClick={event => {
@@ -301,8 +300,6 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
                 <text x={x + 48} y="385" textAnchor="middle" fill="#c1cdff" fontSize="12">{label}</text>
               </g>;
             })}
-            <rect x="70" y="558" width="116" height="16" rx="5" fill="#b39b81" />
-            <rect x="774" y="558" width="116" height="16" rx="5" fill="#b39b81" />
             <text x="480" y="584" textAnchor="middle" fill="#b4c2cc" fontSize="12" letterSpacing="2">YOUR NEXT IDEA IS A DOOR AWAY</text>
             <g transform={`translate(${position.x} ${position.y})`} data-testid="clubhouse-player" aria-hidden="true" pointerEvents="none">
               <ellipse cy="8" rx="17" ry="7" fill="#10171e" opacity=".5" />

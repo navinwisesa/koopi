@@ -1,8 +1,10 @@
 .clubhouse { margin-top: 1rem; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--surface); }
 .clubhouse :focus-visible { outline: 2px solid var(--accent-text); outline-offset: 3px; }
-.heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 24px; }
-.floorLabel { flex-shrink: 0; color: var(--accent-text); font-size: 12px; }
-.playArea { position: relative; border-block: 1px solid var(--border-strong); }
+.floorBar { display: flex; justify-content: flex-end; padding: 10px 12px 0; background: #1c2328; }
+.floorLabel { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid #536797; border-radius: 6px; background: #233456; color: #dbe3ff; font-family: var(--font-nunito-sans), sans-serif; font-size: 12px; line-height: 1.2; }
+.floorLabel strong { font-weight: 800; }
+.floorTotal { color: #c0c9df; }
+.playArea { position: relative; border-bottom: 1px solid var(--border-strong); }
 .playArea:focus-visible { outline-offset: -3px; }
 .viewport { width: 100%; overflow: hidden; }
 .map { display: block; width: 100%; height: auto; aspect-ratio: 960 / 620; cursor: crosshair; user-select: none; touch-action: pan-y pinch-zoom; font-family: var(--font-nunito-sans), sans-serif; }
@@ -57,7 +59,6 @@
   .dialogueText { font-size: 16px; }
   .dialogueActions { flex-direction: column; }
   .editCarpet { margin-left: 16px; }
-  .heading { padding: 16px; }
   .toolbar { align-items: stretch; flex-direction: column; padding: 16px; gap: 12px; }
   .entry { max-width: 100%; min-height: 44px; display: flex; align-items: center; }
   .enter { width: 100%; }
