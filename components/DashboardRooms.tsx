@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Plus, LogIn, X, Users, Globe, Mail, Lock, Trash2 } from "lucide-react";
+import { Plus, LogIn, X, Users, Globe, Mail, Lock, Trash2, List, Map } from "lucide-react";
 import Avatar from "@/components/Avatar";
 import CreateRoomModal, { type Visibility } from "@/components/CreateRoomModal";
 import { createClient } from "@/lib/supabase/client";
@@ -18,6 +19,9 @@ export type RoomView = {
 };
 
 const VIS_ICON = { public: Globe, invited: Mail, private: Lock } as const;
+const RoomClubhouse = dynamic(() => import("@/components/RoomClubhouse"), {
+  loading: () => <p className="py-20 text-center text-muted" role="status">Opening the clubhouse…</p>,
+});
 
 const UUID_RE =
   /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
@@ -48,6 +52,20 @@ export default function DashboardRooms({
   // confirmation step, unlike a single file delete elsewhere in this app.
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [view, setView] = useState<"simple" | "world">("simple");
+  const [viewReady, setViewReady] = useState(false);
+
+  useEffect(() => {
+    try {
+      setView(localStorage.getItem(`koopi:rooms-view:${userId}`) === "world" ? "world" : "simple");
+    } catch { /* Storage may be unavailable in private browsing. */ }
+    setViewReady(true);
+  }, [userId]);
+
+  function changeView(next: "simple" | "world") {
+    setView(next);
+    try { localStorage.setItem(`koopi:rooms-view:${userId}`, next); } catch { /* Keep the toggle usable. */ }
+  }
 
   const working = busy;
 
@@ -183,11 +201,24 @@ export default function DashboardRooms({
       )}
 
       <section className="mt-14">
+        <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="font-display text-sm font-semibold uppercase tracking-wider text-muted">
           Your rooms
         </h2>
+        <div role="group" aria-label="Room selection view" className="flex rounded-lg border border-border bg-surface p-1">
+          {([{ id: "simple", label: "Simple", icon: List }, { id: "world", label: "World", icon: Map }] as const).map(({ id, label, icon: Icon }) => (
+            <button key={id} type="button" aria-pressed={view === id} disabled={!viewReady}
+              onClick={() => changeView(id)}
+              className={`flex min-h-10 items-center gap-2 rounded-md px-3 text-sm font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-text ${view === id ? "bg-accent text-accent-foreground" : "text-muted hover:text-foreground"}`}>
+              <Icon className="h-4 w-4" aria-hidden="true" />{label}
+            </button>
+          ))}
+        </div>
+        </div>
 
-        {rooms.length === 0 ? (
+        {view === "world" ? (
+          <RoomClubhouse rooms={rooms} displayName={displayName} onCreate={() => setShowCreate(true)} active={!showCreate && !joining} />
+        ) : rooms.length === 0 ? (
           <div className="mt-4 rounded-xl border border-dashed border-border px-6 py-14 text-center">
             <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-full bg-accent/10 text-accent">
               <Users className="h-5 w-5" strokeWidth={1.75} />
