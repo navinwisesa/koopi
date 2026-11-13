@@ -124,7 +124,7 @@ export default async function DashboardPage() {
       <BackgroundGrid />
 
       <header className="border-b border-border/80">
-        <nav className="mx-auto flex max-w-4xl items-center px-6 py-4">
+        <nav className="mx-auto flex max-w-6xl items-center px-6 py-4">
           <Link href="/" className="flex items-center gap-2">
             <span className="flex h-7 w-7 items-center justify-center rounded-md bg-accent font-display text-sm font-bold text-accent-foreground">
               K
@@ -144,7 +144,7 @@ export default async function DashboardPage() {
         </nav>
       </header>
 
-      <main className="mx-auto max-w-4xl px-6 pb-24 pt-16 sm:pt-20">
+      <main className="mx-auto max-w-6xl px-6 pb-24 pt-16 sm:pt-20">
         <h1 className="font-display text-3xl font-bold tracking-tight sm:text-4xl">
           Welcome back, {username}
         </h1>
