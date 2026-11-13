@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronLeft, ChevronRight, DoorOpen, Pencil, X } from "lucide-react";
@@ -16,6 +16,34 @@ const MOVEMENT: Record<string, Point> = {
 };
 const DEFAULT_CARPET = { headline: "KOOPI", caption: "what do you wanna make today?" };
 const isTyping = (target: EventTarget | null) => target instanceof HTMLElement && !!target.closest('input, textarea, select, [contenteditable="true"], [role="dialog"]');
+
+function CarpetText({ children, y, size, headline = false }: {
+  children: string; y: number; size: number; headline?: boolean;
+}) {
+  const text = useRef<SVGTextElement>(null);
+  const [fontSize, setFontSize] = useState(size);
+
+  useLayoutEffect(() => {
+    let mounted = true;
+    function fit() {
+      const element = text.current;
+      if (!mounted || !element) return;
+      const width = element.getComputedTextLength();
+      const currentSize = parseFloat(getComputedStyle(element).fontSize);
+      // Shrink uniformly only when necessary. Never stretch glyphs or space
+      // short text out to fill the carpet's width.
+      if (width > 0) setFontSize(Math.min(size, 204 * currentSize / width));
+    }
+    fit();
+    void document.fonts.ready.then(fit);
+    document.fonts.addEventListener("loadingdone", fit);
+    return () => { mounted = false; document.fonts.removeEventListener("loadingdone", fit); };
+  }, [children, size, headline]);
+
+  return <text ref={text} x="480" y={y} textAnchor="middle" fill={headline ? "#aebeff" : "#c0c9df"}
+    fontSize={fontSize} fontWeight={headline ? 700 : 400}
+    fontFamily={headline ? "var(--font-league-spartan), sans-serif" : undefined}>{children}</text>;
+}
 
 export default function RoomClubhouse({ rooms, userId, displayName, onCreate, active }: {
   rooms: RoomView[]; userId: string; displayName: string; onCreate: () => void; active: boolean;
@@ -256,8 +284,8 @@ export default function RoomClubhouse({ rooms, userId, displayName, onCreate, ac
             <title>Customize your carpet</title>
             <rect x="362" y="272" width="236" height="90" rx="12" fill="#233456" stroke="#536797" strokeWidth="2" />
             <rect x="370" y="280" width="220" height="74" rx="8" fill="none" stroke="#536797" strokeDasharray="3 4" />
-            <text x="480" y="310" textAnchor="middle" fill="#aebeff" fontSize={carpet.headline.length > 13 ? "15" : "25"} fontWeight="700" letterSpacing={carpet.headline.length > 10 ? "0" : "3"} textLength={carpet.headline.length > 8 ? 200 : undefined} lengthAdjust="spacingAndGlyphs">{carpet.headline}</text>
-            <text x="480" y="338" textAnchor="middle" fill="#c0c9df" fontSize="12" textLength={carpet.caption.length > 18 ? 204 : undefined} lengthAdjust="spacingAndGlyphs">{carpet.caption}</text>
+            <CarpetText y={310} size={22} headline>{carpet.headline}</CarpetText>
+            <CarpetText y={338} size={12}>{carpet.caption}</CarpetText>
             </g>
             {([-1, 1] as const).map(direction => {
               const right = direction === 1;
