@@ -217,7 +217,7 @@ export default function DashboardRooms({
         </div>
 
         {view === "world" ? (
-          <RoomClubhouse rooms={rooms} displayName={displayName} onCreate={() => setShowCreate(true)} active={!showCreate && !joining} />
+          <RoomClubhouse rooms={rooms} userId={userId} displayName={displayName} onCreate={() => setShowCreate(true)} active={!showCreate && !joining} />
         ) : rooms.length === 0 ? (
           <div className="mt-4 rounded-xl border border-dashed border-border px-6 py-14 text-center">
             <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-full bg-accent/10 text-accent">

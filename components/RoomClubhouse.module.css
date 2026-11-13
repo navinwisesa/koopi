@@ -8,6 +8,31 @@
 .map { display: block; width: 100%; min-width: 720px; cursor: crosshair; user-select: none; font-family: var(--font-nunito-sans), sans-serif; }
 .door { cursor: pointer; }
 .door:hover rect { fill: var(--accent); stroke: var(--accent-text); }
+.carpet { cursor: pointer; }
+.carpet:hover > rect:first-of-type { stroke: #aebeff; }
+.dialogue { position: absolute; bottom: 16px; left: 16px; right: 16px; display: flex; align-items: flex-start; gap: 16px; padding: 20px; border: 2px solid var(--accent-text); border-radius: 10px; background: #111b2b; box-shadow: 0 8px 24px #0006; }
+.speaker { display: grid; place-items: center; flex-shrink: 0; width: 44px; height: 44px; border-radius: 8px; background: var(--accent); color: var(--accent-foreground); font-weight: 700; font-size: 24px; }
+.dialogue[data-side="bottom"] { top: 16px; bottom: auto; }
+.dialogueBody { min-width: 0; flex: 1; }
+.speakerName { color: var(--accent-text); font-size: 13px; font-weight: 600; }
+.dialogueText { margin-top: 4px; font-size: 18px; line-height: 1.35; overflow-wrap: anywhere; }
+.keyHint { margin-top: 10px; color: #c0c9df; font-size: 13px; }
+.keyHint kbd { font-family: inherit; font-weight: 700; color: #eef1ff; }
+.dialogueActions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.secondary { min-height: 44px; padding: 10px 14px; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--foreground); font-size: 14px; }
+.secondary:hover { background: var(--surface-2); }
+.editCarpet { display: flex; align-items: center; gap: 8px; min-height: 44px; margin: 0 24px 12px; color: var(--accent-text); font-size: 14px; }
+.editor { position: fixed; inset: 0; width: min(440px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; margin: auto; border: 1px solid var(--border-strong); border-radius: 12px; padding: 24px; color: var(--foreground); background: var(--surface); }
+.editor::backdrop { background: #000b; }
+.editorHeading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.editorHeading h3 { font-size: 24px; font-weight: 600; }
+.editorHeading button { display: grid; place-items: center; min-width: 44px; min-height: 44px; }
+.editor label { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 16px; font-size: 14px; }
+.editor label span { color: var(--muted); font-size: 12px; }
+.editor input { width: 100%; margin-top: 6px; padding: 12px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--background); color: var(--foreground); }
+.editorActions { display: flex; justify-content: space-between; gap: 12px; margin-top: 24px; }
+.editorActions .secondary { flex-shrink: 0; white-space: nowrap; }
+.editorActions .enter { flex: 1; width: auto; }
 .toolbar { min-height: 88px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 24px; }
 .entry { min-width: 0; max-width: 55%; }
 .enter { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 44px; padding: 10px 14px; border-radius: 6px; background: var(--accent); color: var(--accent-foreground); font-size: 14px; font-weight: 600; }
@@ -25,6 +50,11 @@
 .directory a { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 10px 0; overflow-wrap: anywhere; color: var(--accent-text); }
 .directory a:hover { text-decoration: underline; }
 @media (max-width: 639px) {
+  .dialogue { bottom: 12px; left: 12px; right: 12px; padding: 14px; gap: 10px; }
+  .speaker { width: 32px; height: 32px; font-size: 18px; }
+  .dialogueText { font-size: 16px; }
+  .dialogueActions { flex-direction: column; }
+  .editCarpet { margin-left: 16px; }
   .heading { padding: 16px; }
   .toolbar { align-items: stretch; flex-direction: column; padding: 16px; gap: 12px; }
   .entry { max-width: 100%; min-height: 44px; display: flex; align-items: center; }
